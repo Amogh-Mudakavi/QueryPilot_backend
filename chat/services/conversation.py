@@ -5,6 +5,7 @@ from chat.models import (
 )
 
 from documents.models import Document
+import logging
 
 
 def create_conversation(
@@ -69,6 +70,20 @@ def attach_document(
         raise ValueError(
             "Maximum of 3 documents allowed."
         )
+
+    # Enforce that attached documents must belong to the same workspace
+    if getattr(document, "workspace_id", None) != conversation.workspace_id:
+        raise ValueError(
+            "Cannot attach a document from a different workspace to this conversation."
+        )
+
+    logger = logging.getLogger(__name__)
+    logger.info(
+        "attach_document: conversation_id=%s document_id=%s workspace_id=%s",
+        conversation.id,
+        getattr(document, "id", None),
+        getattr(document, "workspace_id", None),
+    )
 
     link, _ = (
         ConversationDocument.objects.get_or_create(

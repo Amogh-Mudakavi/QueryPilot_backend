@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from langgraph.config import get_stream_writer
@@ -18,6 +19,8 @@ from planner.tools.conversation_memory import conversation_memory
 from planner.tools.query_tables import query_tables
 from planner.tools.search_evidence import search_evidence
 
+
+logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 3
 MAX_TOOL_CALLS = 4
@@ -178,12 +181,23 @@ def dispatch_node(
     mode = action["mode"]
     total_tool_calls += 1
 
-    raw_query = state.get("query", "")
+    raw_query = state.get(
+        "query",
+        "",
+    )
+
+    allowed_document_ids = (
+        state.get(
+            "relevant_document_ids",
+            [],
+        )
+    )
 
     table_query = raw_query
     text_query = raw_query
 
     if mode == "HYBRID":
+
         table_query = (
             action.get("table_query")
             or raw_query
@@ -193,6 +207,14 @@ def dispatch_node(
             action.get("text_query")
             or raw_query
         ).strip()
+
+    logger.info(
+        "agent.dispatch: mode=%s text_query=%s table_query=%s relevant_document_ids=%s",
+        mode,
+        text_query,
+        table_query,
+        allowed_document_ids,
+    )
 
     try:
         result = {
@@ -204,10 +226,28 @@ def dispatch_node(
             ),
         }
 
+        # ---------------------------------------------------------
+        # TEXT
+        # ---------------------------------------------------------
+
         if mode in {"TEXT", "HYBRID"}:
+
             text_result = _run_text(
                 state,
                 query=text_query,
+            )
+
+            logger.info(
+                "agent.dispatch: text_result candidate_count=%s evidence=%d",
+                text_result.get(
+                    "candidate_count"
+                ),
+                len(
+                    text_result.get(
+                        "evidence",
+                        [],
+                    )
+                ),
             )
 
             result["evidence"] = (
@@ -218,22 +258,60 @@ def dispatch_node(
                 )
             )
 
+        # ---------------------------------------------------------
+        # TABLE
+        # ---------------------------------------------------------
+
         if mode in {"TABLE", "HYBRID"}:
+
             table_result = _run_table(
                 state,
                 query=table_query,
             )
 
+            table_evidence = table_result.get(
+                "evidence",
+                [],
+            )
+
+            table_rows = None
+            tables_used = None
+
+            if table_evidence:
+                content = table_evidence[0].get(
+                    "content",
+                    {},
+                )
+
+                if isinstance(content, dict):
+                    table_rows = content.get(
+                        "row_count"
+                    )
+                    tables_used = content.get(
+                        "tables_used"
+                    )
+
+            logger.info(
+                "agent.dispatch: table_result rows=%s tables_used=%s",
+                table_rows,
+                tables_used,
+            )
+
             result["evidence"] = (
                 result["evidence"]
-                + table_result.get(
-                    "evidence",
-                    [],
-                )
+                + table_evidence
             )
+
+        # ---------------------------------------------------------
+        # MEMORY
+        # ---------------------------------------------------------
 
         if mode == "CONVERSATION_MEMORY":
             result = _run_memory(state)
+
+        # ---------------------------------------------------------
+        # FINISH
+        # ---------------------------------------------------------
 
         if mode == "FINISH":
             return {
@@ -245,6 +323,7 @@ def dispatch_node(
             }
 
     except Exception as exc:
+
         _emit_event(
             event="agent_error",
             status="failed",
@@ -305,9 +384,6 @@ def finish_node(
                 "I could not complete that request because "
                 "the required evidence step failed."
             ),
-            # Grounding LLM is no longer used. Preserve the
-            # field for API compatibility but indicate that no
-            # grounding check was performed.
             "grounding_passed": None,
             "error": state.get(
                 "error",
@@ -328,7 +404,6 @@ def finish_node(
                 "I could not find sufficient information "
                 "in the uploaded documents."
             ),
-            # No grounding was performed.
             "grounding_passed": None,
             "error": "",
         }
@@ -361,8 +436,6 @@ def finish_node(
         "final_evidence": evidence,
         "evidence_sufficient": True,
         "answer": answer,
-        # Grounding LLM no longer exists; keep the field but
-        # indicate null/unknown to avoid implying a check ran.
         "grounding_passed": None,
         "error": "",
     }
@@ -488,9 +561,15 @@ def _run_text(
     query: str,
 ) -> dict[str, Any]:
 
+    allowed_document_ids = state.get(
+        "relevant_document_ids",
+        [],
+    )
+
     result = search_evidence(
         query=query,
         workspace_id=state["workspace_id"],
+        allowed_document_ids=allowed_document_ids,
     )
 
     evidence = [
@@ -503,10 +582,16 @@ def _run_text(
     ]
 
     return {
-        "evidence": evidence[:MAX_STATE_EVIDENCE],
+        "evidence": evidence[
+            :MAX_STATE_EVIDENCE
+        ],
         "retrieval_confidence": result.get(
             "confidence",
             0.0,
+        ),
+        "candidate_count": result.get(
+            "candidate_count",
+            0,
         ),
     }
 
@@ -517,13 +602,21 @@ def _run_table(
     query: str,
 ) -> dict[str, Any]:
 
+    allowed_document_ids = (
+        state.get(
+            "relevant_document_ids",
+            [],
+        )
+    )
+
     schema = get_workspace_schema(
-        state["workspace_id"]
+        state["workspace_id"],
+        allowed_document_ids=allowed_document_ids,
     )
 
     if not schema:
         raise AgentRuntimeError(
-            "No tables are available in this workspace."
+            "No tables are available in the allowed documents."
         )
 
     decision = generate_sql(
@@ -543,6 +636,15 @@ def _run_table(
             "SQL generator returned no SQL."
         )
 
+    schema_by_table = {
+        item["table_name"]: item
+        for item in schema
+    }
+
+    allowed_table_names = set(
+        schema_by_table.keys()
+    )
+
     result = query_tables(
         workspace_id=state["workspace_id"],
         sql=sql,
@@ -550,12 +652,8 @@ def _run_table(
             "parameters",
             [],
         ),
+        allowed_table_names=allowed_table_names,
     )
-
-    schema_by_table = {
-        item["table_name"]: item
-        for item in schema
-    }
 
     used_tables = result.get(
         "tables_used",

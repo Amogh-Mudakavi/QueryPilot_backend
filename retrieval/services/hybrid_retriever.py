@@ -1,32 +1,6 @@
-"""
-retrieval/services/hybrid_retriever.py
-
-QueryPilot's primary workspace evidence retriever.
-
-Responsibilities:
-    1. Dense semantic retrieval from Chroma.
-    2. BM25 lexical retrieval over the current workspace.
-    3. Rank-based fusion using Reciprocal Rank Fusion (RRF).
-    4. Deduplicate candidates returned by both retrieval methods.
-    5. Return the strongest 5-10 evidence candidates.
-    6. Provide a retrieval-strength signal for the planner.
-
-This class deliberately does NOT:
-    - decide whether the question is in scope
-    - decide whether SQL is required
-    - execute SQLite queries
-    - run LangGraph
-    - generate answers
-
-Those are planner/agent responsibilities.
-
-Important:
-    `confidence` is a retrieval-strength heuristic, NOT a calibrated
-    probability that the final answer is correct.
-"""
-
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,20 +10,13 @@ from .bm25 import BM25Retriever
 from .evidence import Evidence
 
 
+logger = logging.getLogger(__name__)
+
+
 @dataclass
 class RetrievalResult:
     """
     Result returned by HybridRetriever.
-
-    Attributes:
-        evidence:
-            Final top-K evidence items.
-
-        confidence:
-            Heuristic retrieval-strength signal in [0, 1].
-
-        candidate_count:
-            Number of unique candidates after dense/BM25 fusion.
     """
 
     evidence: list[Evidence]
@@ -73,20 +40,8 @@ class HybridRetriever:
               ↓
         Top-K Evidence
 
-    RRF is used instead of directly combining dense and BM25 raw scores
-    because those scores are not naturally comparable. RRF combines
-    their ranks instead.
-
-    Current QueryPilot choice:
-
-        dense_k = 20
-        bm25_k = 20
-        top_k = 5
-        rrf_k = 60
-
-    The candidate pool is intentionally larger than the final context.
-    This gives both retrieval methods room to contribute before the
-    final evidence list is selected.
+    When allowed_document_ids is supplied, BOTH retrieval paths
+    are restricted to those documents before fusion.
     """
 
     DEFAULT_DENSE_K = 20
@@ -127,28 +82,21 @@ class HybridRetriever:
         *,
         query: str,
         workspace_id: int,
+        allowed_document_ids: list[int] | None = None,
     ) -> RetrievalResult:
         """
-        Retrieve the strongest evidence for a query within one workspace.
+        Retrieve evidence within one workspace.
 
-        Workspace isolation is mandatory. Every retrieval operation is
-        filtered by workspace_id.
+        If allowed_document_ids is supplied, only those document IDs
+        may contribute evidence.
 
-        Args:
-            query:
-                User or agent-generated search query.
+        None:
+            no additional document restriction beyond workspace.
 
-            workspace_id:
-                Current workspace.
-
-        Returns:
-            RetrievalResult containing final evidence and a heuristic
-            retrieval-strength signal.
-
-        Raises:
-            ValueError:
-                If query is empty.
+        []:
+            no documents are allowed.
         """
+
         query = query.strip()
 
         if not query:
@@ -156,14 +104,38 @@ class HybridRetriever:
                 "query must not be empty"
             )
 
+        normalized_document_ids = (
+            None
+            if allowed_document_ids is None
+            else {
+                int(document_id)
+                for document_id in allowed_document_ids
+            }
+        )
+
+        logger.info(
+            "HybridRetriever.retrieve: workspace_id=%s allowed_document_ids=%s",
+            workspace_id,
+            normalized_document_ids,
+        )
+
+        if normalized_document_ids == set():
+            return RetrievalResult(
+                evidence=[],
+                confidence=0.0,
+                candidate_count=0,
+            )
+
         dense_candidates = self._dense_search(
             query=query,
             workspace_id=workspace_id,
+            allowed_document_ids=normalized_document_ids,
         )
 
         bm25_candidates = self._bm25_search(
             query=query,
             workspace_id=workspace_id,
+            allowed_document_ids=normalized_document_ids,
         )
 
         fused_candidates = self._rrf_fuse(
@@ -186,6 +158,14 @@ class HybridRetriever:
             fused_candidates=fused_candidates,
         )
 
+        logger.info(
+            "HybridRetriever.retrieve: dense=%d bm25=%d fused=%d final=%d",
+            len(dense_candidates),
+            len(bm25_candidates),
+            len(fused_candidates),
+            len(final_candidates),
+        )
+
         return RetrievalResult(
             evidence=evidence,
             confidence=confidence,
@@ -197,17 +177,14 @@ class HybridRetriever:
         *,
         query: str,
         workspace_id: int,
+        allowed_document_ids: set[int] | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Perform semantic retrieval using the existing Chroma knowledge
-        collection.
+        Perform semantic retrieval.
 
-        The collection already contains:
-            - text chunks
-            - table semantic representations
-
-        Workspace filtering is performed by Chroma.
+        Document restrictions are applied directly in the Chroma query.
         """
+
         collection = (
             VectorStore.knowledge_collection()
         )
@@ -216,12 +193,33 @@ class HybridRetriever:
             [query]
         )[0]
 
+        where: dict[str, Any] = {
+            "workspace_id": workspace_id,
+        }
+
+        if allowed_document_ids is not None:
+            if not allowed_document_ids:
+                return []
+
+            where = {
+                "$and": [
+                    {
+                        "workspace_id": workspace_id,
+                    },
+                    {
+                        "document_id": {
+                            "$in": sorted(
+                                allowed_document_ids
+                            ),
+                        }
+                    },
+                ]
+            }
+
         results = collection.query(
             query_embeddings=[query_embedding],
             n_results=self.dense_k,
-            where={
-                "workspace_id": workspace_id,
-            },
+            where=where,
             include=[
                 "documents",
                 "metadatas",
@@ -285,25 +283,44 @@ class HybridRetriever:
         *,
         query: str,
         workspace_id: int,
+        allowed_document_ids: set[int] | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Perform workspace-scoped BM25 retrieval.
+        Perform BM25 retrieval.
 
-        BM25 is rebuilt in memory for the current workspace.
-
-        This is deliberate because QueryPilot currently limits a
-        workspace to a small number of documents. Maintaining a
-        persistent BM25 index would add synchronization and deletion
-        complexity without a meaningful benefit at this scale.
+        When an allow-list exists, the corpus itself is restricted
+        before BM25 ranking.
         """
+
         collection = (
             VectorStore.knowledge_collection()
         )
 
+        where: dict[str, Any] = {
+            "workspace_id": workspace_id,
+        }
+
+        if allowed_document_ids is not None:
+            if not allowed_document_ids:
+                return []
+
+            where = {
+                "$and": [
+                    {
+                        "workspace_id": workspace_id,
+                    },
+                    {
+                        "document_id": {
+                            "$in": sorted(
+                                allowed_document_ids
+                            ),
+                        }
+                    },
+                ]
+            }
+
         corpus = collection.get(
-            where={
-                "workspace_id": workspace_id,
-            },
+            where=where,
             include=[
                 "documents",
                 "metadatas",
@@ -372,24 +389,7 @@ class HybridRetriever:
         dense_candidates: list[dict[str, Any]],
         bm25_candidates: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """
-        Fuse dense and BM25 ranked lists using Reciprocal Rank Fusion.
 
-        RRF score:
-
-            sum(1 / (k + rank))
-
-        where:
-            k = RRF_K
-            rank starts at 1
-
-        A candidate appearing near the top of both retrieval lists gets
-        support from both signals.
-
-        A candidate appearing in only one list can still survive, which
-        is important for exact lexical matches that dense retrieval may
-        miss.
-        """
         candidates: dict[str, dict[str, Any]] = {}
 
         for rank, candidate in enumerate(
@@ -422,10 +422,8 @@ class HybridRetriever:
             )
 
             item["dense_rank"] = rank
-            item["dense_distance"] = (
-                candidate.get(
-                    "dense_distance"
-                )
+            item["dense_distance"] = candidate.get(
+                "dense_distance"
             )
 
             item["rrf_score"] += (
@@ -466,14 +464,10 @@ class HybridRetriever:
             )
 
             item["bm25_rank"] = rank
-            item["bm25_score"] = (
-                candidate.get(
-                    "bm25_score"
-                )
+            item["bm25_score"] = candidate.get(
+                "bm25_score"
             )
 
-            # Preserve BM25 text/metadata if the candidate was not
-            # already discovered by dense retrieval.
             if not item["text"]:
                 item["text"] = candidate.get(
                     "text",
@@ -525,12 +519,7 @@ class HybridRetriever:
     def _rank_tiebreak(
         candidate: dict[str, Any],
     ) -> float:
-        """
-        Small deterministic tiebreak value.
 
-        Candidates present in both retrieval lists receive additional
-        support because they have both ranks.
-        """
         score = 0.0
 
         if candidate.get("dense_rank") is not None:
@@ -560,26 +549,18 @@ class HybridRetriever:
         score: float,
         metadata: dict[str, Any],
     ) -> Evidence:
-        """
-        Convert a retrieved candidate into the common Evidence type.
-        """
+
         source_type = metadata.get(
             "type",
             "unknown",
         )
 
         if source_type == "text":
-            normalized_source_type = (
-                "text_chunk"
-            )
+            normalized_source_type = "text_chunk"
         elif source_type == "table":
-            normalized_source_type = (
-                "table_metadata"
-            )
+            normalized_source_type = "table_metadata"
         else:
-            normalized_source_type = (
-                source_type
-            )
+            normalized_source_type = source_type
 
         workspace_id = metadata.get(
             "workspace_id"
@@ -591,26 +572,20 @@ class HybridRetriever:
 
         if workspace_id is None:
             raise ValueError(
-                "Retrieved evidence is missing "
-                "workspace_id"
+                "Retrieved evidence is missing workspace_id"
             )
 
         if document_id is None:
             raise ValueError(
-                "Retrieved evidence is missing "
-                "document_id"
+                "Retrieved evidence is missing document_id"
             )
 
         return Evidence(
             content=content,
             score=float(score),
             source_type=normalized_source_type,
-            workspace_id=int(
-                workspace_id
-            ),
-            document_id=int(
-                document_id
-            ),
+            workspace_id=int(workspace_id),
+            document_id=int(document_id),
             document_name=metadata.get(
                 "document_name"
             ),
@@ -621,51 +596,19 @@ class HybridRetriever:
     def _calculate_confidence(
         cls,
         *,
-        dense_candidates: list[
-            dict[str, Any]
-        ],
-        bm25_candidates: list[
-            dict[str, Any]
-        ],
-        fused_candidates: list[
-            dict[str, Any]
-        ],
+        dense_candidates: list[dict[str, Any]],
+        bm25_candidates: list[dict[str, Any]],
+        fused_candidates: list[dict[str, Any]],
     ) -> float:
-        """
-        Estimate retrieval strength without pretending it is a
-        calibrated probability.
 
-        Signals:
-
-            1. Absolute dense similarity of the best candidate.
-            2. Whether the best fused candidate is also a strong BM25 hit.
-            3. Whether the two retrieval systems agree on multiple
-               candidates.
-
-        Because these signals come from different systems, this value is
-        intentionally treated as a heuristic for the planner.
-
-        The important behavior is:
-
-            strong semantic match + lexical agreement
-                -> high
-
-            weak semantic match with no lexical agreement
-                -> low
-
-        This avoids the old behavior where min-max normalization forced
-        the best candidate of every query to look like a "1.0".
-        """
         if not fused_candidates:
             return 0.0
 
         best_dense_similarity = 0.0
 
         if dense_candidates:
-            best_distance = (
-                dense_candidates[0].get(
-                    "dense_distance"
-                )
+            best_distance = dense_candidates[0].get(
+                "dense_distance"
             )
 
             best_dense_similarity = (
@@ -674,21 +617,12 @@ class HybridRetriever:
                 )
             )
 
-        top_candidate = (
-            fused_candidates[0]
-        )
+        top_candidate = fused_candidates[0]
 
         lexical_support = 0.0
 
-        if (
-            top_candidate.get(
-                "bm25_rank"
-            )
-            is not None
-        ):
-            bm25_rank = top_candidate[
-                "bm25_rank"
-            ]
+        if top_candidate.get("bm25_rank") is not None:
+            bm25_rank = top_candidate["bm25_rank"]
 
             if bm25_rank <= 3:
                 lexical_support = 1.0
@@ -701,14 +635,8 @@ class HybridRetriever:
             1
             for candidate in fused_candidates
             if (
-                candidate.get(
-                    "dense_rank"
-                )
-                is not None
-                and candidate.get(
-                    "bm25_rank"
-                )
-                is not None
+                candidate.get("dense_rank") is not None
+                and candidate.get("bm25_rank") is not None
             )
         )
 
@@ -718,12 +646,9 @@ class HybridRetriever:
         )
 
         confidence = (
-            0.60
-            * best_dense_similarity
-            + 0.25
-            * lexical_support
-            + 0.15
-            * agreement
+            0.60 * best_dense_similarity
+            + 0.25 * lexical_support
+            + 0.15 * agreement
         )
 
         return max(
@@ -738,22 +663,7 @@ class HybridRetriever:
     def _l2_distance_to_similarity(
         distance: float | None,
     ) -> float:
-        """
-        Convert L2 distance between normalized vectors into cosine
-        similarity.
 
-        VectorStore normalizes embeddings before storing/querying them.
-        For unit vectors:
-
-            ||a-b||² = 2 - 2*cos(theta)
-
-        therefore:
-
-            cosine = 1 - distance² / 2
-
-        The result is clamped to [0, 1] because retrieval confidence
-        should not treat negative similarity as positive evidence.
-        """
         if distance is None:
             return 0.0
 

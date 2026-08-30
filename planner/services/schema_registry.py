@@ -8,15 +8,32 @@ from documents.ingestion.sqlite import SQLiteManager
 
 def get_workspace_schema(
     workspace_id: int,
+    allowed_document_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Return the authoritative schema for every table in one workspace.
+    Return the authoritative SQLite schema for a workspace.
 
-    Also flags which columns are actually numeric, even though every
-    column is physically stored as TEXT (see sqlite.py create_table).
-    The SQL generator needs this to know when it must CAST - plain
-    TEXT sorting/comparison on numeric-looking strings is wrong.
+    If allowed_document_ids is supplied, only tables belonging to
+    those documents are returned.
+
+    None:
+        all workspace tables
+
+    []:
+        no tables
     """
+
+    normalized_document_ids = (
+        None
+        if allowed_document_ids is None
+        else {
+            int(document_id)
+            for document_id in allowed_document_ids
+        }
+    )
+
+    if normalized_document_ids == set():
+        return []
 
     prefix = f"ws_{workspace_id}_"
 
@@ -25,6 +42,14 @@ def get_workspace_schema(
         for table_name in SQLiteManager.list_tables()
         if table_name.startswith(prefix)
     ]
+
+    if normalized_document_ids is not None:
+        table_names = [
+            table_name
+            for table_name in table_names
+            if _get_document_id(table_name)
+            in normalized_document_ids
+        ]
 
     if not table_names:
         return []
@@ -38,6 +63,7 @@ def get_workspace_schema(
         schema = []
 
         for table_name in table_names:
+
             columns = [
                 row[1]
                 for row in connection.execute(
@@ -50,10 +76,13 @@ def get_workspace_schema(
             ).fetchall()
 
             numeric_columns = _detect_numeric_columns(
-                columns, sample_rows
+                columns,
+                sample_rows,
             )
 
-            document_id = _get_document_id(table_name)
+            document_id = _get_document_id(
+                table_name
+            )
 
             schema.append(
                 {
@@ -74,34 +103,53 @@ def _detect_numeric_columns(
     columns: list[str],
     sample_rows: list[tuple],
 ) -> list[str]:
+
     numeric = []
 
     for index, column in enumerate(columns):
+
         values = [
             row[index]
             for row in sample_rows
             if row[index] not in (None, "")
         ]
 
-        if values and all(_is_number(value) for value in values):
+        if values and all(
+            _is_number(value)
+            for value in values
+        ):
             numeric.append(column)
 
     return numeric
 
 
-def _is_number(value: Any) -> bool:
+def _is_number(
+    value: Any,
+) -> bool:
+
     try:
         float(value)
         return True
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError,
+    ):
         return False
 
 
-def _get_document_id(table_name: str) -> int | None:
+def _get_document_id(
+    table_name: str,
+) -> int | None:
+
     parts = table_name.split("_")
 
     try:
         doc_index = parts.index("doc")
-        return int(parts[doc_index + 1])
-    except (ValueError, IndexError):
+        return int(
+            parts[doc_index + 1]
+        )
+    except (
+        ValueError,
+        IndexError,
+    ):
         return None

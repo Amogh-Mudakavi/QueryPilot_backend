@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from pathlib import Path
@@ -7,6 +8,8 @@ from typing import Any
 
 from django.conf import settings
 
+
+logger = logging.getLogger(__name__)
 
 MAX_RESULTS = 100
 QUERY_TIMEOUT_SECONDS = 3.0
@@ -17,7 +20,9 @@ def query_tables(
     workspace_id: int,
     sql: str,
     parameters: list[Any] | tuple[Any, ...] | None = None,
+    allowed_table_names: set[str] | None = None,
 ) -> dict[str, Any]:
+
     if workspace_id <= 0:
         raise ValueError(
             "workspace_id must be greater than zero."
@@ -56,6 +61,22 @@ def query_tables(
         raise ValueError(
             "No tables are available for this workspace."
         )
+
+    if allowed_table_names is not None:
+        allowed_tables.intersection_update(
+            allowed_table_names
+        )
+
+        if not allowed_tables:
+            raise ValueError(
+                "No tables are allowed for this query."
+            )
+
+    logger.info(
+        "query_tables: workspace_id=%s allowed_table_names=%s",
+        workspace_id,
+        sorted(allowed_tables),
+    )
 
     connection = sqlite3.connect(
         f"file:{_database_path()}?mode=ro",
@@ -100,20 +121,32 @@ def query_tables(
             )
         ]
 
-        return {
+        rows_list = [
+            {
+                column: row[column]
+                for column in columns
+            }
+            for row in rows
+        ]
+
+        result = {
             "success": True,
             "columns": columns,
-            "rows": [
-                {
-                    column: row[column]
-                    for column in columns
-                }
-                for row in rows
-            ],
-            "row_count": len(rows),
-            "truncated": len(rows) >= MAX_RESULTS,
-            "tables_used": sorted(tables_used),
+            "rows": rows_list,
+            "row_count": len(rows_list),
+            "truncated": len(rows_list) >= MAX_RESULTS,
+            "tables_used": sorted(
+                tables_used
+            ),
         }
+
+        logger.info(
+            "query_tables: returned %d rows tables_used=%s",
+            result["row_count"],
+            result["tables_used"],
+        )
+
+        return result
 
     except sqlite3.Error as exc:
         raise ValueError(
@@ -142,6 +175,7 @@ def _database_path() -> str:
 def _get_workspace_tables(
     workspace_id: int,
 ) -> set[str]:
+
     connection = sqlite3.connect(
         f"file:{_database_path()}?mode=ro",
         uri=True,
@@ -173,6 +207,7 @@ def _authorizer(
     allowed_tables: set[str],
     tables_used: set[str],
 ):
+
     forbidden = {
         sqlite3.SQLITE_INSERT,
         sqlite3.SQLITE_UPDATE,
@@ -211,6 +246,7 @@ def _authorizer(
             return sqlite3.SQLITE_DENY
 
         if action == sqlite3.SQLITE_READ:
+
             table_name = arg1
 
             if (
@@ -224,26 +260,10 @@ def _authorizer(
                 return sqlite3.SQLITE_DENY
 
             if table_name in allowed_tables:
-                tables_used.add(table_name)
+                tables_used.add(
+                    table_name
+                )
 
         return sqlite3.SQLITE_OK
 
     return check
-
-
-# #     So query_tables.py responsibility is now exactly this
-# # SQL comes in
-# #    ↓
-# # must be SELECT / WITH
-# #    ↓
-# # workspace tables checked
-# #    ↓
-# # SQLite opens read-only
-# #    ↓
-# # SQLite authorizer blocks writes/admin operations, tracks tables read
-# #    ↓
-# # execute
-# #    ↓
-# # return rows + tables_used
-
-# Nothing else.

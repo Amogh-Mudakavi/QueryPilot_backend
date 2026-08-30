@@ -1,25 +1,6 @@
-"""
-planner/tools/search_evidence.py
-
-LangGraph tool for retrieving document evidence.
-
-The tool is intentionally thin.
-
-Responsibilities:
-    - Accept a search query and workspace.
-    - Call the existing HybridRetriever.
-    - Return bounded, serializable evidence.
-
-It does NOT:
-    - decide whether retrieval is needed
-    - inspect whether evidence is sufficient
-    - query SQLite
-    - call the LLM
-    - decide when the agent should stop
-"""
-
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from retrieval.services.hybrid_retriever import (
@@ -28,6 +9,7 @@ from retrieval.services.hybrid_retriever import (
 
 
 _retriever = HybridRetriever()
+logger = logging.getLogger(__name__)
 
 MAX_EVIDENCE_ITEMS = 8
 MAX_CHARS_PER_EVIDENCE = 6000
@@ -92,26 +74,16 @@ def search_evidence(
     *,
     query: str,
     workspace_id: int,
+    allowed_document_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     """
-    Retrieve the strongest bounded document evidence.
+    Retrieve bounded document evidence.
 
-    Args:
-        query:
-            Search query produced by the agent.
+    If allowed_document_ids is supplied, retrieval is restricted
+    to exactly those document IDs.
 
-        workspace_id:
-            Current workspace.
-
-    Returns:
-        Dictionary containing:
-            - evidence
-            - confidence
-            - candidate_count
-
-    Raises:
-        ValueError:
-            If query is empty or workspace_id is invalid.
+    An empty allow-list is treated as no allowed documents and
+    therefore returns no evidence.
     """
 
     query = query.strip()
@@ -126,9 +98,16 @@ def search_evidence(
             "workspace_id must be greater than zero."
         )
 
+    logger.info(
+        "search_evidence: workspace_id=%s allowed_document_ids=%s",
+        workspace_id,
+        allowed_document_ids,
+    )
+
     result = _retriever.retrieve(
         query=query,
         workspace_id=workspace_id,
+        allowed_document_ids=allowed_document_ids,
     )
 
     raw_evidence = [
@@ -138,6 +117,13 @@ def search_evidence(
 
     evidence = _bound_evidence(
         raw_evidence
+    )
+
+    logger.info(
+        "search_evidence: returning evidence=%d candidate_count=%s confidence=%.4f",
+        len(evidence),
+        result.candidate_count,
+        result.confidence,
     )
 
     return {

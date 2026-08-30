@@ -415,9 +415,10 @@ def execute_message_stream(
     guard = ScopeGuard()
 
     scope_result = guard.classify(
-        query=user_message,
-        workspace_id=conversation.workspace_id,
-        conversation_history=conversation_history,
+    query=user_message,
+    workspace_id=conversation.workspace_id,
+    allowed_document_ids=document_ids,
+    conversation_history=conversation_history,
     )
 
     route = scope_result.route
