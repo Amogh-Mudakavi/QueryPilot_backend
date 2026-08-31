@@ -27,6 +27,13 @@ class JWTAuthentication(BaseAuthentication):
         except Exception as exc:
             raise AuthenticationFailed("Invalid or expired token.") from exc
 
+        # A refresh token is also a validly-signed JWT. Without this
+        # check, someone could take a refresh token and use it directly
+        # as a bearer token on any protected endpoint — completely
+        # skipping the short access-token lifetime.
+        if payload.get("type") != "access":
+            raise AuthenticationFailed("Invalid token type.")
+
         user_id = payload.get("user_id")
         if not user_id:
             raise AuthenticationFailed("Invalid token payload.")

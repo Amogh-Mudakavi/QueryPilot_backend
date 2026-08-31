@@ -1,21 +1,46 @@
 from pathlib import Path
 import os
 
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+
+def _env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_list(name, default=None):
+    value = os.getenv(name)
+    if not value:
+        return list(default or [])
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 # =====================================================
 # SECURITY
 # =====================================================
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY")
+if not SECRET_KEY:
+    raise ImproperlyConfigured(
+        "DJANGO_SECRET_KEY is not set. Add it to your .env file."
+    )
 
-DEBUG = True
+# Fail closed: DEBUG is OFF unless something explicitly turns it on.
+# For local dev, add DJANGO_DEBUG=True to your .env file.
+DEBUG = _env_bool("DJANGO_DEBUG", default=False)
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = _env_list(
+    "DJANGO_ALLOWED_HOSTS",
+    default=["localhost", "127.0.0.1"] if DEBUG else [],
+)
 
 # =====================================================
 # APPLICATIONS
@@ -71,11 +96,32 @@ AUTH_USER_MODEL = "accounts.User"
 
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 
+# HS256 needs a properly-sized key (32+ random bytes). A short or
+# missing key is a real weakness, not a warning to shrug off — so we
+# refuse to start instead of running with a weak key.
+if not JWT_SECRET_KEY or len(JWT_SECRET_KEY) < 32:
+    raise ImproperlyConfigured(
+        "JWT_SECRET_KEY is missing or shorter than 32 characters. "
+        "Generate one with: "
+        "python -c \"import secrets; print(secrets.token_urlsafe(48))\" "
+        "and put it in your .env file."
+    )
+
+# Access tokens are short-lived on purpose — refresh tokens are what
+# keep the session going. Override via env if you need to.
+ACCESS_TOKEN_LIFETIME_MINUTES = int(os.getenv("ACCESS_TOKEN_LIFETIME_MINUTES", "15"))
+REFRESH_TOKEN_LIFETIME_DAYS = int(os.getenv("REFRESH_TOKEN_LIFETIME_DAYS", "7"))
+
 # =====================================================
 # CORS
 # =====================================================
 
-CORS_ALLOW_ALL_ORIGINS = True
+if DEBUG:
+    # Convenient for local dev only.
+    CORS_ALLOW_ALL_ORIGINS = True
+else:
+    CORS_ALLOW_ALL_ORIGINS = False
+    CORS_ALLOWED_ORIGINS = _env_list("CORS_ALLOWED_ORIGINS", default=[])
 
 CORS_EXPOSE_HEADERS = [
     "X-Conversation-Id",

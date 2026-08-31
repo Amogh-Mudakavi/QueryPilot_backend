@@ -1,10 +1,18 @@
-import jwt
-from accounts.models import User
-from datetime import datetime, timedelta, timezone
-from django.conf import settings
-from rest_framework.response import Response
-from rest_framework import status
+import secrets
+from datetime import datetime, timedelta, timezone as dt_timezone
 
+import jwt
+from django.conf import settings
+from rest_framework import status
+from rest_framework.response import Response
+
+
+def _access_token_lifetime():
+    return timedelta(minutes=getattr(settings, "ACCESS_TOKEN_LIFETIME_MINUTES", 15))
+
+
+def _refresh_token_lifetime():
+    return timedelta(days=getattr(settings, "REFRESH_TOKEN_LIFETIME_DAYS", 7))
 
 
 def generate_access_token(user):
@@ -13,16 +21,11 @@ def generate_access_token(user):
         "user_id": user.id,
         "email": user.email,
         "type": "access",
-        "exp": datetime.now(timezone.utc) + timedelta(days = 1),
+        "iat": datetime.now(dt_timezone.utc),
+        "exp": datetime.now(dt_timezone.utc) + _access_token_lifetime(),
     }
 
-    token = jwt.encode(
-        payload,
-        settings.JWT_SECRET_KEY,
-        algorithm="HS256",
-    )
-
-    return token
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm="HS256")
 
 
 def generate_refresh_token(user):
@@ -30,48 +33,25 @@ def generate_refresh_token(user):
     payload = {
         "user_id": user.id,
         "type": "refresh",
-        "exp": datetime.now(timezone.utc) + timedelta(days=7),
+        # A random id per token. Not required for the hash-lookup flow
+        # to work, but it means two refresh tokens minted in the same
+        # second for the same user still hash to different values.
+        "jti": secrets.token_hex(16),
+        "iat": datetime.now(dt_timezone.utc),
+        "exp": datetime.now(dt_timezone.utc) + _refresh_token_lifetime(),
     }
 
-    token = jwt.encode(
-        payload,
-        settings.JWT_SECRET_KEY,
-        algorithm="HS256",
-    )
-
-    return token
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm="HS256")
 
 
 def decode_token(token):
 
-    payload = jwt.decode(
+    return jwt.decode(
         token,
         settings.JWT_SECRET_KEY,
         algorithms=["HS256"],
     )
 
-    return payload
-
-
-def get_current_user(request):
-
-    authorization = request.headers.get("Authorization")
-
-    if not authorization:
-        return None
-
-    token = authorization.split(" ")[1]
-
-    payload = decode_token(token)
-
-    user_id = payload["user_id"]
-
-    user = User.objects.get(id=user_id)
-
-    if user.is_blocked:
-        raise 
-
-    return user
 
 def admin_required(user):
 

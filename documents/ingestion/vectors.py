@@ -27,7 +27,6 @@ DOCUMENT_COLLECTION = "querypilot_document_metadata"
 
 
 class VectorStore:
-    print("STORE_DOCUMENT_PROFILE CALLED")
     """
     Central Chroma interface.
 
@@ -64,9 +63,19 @@ class VectorStore:
 
         if cls._embedder is None:
 
-            cls._embedder = SentenceTransformer(
-                "mixedbread-ai/mxbai-embed-large-v1"
-            )
+            try:
+                # Model already cached locally (normal case after first boot) —
+                # skip the network round-trips entirely.
+                cls._embedder = SentenceTransformer(
+                    "mixedbread-ai/mxbai-embed-large-v1",
+                    local_files_only=True,
+                )
+            except Exception:
+                # Cache missing (first-ever boot on a fresh machine) —
+                # fall back to a real download.
+                cls._embedder = SentenceTransformer(
+                    "mixedbread-ai/mxbai-embed-large-v1"
+                )
 
         return cls._embedder
 

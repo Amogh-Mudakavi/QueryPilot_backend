@@ -19,7 +19,6 @@ class DocumentProfileBuilder:
     - first chunk preview
     - table metadata
     """
-    print("INSIDE PROFILE BUILDER")
     @staticmethod
     def build_profile_text(
         document_title: str,
