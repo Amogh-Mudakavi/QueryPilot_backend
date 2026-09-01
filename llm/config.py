@@ -38,7 +38,14 @@ TASK_KEY_OFFSET = {
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_MAX_TOKENS = 1024
 
-MAX_RETRIES = 2
-REQUEST_TIMEOUT = 30
+# Total number of attempts, including the first request.
+MAX_ATTEMPTS = 3
+
+# Maximum time allowed for one provider request.
+REQUEST_TIMEOUT = 30.0
+
+# Base retry delay. Backoff becomes roughly:
+# 1s -> 2s
+RETRY_BACKOFF_SECONDS = 1.0
 
 DEFAULT_PROVIDER = "groq"

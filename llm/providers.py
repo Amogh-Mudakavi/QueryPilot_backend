@@ -1,11 +1,14 @@
 import logging
+import random
 import time
 
 from groq import Groq
 
 from .config import (
     GROQ_API_KEYS,
-    MAX_RETRIES,
+    MAX_ATTEMPTS,
+    REQUEST_TIMEOUT,
+    RETRY_BACKOFF_SECONDS,
     TASK_KEY_OFFSET,
 )
 from .exceptions import (
@@ -13,6 +16,7 @@ from .exceptions import (
     InvalidResponseError,
     ProviderUnavailableError,
     RateLimitError,
+    TimeoutError,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,7 +42,8 @@ class GroqProvider:
     def __init__(self):
         self.clients = [
             Groq(
-                api_key=key
+                api_key=key,
+                timeout=REQUEST_TIMEOUT,
             )
             for key in GROQ_API_KEYS
         ]
@@ -61,6 +66,40 @@ class GroqProvider:
 
         return self.clients[index]
 
+    def _get_retry_delay(self, attempt: int) -> float:
+        """
+        Small exponential backoff with jitter.
+
+        attempt=1 -> about 1s
+        attempt=2 -> about 2s
+        """
+        base_delay = (
+            RETRY_BACKOFF_SECONDS
+            * (2 ** (attempt - 1))
+        )
+
+        jitter = random.uniform(0, 0.25)
+
+        return base_delay + jitter
+
+    @staticmethod
+    def _get_status_code(exc):
+        return getattr(
+            exc,
+            "status_code",
+            None,
+        )
+
+    @staticmethod
+    def _is_retryable_status(status):
+        return status in {
+            429,
+            500,
+            502,
+            503,
+            504,
+        }
+
     def generate(
         self,
         *,
@@ -75,10 +114,8 @@ class GroqProvider:
     ):
         extra_params = {}
 
-        # Reasoning models (e.g. gpt-oss-20b) spend completion
-        # tokens on internal reasoning before writing output.
-        # include_reasoning=False tells Groq to keep that low so
-        # max_tokens isn't consumed before the JSON is produced.
+        # Reasoning models can spend completion tokens on internal
+        # reasoning. Keep reasoning low when explicitly requested.
         if include_reasoning is False:
             extra_params["reasoning_effort"] = "low"
 
@@ -86,13 +123,11 @@ class GroqProvider:
 
         for attempt in range(
             1,
-            MAX_RETRIES + 1,
+            MAX_ATTEMPTS + 1,
         ):
-
             client = self._get_client(task)
 
             try:
-
                 response = client.chat.completions.create(
                     model=model,
                     messages=messages,
@@ -114,47 +149,94 @@ class GroqProvider:
                 return response
 
             except Exception as exc:
-
                 last_error = exc
 
-                status = getattr(
-                    exc,
-                    "status_code",
-                    None,
-                )
+                status = self._get_status_code(exc)
 
                 logger.warning(
-                    "[LLM] task=%s model=%s "
-                    "attempt=%s status=%s error=%s",
+                    "[LLM] task=%s model=%s attempt=%s/%s "
+                    "status=%s error=%s",
                     task,
                     model,
                     attempt,
+                    MAX_ATTEMPTS,
                     status,
                     exc,
                 )
 
+                # Invalid key / forbidden request:
+                # do not blindly keep retrying the same problem.
                 if status in (401, 403):
                     raise AuthenticationError(
                         str(exc)
                     ) from exc
 
-                if status == 429:
-                    if attempt < MAX_RETRIES:
-                        time.sleep(1)
+                # Timeouts should be retryable.
+                exception_name = exc.__class__.__name__.lower()
+
+                if "timeout" in exception_name:
+                    if attempt < MAX_ATTEMPTS:
+                        time.sleep(
+                            self._get_retry_delay(attempt)
+                        )
                         continue
 
-                    raise RateLimitError(
+                    raise TimeoutError(
+                        "Groq request timed out."
+                    ) from exc
+
+                # Rate limits and transient provider failures:
+                # retry with the next key + backoff.
+                if self._is_retryable_status(status):
+                    if attempt < MAX_ATTEMPTS:
+                        time.sleep(
+                            self._get_retry_delay(attempt)
+                        )
+                        continue
+
+                    if status == 429:
+                        raise RateLimitError(
+                            str(exc)
+                        ) from exc
+
+                    raise ProviderUnavailableError(
                         str(exc)
                     ) from exc
 
+                # Other connection/network-style failures usually don't
+                # expose a useful HTTP status. Give them a bounded retry.
+                if status is None:
+                    if attempt < MAX_ATTEMPTS:
+                        time.sleep(
+                            self._get_retry_delay(attempt)
+                        )
+                        continue
+
+                    raise ProviderUnavailableError(
+                        f"Groq request failed: {exc}"
+                    ) from exc
+
+                # HTTP 400 is intentionally NOT retried here.
+                #
+                # A bad request and a model-generated malformed response
+                # are different problems. Structured-output recovery
+                # belongs at the caller/planner layer.
                 if status == 400:
                     raise InvalidResponseError(
                         str(exc)
                     ) from exc
 
-                if attempt < MAX_RETRIES:
-                    time.sleep(1)
+                # Any other unexpected provider error:
+                # bounded retry, then fail cleanly.
+                if attempt < MAX_ATTEMPTS:
+                    time.sleep(
+                        self._get_retry_delay(attempt)
+                    )
                     continue
+
+                raise ProviderUnavailableError(
+                    f"Groq failed: {exc}"
+                ) from exc
 
         raise ProviderUnavailableError(
             f"Groq failed: {last_error}"

@@ -4,6 +4,16 @@ from django.conf import settings
 from llama_cloud import LlamaCloud
 
 
+# client.parsing.parse() combines an upload + a parse job + polling for
+# completion, so it needs a much longer timeout than a single HTTP call.
+# The SDK's own default for combined calls already scales for this, but
+# leaving it implicit meant a hang here had no clear ceiling - a single
+# stuck parse could block the whole worker indefinitely. 10 minutes is
+# generous for "agentic" tier on a large document while still guaranteeing
+# a bounded, visible failure instead of an open-ended hang.
+PARSE_TIMEOUT_SECONDS = 600.0
+
+
 class LlamaParseService:
     """
     Thin wrapper around LlamaParse.
@@ -14,13 +24,21 @@ class LlamaParseService:
 
     client = LlamaCloud(
         api_key=settings.LLAMA_CLOUD_API_KEY,
+        timeout=PARSE_TIMEOUT_SECONDS,
     )
 
     @classmethod
     def parse_document(cls, file_path: str):
 
+        path = Path(file_path)
+
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Document file not found at '{file_path}'."
+            )
+
         uploaded_file = cls.client.files.create(
-            file=Path(file_path),
+            file=path,
             purpose="parse",
         )
 
@@ -49,7 +67,7 @@ class LlamaAdapter:
         text_nodes = []
 
         pages = getattr(
-            result.items,
+            getattr(result, "items", None),
             "pages",
             [],
         )
@@ -117,7 +135,7 @@ class LlamaAdapter:
         table_nodes = []
 
         pages = getattr(
-            result.items,
+            getattr(result, "items", None),
             "pages",
             [],
         )

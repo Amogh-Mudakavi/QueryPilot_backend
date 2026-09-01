@@ -1,3 +1,5 @@
+import logging
+
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 
@@ -19,6 +21,8 @@ from documents.ingestion.sqlite import SQLiteManager
 from documents.ingestion.vectors import VectorStore
 
 from utils.redis import publish_job
+
+logger = logging.getLogger(__name__)
 
 
 class DocumentUploadAPIView(APIView):
@@ -258,27 +262,57 @@ class DocumentDeleteAPIView(APIView):
 
         workspace_id = document.workspace_id
 
+        # Vector and SQLite cleanup are best-effort and independent of
+        # each other and of the Django row below. @transaction.atomic
+        # only covers the ORM/MySQL side (this Document row) - it has
+        # no knowledge of Chroma or SQLite, so a failure in one of them
+        # must not be allowed to block deleting the other, or block
+        # deleting the Document row itself. A document a user can't
+        # delete is worse than a leftover vector/table nobody will
+        # query again once the Document row is gone.
+        cleanup_errors = []
+
         try:
             VectorStore.delete_document(
                 document_id=document.id
             )
+        except Exception:
+            logger.exception(
+                "Vector cleanup failed for document %s",
+                document.id,
+            )
+            cleanup_errors.append("vectors")
 
+        try:
             SQLiteManager.drop_document_tables(
                 workspace_id=workspace_id,
                 document_id=document.id,
             )
+        except Exception:
+            logger.exception(
+                "SQLite cleanup failed for document %s",
+                document.id,
+            )
+            cleanup_errors.append("tables")
 
-            if document.file:
-                document.file.delete(
-                    save=False
-                )
+        if document.file:
+            document.file.delete(
+                save=False
+            )
 
-            document.delete()
+        document.delete()
 
-        except Exception as exc:
-            raise RuntimeError(
-                "Document cleanup failed."
-            ) from exc
+        if cleanup_errors:
+            return Response(
+                {
+                    "message": (
+                        "Document deleted, but cleanup of "
+                        f"{', '.join(cleanup_errors)} may be "
+                        "incomplete. This has been logged."
+                    )
+                },
+                status=status.HTTP_200_OK,
+            )
 
         return Response(
             {

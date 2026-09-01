@@ -41,7 +41,24 @@ from chat.services.conversation import (
 from chat.services.execution import (
     execute_message_stream,
 )
+from utils.redis import check_chat_question_limit
 from workspace.models import Workspace
+
+
+# ---------------------------------------------------------
+# Final user-facing message when the chat quota is exhausted
+# ---------------------------------------------------------
+
+CHAT_LIMIT_MESSAGE = (
+    "Looks like I’ve hit the ceiling on the LLM credits available "
+    "to this solo-developer project. I’ve exhausted the recovery "
+    "options, so I’d rather be honest than invent an answer. "
+    "QueryPilot is being built and funded by one developer using "
+    "limited/free API capacity. If you see potential here, please "
+    "consider hiring him, referring him, or connecting him with "
+    "someone who can. Give him the opportunity and the resources, "
+    "and this product can go much further."
+)
 
 
 class ConversationListCreateView(APIView):
@@ -248,6 +265,51 @@ class StreamMessageView(APIView):
                 },
                 status=status.HTTP_404_NOT_FOUND,
             )
+
+        # ---------------------------------------------------------
+        # Per-user question limit
+        #
+        # First 10 questions:
+        #     normal QueryPilot execution
+        #
+        # Question 11:
+        #     return the fixed solo-developer message
+        #     without calling any LLM
+        #
+        # During the 2-hour cooldown:
+        #     immediately return the same message
+        # ---------------------------------------------------------
+
+        allowed, _ = check_chat_question_limit(
+            user_id=request.user.id,
+        )
+
+        if not allowed:
+
+            def limited_event_stream():
+                payload = {
+                    "message": CHAT_LIMIT_MESSAGE,
+                    "data": {
+                        "status": "rate_limited",
+                        "retry_after_seconds": 7200,
+                    },
+                }
+
+                yield (
+                    "event: complete\n"
+                    f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                )
+
+            response = StreamingHttpResponse(
+                limited_event_stream(),
+                content_type="text/event-stream",
+                status=200,
+            )
+
+            response["Cache-Control"] = "no-cache"
+            response["X-Accel-Buffering"] = "no"
+
+            return response
 
         def event_stream():
             """

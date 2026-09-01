@@ -6,48 +6,69 @@ Run with:
     python manage.py ingestion_worker
 
 Startup:
-    1. Recover pending jobs from the database.
+    1. Recover pending and stuck-processing jobs from the database.
     2. Process them.
     3. Start listening for new Redis notifications.
+
+Safe to run as multiple concurrent processes (e.g. 3 worker replicas
+in production) - job claiming uses select_for_update(skip_locked=True)
+so only one process can ever pick up a given job.
 """
 
 from __future__ import annotations
 
+import logging
+
 from datetime import datetime, timezone
 
 from django.core.management.base import BaseCommand
+from django.db import transaction
 
 from documents.ingestion.pipeline import IngestionPipeline
 from documents.models import IngestionJob
 from utils.redis import get_pubsub
 
+logger = logging.getLogger(__name__)
 
-def process_ingestion_job(job_id: int) -> None:
+
+def _claim_job(job_id: int):
     """
-    Process one pending ingestion job.
+    Atomically claims a job for this worker process, if it's still
+    claimable.
+
+    Uses select_for_update(skip_locked=True) so that when multiple
+    worker processes receive the same Redis broadcast for this job_id
+    (pub/sub delivers to every subscriber, not just one), only the
+    first to reach this row wins the row lock and flips it to
+    "processing". Every other worker's SELECT either sees the row is
+    no longer "pending" (lock already released, status changed) or is
+    skipped immediately via skip_locked instead of blocking - so it
+    returns None right away rather than waiting and then double
+    processing.
+
+    Runs as its own short transaction, separate from the actual
+    ingestion work below, so a slow pipeline run doesn't hold this row
+    lock for the run's whole duration.
+
+    Returns the claimed (job, document) tuple, or (None, None) if this
+    process lost the race or the job isn't in a claimable state.
     """
 
-    job = (
-        IngestionJob.objects
-        .select_related("document")
-        .filter(id=job_id)
-        .first()
-    )
-
-    if job is None:
-        print(f"[INGESTION] Job {job_id} not found.")
-        return
-
-    if job.status != "pending":
-        print(
-            f"[INGESTION] Ignoring job {job.id}; "
-            f"status={job.status}"
+    with transaction.atomic():
+        job = (
+            IngestionJob.objects
+            .select_for_update(skip_locked=True)
+            .select_related("document")
+            .filter(
+                id=job_id,
+                status__in=["pending", "processing"],
+            )
+            .first()
         )
-        return
 
-    document = job.document
+        if job is None:
+            return None, None
 
-    try:
         job.attempts += 1
         job.status = "processing"
         job.started_at = datetime.now(timezone.utc)
@@ -62,6 +83,8 @@ def process_ingestion_job(job_id: int) -> None:
             ]
         )
 
+        document = job.document
+
         document.status = "processing"
 
         document.save(
@@ -71,8 +94,27 @@ def process_ingestion_job(job_id: int) -> None:
             ]
         )
 
-        print(
-            f"[INGESTION] Processing job {job.id}"
+        return job, document
+
+
+def process_ingestion_job(job_id: int) -> None:
+    """
+    Process one ingestion job, if this worker successfully claims it.
+    """
+
+    job, document = _claim_job(job_id)
+
+    if job is None:
+        logger.info(
+            "[INGESTION] Job %s not claimable "
+            "(already taken, missing, or in a terminal state).",
+            job_id,
+        )
+        return
+
+    try:
+        logger.info(
+            "[INGESTION] Processing job %s", job.id
         )
 
         IngestionPipeline.run(document)
@@ -100,8 +142,8 @@ def process_ingestion_job(job_id: int) -> None:
             ]
         )
 
-        print(
-            f"[INGESTION] Completed job {job.id}"
+        logger.info(
+            "[INGESTION] Completed job %s", job.id
         )
 
     except Exception as exc:
@@ -124,35 +166,46 @@ def process_ingestion_job(job_id: int) -> None:
             ]
         )
 
-        print(
-            f"[INGESTION] Failed job {job.id}: {exc}"
+        logger.exception(
+            "[INGESTION] Failed job %s", job.id
         )
 
 
 def recover_pending_jobs() -> None:
     """
-    Process jobs that were already pending when the worker started.
+    Process jobs that were already pending or stuck in "processing"
+    when the worker started.
+
+    A job can be found "processing" at startup if a previous worker
+    process died mid-ingestion (crash, OOM kill, deploy restart) after
+    claiming the job but before finishing it. Recovering "processing"
+    jobs here, not just "pending" ones, means such a job gets retried
+    instead of sitting stuck forever with no worker aware of it.
+
+    Safe to call from multiple worker processes starting at once -
+    process_ingestion_job's claim is what actually serializes who
+    gets each job, this function just enumerates candidates.
     """
 
-    pending_job_ids = list(
+    job_ids = list(
         IngestionJob.objects
-        .filter(status="pending")
+        .filter(status__in=["pending", "processing"])
         .order_by("id")
         .values_list("id", flat=True)
     )
 
-    if not pending_job_ids:
-        print(
-            "[INGESTION] No pending jobs at startup."
+    if not job_ids:
+        logger.info(
+            "[INGESTION] No pending or stuck jobs at startup."
         )
         return
 
-    print(
-        f"[INGESTION] Found "
-        f"{len(pending_job_ids)} pending job(s) at startup."
+    logger.info(
+        "[INGESTION] Found %d job(s) to recover at startup.",
+        len(job_ids),
     )
 
-    for job_id in pending_job_ids:
+    for job_id in job_ids:
         process_ingestion_job(job_id)
 
 
@@ -165,9 +218,8 @@ def start_worker() -> None:
 
     pubsub = get_pubsub()
 
-    print(
-        "[INGESTION] Worker started. "
-        "Listening on admin_jobs..."
+    logger.info(
+        "[INGESTION] Worker started. Listening on admin_jobs..."
     )
 
     for message in pubsub.listen():
@@ -181,14 +233,14 @@ def start_worker() -> None:
             TypeError,
             ValueError,
         ):
-            print(
-                "[INGESTION] Ignoring invalid job ID: "
-                f"{message.get('data')}"
+            logger.warning(
+                "[INGESTION] Ignoring invalid job ID: %s",
+                message.get("data"),
             )
             continue
 
-        print(
-            f"[INGESTION] Received job {job_id}"
+        logger.info(
+            "[INGESTION] Received job %s", job_id
         )
 
         process_ingestion_job(job_id)

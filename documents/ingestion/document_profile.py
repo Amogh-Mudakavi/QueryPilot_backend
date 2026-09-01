@@ -1,6 +1,10 @@
+import logging
+
 from documents.ingestion.vectors import (
     VectorStore,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class DocumentProfileBuilder:
@@ -125,6 +129,7 @@ class DocumentProfileBuilder:
             profile_text=profile_text,
         )
 
-        print(
-            f"Stored document profile for document {document_id}"
+        logger.info(
+            "Stored document profile for document %s",
+            document_id,
         )

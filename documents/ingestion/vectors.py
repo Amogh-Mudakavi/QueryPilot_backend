@@ -105,6 +105,11 @@ class VectorStore:
         texts,
     ):
 
+        if not texts:
+            raise ValueError(
+                "Cannot embed an empty list of texts."
+            )
+
         model = cls.get_embedder()
 
         return model.encode(
@@ -161,7 +166,11 @@ class VectorStore:
                 }
             )
 
-        collection.add(
+        # upsert, not add: add() raises on an ID that already exists,
+        # which breaks retrying a document whose previous ingestion
+        # attempt got partway through before failing. upsert() overwrites
+        # cleanly, making a retry of this step safe to repeat.
+        collection.upsert(
             ids=ids,
             documents=documents,
             embeddings=cls.embed(
@@ -183,7 +192,9 @@ class VectorStore:
             cls.knowledge_collection()
         )
 
-        collection.add(
+        # upsert for the same reason as store_chunks - safe to repeat
+        # on retry without erroring on a duplicate ID.
+        collection.upsert(
             ids=[
                 f"{table_name}_metadata"
             ],
@@ -246,15 +257,36 @@ class VectorStore:
         cls,
         document_id,
     ):
+        """
+        Deletes both collections' entries for a document.
 
-        cls.knowledge_collection().delete(
-            where={
-                "document_id": document_id
-            }
-        )
+        Both deletes are attempted even if one fails, so a problem in
+        one collection doesn't leave the other with orphaned vectors
+        for a document that's otherwise being removed.
+        """
 
-        cls.document_collection().delete(
-            where={
-                "document_id": document_id
-            }
-        )
+        errors = []
+
+        try:
+            cls.knowledge_collection().delete(
+                where={
+                    "document_id": document_id
+                }
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+        try:
+            cls.document_collection().delete(
+                where={
+                    "document_id": document_id
+                }
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+        if errors:
+            raise RuntimeError(
+                f"Vector deletion failed for document {document_id}: "
+                f"{errors}"
+            )

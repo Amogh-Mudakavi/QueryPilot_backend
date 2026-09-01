@@ -7,6 +7,12 @@ from django.conf import settings
 
 MAX_QUERY_SECONDS = 3.0
 
+# How long a connection will wait for a lock held by another writer
+# before giving up. Needed once more than one ingestion worker process
+# can write to this file concurrently - without this, a second writer
+# gets "database is locked" immediately instead of just waiting briefly.
+CONNECTION_TIMEOUT_SECONDS = 10
+
 
 class SQLiteManager:
     DB_PATH = (
@@ -21,7 +27,18 @@ class SQLiteManager:
             parents=True,
             exist_ok=True,
         )
-        return sqlite3.connect(cls.DB_PATH)
+
+        connection = sqlite3.connect(
+            cls.DB_PATH,
+            timeout=CONNECTION_TIMEOUT_SECONDS,
+        )
+
+        # WAL allows one writer + concurrent readers instead of locking
+        # the whole file on every write. Safe to set on every connect -
+        # it's a no-op if already enabled.
+        connection.execute("PRAGMA journal_mode=WAL")
+
+        return connection
 
     @staticmethod
     def sanitize_column_name(column_name):
@@ -32,6 +49,11 @@ class SQLiteManager:
 
     @classmethod
     def create_table(cls, table_name, columns):
+        if not columns:
+            raise ValueError(
+                f"Cannot create table '{table_name}' with no columns."
+            )
+
         connection = cls.get_connection()
         try:
             columns = [
@@ -54,9 +76,24 @@ class SQLiteManager:
         if not rows:
             return
 
+        expected_width = len(rows[0])
+
+        # Every row must match the header width used to create the
+        # table. TableProcessor.normalize_table already pads/truncates
+        # rows to line up with headers, so a mismatch here means a bug
+        # upstream - better to fail loudly now than let sqlite3 raise a
+        # confusing "N values for M columns" error mid-batch, or worse,
+        # silently misalign columns and rows.
+        for row in rows:
+            if len(row) != expected_width:
+                raise ValueError(
+                    f"Row width mismatch for table '{table_name}': "
+                    f"expected {expected_width} columns, got {len(row)}."
+                )
+
         connection = cls.get_connection()
         try:
-            placeholders = ",".join(["?"] * len(rows[0]))
+            placeholders = ",".join(["?"] * expected_width)
             query = (
                 f'INSERT INTO "{table_name}" '
                 f"VALUES ({placeholders})"

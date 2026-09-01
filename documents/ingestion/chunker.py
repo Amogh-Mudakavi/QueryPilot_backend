@@ -123,6 +123,13 @@ class StructureAwareChunker:
             chunk_index is a running count across the whole document, so
             downstream code can restore document order without re-sorting.
         """
+        for node in text_nodes:
+            if "page" not in node or "text" not in node:
+                raise ValueError(
+                    "Each text_node must have 'page' and 'text' keys, "
+                    f"got: {sorted(node.keys())}"
+                )
+
         sections = self.build_sections(text_nodes)
 
         chunks: list[dict] = []

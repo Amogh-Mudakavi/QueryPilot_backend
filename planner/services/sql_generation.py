@@ -52,6 +52,13 @@ Therefore:
   SELECT. Extra columns are cheap. A missing column that a downstream
   policy needs is not recoverable later.
 
+SQL PARAMETERS:
+- "parameters" must contain ONLY scalar values.
+- Each parameter must be a string, number, boolean, or null.
+- Never return objects, dictionaries, arrays, or nested JSON as a parameter.
+- Example:
+    "parameters": ["E005"]
+
 Rules:
 - Use table and column names exactly as provided.
 - Never invent or rename identifiers.
@@ -78,7 +85,14 @@ SQL_GENERATION_SCHEMA = {
                 "sql": {"type": ["string", "null"]},
                 "parameters": {
                     "type": "array",
-                    "items": {},
+                    "items": {
+                        "type": [
+                            "string",
+                            "number",
+                            "boolean",
+                            "null",
+                        ],
+                    },
                 },
             },
             "required": [

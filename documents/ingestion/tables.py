@@ -1,4 +1,7 @@
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class TableProcessor:
@@ -34,6 +37,12 @@ class TableProcessor:
 
         We treat first row as headers.
         """
+
+        if not isinstance(table_node, dict):
+            raise ValueError(
+                "Expected a dict table_node from LlamaParse, "
+                f"got {type(table_node).__name__}."
+            )
 
         raw_rows = table_node.get(
             "rows",
@@ -195,48 +204,29 @@ class TableProcessor:
         Main orchestration method.
         """
 
-        print("\n" + "=" * 80)
-        print("RAW TABLE NODE")
-        print("=" * 80)
-        print(table_node)
-
         table = cls.extract_table(
             table_node
         )
-
-        print("\nEXTRACTED TABLE")
-        print(table)
 
         headers, rows = cls.normalize_table(
             table["headers"],
             table["rows"],
         )
 
-        print("\nNORMALIZED TABLE")
-        print("Headers:")
-        print(headers)
-
-        print("\nRow Count:")
-        print(len(rows))
-
-        if rows:
-            print("\nFirst Row:")
-            print(rows[0])
-
         is_valid = cls.validate_table(
             headers,
             rows,
         )
 
-        print("\nVALIDATION RESULT:")
-        print(is_valid)
-
         if not is_valid:
-
-            print(
-                "\nTABLE REJECTED"
+            logger.info(
+                "Table rejected for document %s (page %s): "
+                "%d headers, %d rows after normalization.",
+                document_id,
+                table.get("page"),
+                len(headers),
+                len(rows),
             )
-
             return None
 
         metadata = cls.build_metadata(
@@ -246,9 +236,6 @@ class TableProcessor:
             headers=headers,
             rows=rows,
         )
-
-        print("\nMETADATA")
-        print(metadata)
 
         semantic_text = (
             cls.serialize_for_embedding(
@@ -267,14 +254,13 @@ class TableProcessor:
             "semantic_text": semantic_text,
         }
 
-        print("\nFINAL PAYLOAD CREATED")
-        print(
-            f"Headers: {len(headers)}"
+        logger.debug(
+            "Processed table for document %s (page %s): "
+            "%d headers, %d rows.",
+            document_id,
+            table.get("page"),
+            len(headers),
+            len(rows),
         )
-        print(
-            f"Rows: {len(rows)}"
-        )
-
-        print("=" * 80)
 
         return payload
