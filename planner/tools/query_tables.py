@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 import time
 from pathlib import Path
@@ -13,6 +14,71 @@ logger = logging.getLogger(__name__)
 
 MAX_RESULTS = 100
 QUERY_TIMEOUT_SECONDS = 3.0
+
+MAX_PARAMETERS = 50
+MAX_PARAMETER_STRING_LENGTH = 1000
+
+
+def _validate_parameters(
+    parameters: Any,
+) -> list[Any]:
+    """
+    Enforce the scalar-only parameter contract at the tool boundary.
+
+    Allowed: str, int, float (finite), bool, None.
+    Rejected: dict, list, tuple, bytes, nested structures, anything else.
+
+    Raised as ValueError so the caller handles it the same way as any
+    other query_tables failure, before SQLite is ever touched.
+    """
+
+    if parameters is None:
+        return []
+
+    if not isinstance(parameters, (list, tuple)):
+        raise ValueError(
+            "SQL parameters must be a list of scalar values."
+        )
+
+    if len(parameters) > MAX_PARAMETERS:
+        raise ValueError(
+            f"Too many SQL parameters (max {MAX_PARAMETERS})."
+        )
+
+    validated: list[Any] = []
+
+    for position, value in enumerate(parameters):
+
+        if value is None:
+            validated.append(value)
+            continue
+
+        # bool is a subclass of int, so it is covered here as well.
+        if not isinstance(value, (str, int, float)):
+            raise ValueError(
+                f"SQL parameter at position {position} must be a "
+                f"string, number, boolean, or null; got "
+                f"{type(value).__name__}."
+            )
+
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(
+                f"SQL parameter at position {position} must be a "
+                f"finite number."
+            )
+
+        if (
+            isinstance(value, str)
+            and len(value) > MAX_PARAMETER_STRING_LENGTH
+        ):
+            raise ValueError(
+                f"SQL parameter at position {position} is too long "
+                f"(max {MAX_PARAMETER_STRING_LENGTH} characters)."
+            )
+
+        validated.append(value)
+
+    return validated
 
 
 def query_tables(
@@ -28,12 +94,13 @@ def query_tables(
             "workspace_id must be greater than zero."
         )
 
-    sql = sql.strip()
-
-    if not sql:
+    # Also covers needs_sql=true with sql=None from the SQL generator.
+    if not isinstance(sql, str) or not sql.strip():
         raise ValueError(
             "SQL query cannot be empty."
         )
+
+    sql = sql.strip()
 
     if not sql.lower().startswith(
         ("select", "with")
@@ -52,6 +119,10 @@ def query_tables(
         raise ValueError(
             "Multiple SQL statements are not allowed."
         )
+
+    validated_parameters = _validate_parameters(
+        parameters
+    )
 
     allowed_tables = _get_workspace_tables(
         workspace_id
@@ -107,12 +178,17 @@ def query_tables(
     try:
         cursor = connection.execute(
             sql,
-            list(parameters or []),
+            validated_parameters,
         )
 
-        rows = cursor.fetchmany(
-            MAX_RESULTS
+        # Fetch one extra row so "truncated" is only True when there
+        # really were more rows than the cap (not merely exactly the cap).
+        fetched = cursor.fetchmany(
+            MAX_RESULTS + 1
         )
+
+        truncated = len(fetched) > MAX_RESULTS
+        rows = fetched[:MAX_RESULTS]
 
         columns = [
             column[0]
@@ -134,7 +210,7 @@ def query_tables(
             "columns": columns,
             "rows": rows_list,
             "row_count": len(rows_list),
-            "truncated": len(rows_list) >= MAX_RESULTS,
+            "truncated": truncated,
             "tables_used": sorted(
                 tables_used
             ),
@@ -182,26 +258,25 @@ def _get_workspace_tables(
     )
 
     try:
-        prefix = f"ws_{workspace_id}_%"
-
         rows = connection.execute(
             """
             SELECT name
             FROM sqlite_master
             WHERE type = 'table'
-              AND name LIKE ?
-            """,
-            (prefix,),
+            """
         ).fetchall()
+
+        prefix = f"ws_{workspace_id}_"
 
         return {
             row[0]
             for row in rows
+            if isinstance(row[0], str)
+            and row[0].startswith(prefix)
         }
 
     finally:
         connection.close()
-
 
 def _authorizer(
     allowed_tables: set[str],
@@ -249,14 +324,17 @@ def _authorizer(
 
             table_name = arg1
 
-            if (
-                table_name is not None
-                and table_name not in allowed_tables
-                and table_name not in {
-                    "sqlite_master",
-                    "sqlite_temp_master",
-                }
-            ):
+            # SQLite schema tables are global metadata, not workspace data.
+            # Never expose them through planner-generated SQL.
+            if table_name in {
+                "sqlite_master",
+                "sqlite_temp_master",
+                "sqlite_schema",
+                "sqlite_temp_schema",
+            }:
+                return sqlite3.SQLITE_DENY
+
+            if table_name is not None and table_name not in allowed_tables:
                 return sqlite3.SQLITE_DENY
 
             if table_name in allowed_tables:

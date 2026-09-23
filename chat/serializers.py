@@ -3,6 +3,7 @@ from rest_framework import serializers
 from chat.models import (
     Conversation,
     Message,
+    ConversationSettings,
 )
 
 
@@ -13,11 +14,13 @@ class MessageSerializer(serializers.ModelSerializer):
             "id",
             "role",
             "content",
+            "metadata",
             "created_at",
         ]
         read_only_fields = [
             "id",
             "role",
+            "metadata",
             "created_at",
         ]
 
@@ -38,6 +41,28 @@ class ConversationSerializer(serializers.ModelSerializer):
             "title",
             "created_by",
             "created_at",
+            "updated_at",
+        ]
+
+
+class ConversationSettingsSerializer(serializers.ModelSerializer):
+    """
+    Serializer for user-configurable settings of a conversation.
+
+    Only exposes settings that have an actual effect on conversation
+    execution.
+    """
+
+    class Meta:
+        model = ConversationSettings
+        fields = [
+            "conversation",
+            "memory_enabled",
+            "citations_enabled",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "conversation",
             "updated_at",
         ]
 

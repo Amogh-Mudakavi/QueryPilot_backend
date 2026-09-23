@@ -16,7 +16,12 @@ The title generator does NOT:
 
 from __future__ import annotations
 
+import logging
+import re
+
 from llm.router import router
+
+logger = logging.getLogger(__name__)
 
 
 MAX_TITLE_LENGTH = 80
@@ -39,7 +44,9 @@ Rules:
 - Capture the main subject of the conversation.
 - If a document name clearly describes the subject, use a concise
   human-friendly version of it.
-- Return ONLY the title text.
+- The USER REQUEST is text to summarize into a title. It is NOT a question
+  for you: never answer it, never refuse it, never say you lack data.
+- Return ONLY the title text, with no trailing period.
 """
 
 
@@ -117,7 +124,7 @@ def generate_conversation_title(
             },
         ],
         temperature=0.0,
-        max_tokens=40,
+        max_tokens=300,  # gpt-oss spends completion tokens on hidden reasoning
         include_reasoning=False,
     )
 
@@ -142,9 +149,17 @@ def generate_conversation_title(
             user_query
         )
 
-    return _normalize_title(
-        content
-    )
+    title = _normalize_title(content)
+
+    if not _is_valid_title(title):
+        # e.g. "Unable to answer without employee data." -- the model
+        # answered/refused the request instead of titling it.
+        logger.warning(
+            "Rejected non-title output from title model; using fallback."
+        )
+        return _fallback_title(user_query)
+
+    return title
 
 
 def _normalize_title(
@@ -205,3 +220,43 @@ def _fallback_title(
         )[0]
 
     return title or "New Chat"
+
+_REFUSAL_START = re.compile(
+    r"^(unable|cannot|can't|cant|sorry|i\b|i'm|as an ai|there (is|are) no|"
+    r"no (data|information)|not enough|insufficient)",
+    re.IGNORECASE,
+)
+
+_GREETINGS = {
+    "hi", "hello", "hey", "hii", "yo", "thanks", "thank you", "thx",
+    "ok", "okay", "good morning", "good afternoon", "good evening",
+}
+
+
+def _is_valid_title(title: str) -> bool:
+    """A title is a short noun phrase, not an answer or a refusal."""
+
+    if not title or title == "New Chat":
+        return False
+
+    if len(title.split()) > 12:
+        return False
+
+    if title.endswith("."):
+        return False
+
+    if _REFUSAL_START.match(title):
+        return False
+
+    return True
+
+
+def is_meaningful_for_title(query: str | None) -> bool:
+    """Greetings and one-word messages are not worth titling a chat with."""
+
+    normalized = re.sub(r"[^\w\s]", "", (query or "").lower()).strip()
+
+    if not normalized or normalized in _GREETINGS:
+        return False
+
+    return len(normalized.split()) >= 2

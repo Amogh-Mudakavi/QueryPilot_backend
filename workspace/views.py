@@ -1,3 +1,5 @@
+from django.shortcuts import get_object_or_404
+
 from rest_framework import status
 from rest_framework.generics import ListAPIView
 from rest_framework.permissions import IsAuthenticated
@@ -8,19 +10,18 @@ from .models import Workspace
 from .serializers import (
     WorkspaceSerializer,
     WorkspaceCreateSerializer,
+    WorkspaceUpdateSerializer,
+    WorkspaceSettingsSerializer,
 )
 
 
 class WorkspaceCreateAPIView(APIView):
-
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-
         serializer = WorkspaceCreateSerializer(
             data=request.data
         )
-
         serializer.is_valid(raise_exception=True)
 
         workspace = Workspace.objects.create(
@@ -35,38 +36,68 @@ class WorkspaceCreateAPIView(APIView):
 
 
 class WorkspaceListAPIView(ListAPIView):
-
     permission_classes = [IsAuthenticated]
-
     serializer_class = WorkspaceSerializer
 
     def get_queryset(self):
-
         return Workspace.objects.filter(
             owner=self.request.user
         ).order_by("-updated_at")
 
 
-class WorkspaceDeleteAPIView(APIView):
-
+class WorkspaceDetailAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
-    def delete(self, request, workspace_id):
-
-        workspace = Workspace.objects.filter(
+    def get_workspace(self, request, workspace_id):
+        return get_object_or_404(
+            Workspace,
             id=workspace_id,
             owner=request.user,
-        ).first()
+        )
 
-        if not workspace:
+    def patch(self, request, workspace_id):
+        workspace = self.get_workspace(
+            request,
+            workspace_id,
+        )
 
-            return Response(
-                {"detail": "Workspace not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+        serializer = WorkspaceUpdateSerializer(
+            workspace,
+            data=request.data,
+            partial=True,
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        return Response(
+            WorkspaceSerializer(workspace).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def delete(self, request, workspace_id):
+        workspace = self.get_workspace(
+            request,
+            workspace_id,
+        )
 
         workspace.delete()
 
         return Response(
             status=status.HTTP_204_NO_CONTENT
+        )
+
+
+class WorkspaceSettingsAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, workspace_id):
+        workspace = get_object_or_404(
+            Workspace,
+            id=workspace_id,
+            owner=request.user,
+        )
+
+        return Response(
+            WorkspaceSettingsSerializer(workspace).data,
+            status=status.HTTP_200_OK,
         )

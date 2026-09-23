@@ -14,47 +14,111 @@ This file should NOT know anything about:
     - SQLite tables
 
 It only stores and retrieves embeddings.
+
+Performance notes
+-----------------
+- One SentenceTransformer instance is shared by every thread in the
+  process (double-checked locked singleton), and encode() calls are
+  serialized with _embedding_lock. Worker concurrency therefore never
+  loads multiple copies of the model and never runs competing encodes.
+- Intra-op CPU threads are capped (EMBEDDING_TORCH_THREADS env var;
+  default min(4, cpu_count)). PyTorch defaults to every visible core,
+  which oversubscribes small or shared machines.
+- Embedding start/completion and Chroma upsert completion are logged
+  with timings so slow stages are visible in the worker logs.
+- The model stays fp32: quantization or half precision would change
+  the embedding values and therefore retrieval semantics.
 """
 
-import chromadb
+from __future__ import annotations
 
+import logging
+import os
+import threading
+import time
+
+import chromadb
+import torch
 from django.conf import settings
 from sentence_transformers import SentenceTransformer
+
+
+logger = logging.getLogger(__name__)
 
 
 KNOWLEDGE_COLLECTION = "querypilot_knowledge"
 DOCUMENT_COLLECTION = "querypilot_document_metadata"
 
+EMBEDDING_MODEL = "mixedbread-ai/mxbai-embed-large-v1"
+
+EMBEDDING_BATCH_SIZE = getattr(
+    settings,
+    "EMBEDDING_BATCH_SIZE",
+    32,
+)
+
+CHROMA_BATCH_SIZE = getattr(
+    settings,
+    "CHROMA_BATCH_SIZE",
+    128,
+)
+
+
+def _resolve_torch_threads() -> int:
+    """
+    Intra-op threads for CPU embedding inference.
+
+    EMBEDDING_TORCH_THREADS > 0 wins. Otherwise default to at most 4:
+    PyTorch defaults to every visible core, which oversubscribes small
+    or shared machines (and containers that report host cores).
+    """
+    try:
+        configured = int(
+            os.getenv(
+                "EMBEDDING_TORCH_THREADS",
+                "0",
+            )
+        )
+    except (TypeError, ValueError):
+        configured = 0
+
+    if configured > 0:
+        return configured
+
+    return max(
+        1,
+        min(
+            4,
+            os.cpu_count() or 1,
+        ),
+    )
+
 
 class VectorStore:
-    """
-    Central Chroma interface.
-
-    QueryPilot uses:
-
-        querypilot_knowledge
-            - text chunks
-            - table metadata
-
-        querypilot_document_metadata
-            - one document profile per document
-    """
 
     _client = None
     _embedder = None
+
+    _client_lock = threading.Lock()
+    _embedder_lock = threading.Lock()
+    _embedding_lock = threading.Lock()
 
     @classmethod
     def get_client(cls):
 
         if cls._client is None:
 
-            cls._client = chromadb.PersistentClient(
-                path=str(
-                    settings.BASE_DIR
-                    / "storage"
-                    / "chroma"
-                )
-            )
+            with cls._client_lock:
+
+                if cls._client is None:
+
+                    cls._client = chromadb.PersistentClient(
+                        path=str(
+                            settings.BASE_DIR
+                            / "storage"
+                            / "chroma"
+                        )
+                    )
 
         return cls._client
 
@@ -63,19 +127,42 @@ class VectorStore:
 
         if cls._embedder is None:
 
-            try:
-                # Model already cached locally (normal case after first boot) —
-                # skip the network round-trips entirely.
-                cls._embedder = SentenceTransformer(
-                    "mixedbread-ai/mxbai-embed-large-v1",
-                    local_files_only=True,
-                )
-            except Exception:
-                # Cache missing (first-ever boot on a fresh machine) —
-                # fall back to a real download.
-                cls._embedder = SentenceTransformer(
-                    "mixedbread-ai/mxbai-embed-large-v1"
-                )
+            with cls._embedder_lock:
+
+                if cls._embedder is None:
+
+                    threads = _resolve_torch_threads()
+
+                    try:
+                        torch.set_num_threads(
+                            threads,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[EMBEDDING] Could not set torch "
+                            "num_threads=%s.",
+                            threads,
+                        )
+
+                    try:
+                        cls._embedder = SentenceTransformer(
+                            EMBEDDING_MODEL,
+                            local_files_only=True,
+                            trust_remote_code=False,
+                        )
+                    except OSError:
+                        cls._embedder = SentenceTransformer(
+                            EMBEDDING_MODEL,
+                            trust_remote_code=False,
+                        )
+
+                    logger.info(
+                        "[EMBEDDING] Model ready: %s "
+                        "(torch_threads=%s, batch_size=%s).",
+                        EMBEDDING_MODEL,
+                        threads,
+                        EMBEDDING_BATCH_SIZE,
+                    )
 
         return cls._embedder
 
@@ -105,17 +192,52 @@ class VectorStore:
         texts,
     ):
 
+        texts = list(texts)
+
         if not texts:
             raise ValueError(
                 "Cannot embed an empty list of texts."
             )
 
+        if any(
+            not isinstance(text, str)
+            or not text.strip()
+            for text in texts
+        ):
+            raise ValueError(
+                "All texts must be non-empty strings."
+            )
+
         model = cls.get_embedder()
 
-        return model.encode(
-            texts,
-            normalize_embeddings=True,
-        ).tolist()
+        started = time.monotonic()
+
+        logger.info(
+            "[EMBEDDING] start: %d text(s) (batch_size=%s).",
+            len(texts),
+            EMBEDDING_BATCH_SIZE,
+        )
+
+        # One heavy model is shared by all ingestion threads.
+        # Serializing encode() avoids multiple CPU-heavy calls
+        # competing for the same model at the same time.
+        with cls._embedding_lock:
+
+            vectors = model.encode(
+                texts,
+                batch_size=EMBEDDING_BATCH_SIZE,
+                show_progress_bar=False,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+            ).tolist()
+
+        logger.info(
+            "[EMBEDDING] completed: %d text(s) in %.2fs.",
+            len(texts),
+            time.monotonic() - started,
+        )
+
+        return vectors
 
     @classmethod
     def store_chunks(
@@ -128,55 +250,65 @@ class VectorStore:
         if not chunks:
             return
 
-        collection = (
-            cls.knowledge_collection()
-        )
+        collection = cls.knowledge_collection()
 
-        documents = [
-            chunk["text"]
-            for chunk in chunks
-        ]
+        started = time.monotonic()
 
-        ids = [
-            f"doc_{document_id}_chunk_{chunk['chunk_index']}"
-            for chunk in chunks
-        ]
+        upserted = 0
 
-        metadatas = []
+        for start in range(
+            0,
+            len(chunks),
+            CHROMA_BATCH_SIZE,
+        ):
 
-        for chunk in chunks:
+            batch = chunks[
+                start:start + CHROMA_BATCH_SIZE
+            ]
 
-            metadatas.append(
-                {
-                    "workspace_id": workspace_id,
-                    "document_id": document_id,
-                    "type": "text",
-                    "chunk_index": chunk[
-                        "chunk_index"
-                    ],
-                    "page_start": chunk[
-                        "page_start"
-                    ],
-                    "page_end": chunk[
-                        "page_end"
-                    ],
-                    "heading": chunk[
-                        "heading"
-                    ],
-                }
+            documents = [
+                chunk["text"]
+                for chunk in batch
+            ]
+
+            ids = [
+                f"doc_{document_id}_chunk_{chunk['chunk_index']}"
+                for chunk in batch
+            ]
+
+            metadatas = []
+
+            for chunk in batch:
+
+                metadatas.append(
+                    {
+                        "workspace_id": workspace_id,
+                        "document_id": document_id,
+                        "type": "text",
+                        "chunk_index": chunk["chunk_index"],
+                        "page_start": chunk["page_start"],
+                        "page_end": chunk["page_end"],
+                        "heading": chunk.get("heading") or "",
+                    }
+                )
+
+            embeddings = cls.embed(documents)
+
+            collection.upsert(
+                ids=ids,
+                documents=documents,
+                embeddings=embeddings,
+                metadatas=metadatas,
             )
 
-        # upsert, not add: add() raises on an ID that already exists,
-        # which breaks retrying a document whose previous ingestion
-        # attempt got partway through before failing. upsert() overwrites
-        # cleanly, making a retry of this step safe to repeat.
-        collection.upsert(
-            ids=ids,
-            documents=documents,
-            embeddings=cls.embed(
-                documents
-            ),
-            metadatas=metadatas,
+            upserted += len(batch)
+
+        logger.info(
+            "[CHROMA] upsert completed: %d chunk(s) for document %s "
+            "in %.2fs.",
+            upserted,
+            document_id,
+            time.monotonic() - started,
         )
 
     @classmethod
@@ -188,22 +320,25 @@ class VectorStore:
         summary,
     ):
 
-        collection = (
-            cls.knowledge_collection()
+        if (
+            not isinstance(summary, str)
+            or not summary.strip()
+        ):
+            raise ValueError(
+                "Table metadata summary cannot be empty."
+            )
+
+        collection = cls.knowledge_collection()
+
+        table_id = (
+            f"doc_{document_id}_table_"
+            f"{table_name}_metadata"
         )
 
-        # upsert for the same reason as store_chunks - safe to repeat
-        # on retry without erroring on a duplicate ID.
         collection.upsert(
-            ids=[
-                f"{table_name}_metadata"
-            ],
-            documents=[
-                summary
-            ],
-            embeddings=cls.embed(
-                [summary]
-            ),
+            ids=[table_id],
+            documents=[summary],
+            embeddings=cls.embed([summary]),
             metadatas=[
                 {
                     "workspace_id": workspace_id,
@@ -214,6 +349,13 @@ class VectorStore:
             ],
         )
 
+        logger.info(
+            "[CHROMA] upsert completed: table metadata '%s' for "
+            "document %s.",
+            table_name,
+            document_id,
+        )
+
     @classmethod
     def store_document_profile(
         cls,
@@ -222,15 +364,16 @@ class VectorStore:
         document_name,
         profile_text,
     ):
-        """
-        One profile per document.
 
-        Used by planner.
-        """
+        if (
+            not isinstance(profile_text, str)
+            or not profile_text.strip()
+        ):
+            raise ValueError(
+                "Document profile cannot be empty."
+            )
 
-        collection = (
-            cls.document_collection()
-        )
+        collection = cls.document_collection()
 
         collection.upsert(
             ids=[
@@ -252,18 +395,17 @@ class VectorStore:
             ],
         )
 
+        logger.info(
+            "[CHROMA] upsert completed: document profile for "
+            "document %s.",
+            document_id,
+        )
+
     @classmethod
     def delete_document(
         cls,
         document_id,
     ):
-        """
-        Deletes both collections' entries for a document.
-
-        Both deletes are attempted even if one fails, so a problem in
-        one collection doesn't leave the other with orphaned vectors
-        for a document that's otherwise being removed.
-        """
 
         errors = []
 

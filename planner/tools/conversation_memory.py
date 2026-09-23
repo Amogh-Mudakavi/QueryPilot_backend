@@ -57,6 +57,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from planner.services.history import split_history
+
 
 RECENT_MESSAGES = 6
 MAX_RELEVANT_OLDER_MESSAGES = 4
@@ -88,6 +90,22 @@ PREVIOUS_ANSWER_PATTERNS = [
         r"\bsay (that|it) again\b",
         r"\byour (previous|last|earlier) (answer|response|message)\b",
         r"\bwhat.*(you|u).*(just|earlier).*(say|said)\b",
+        r"\bwhat was the answer (you|u) (gave|provided|said)\b",
+        r"\bthe answer (you|u) (gave|provided)\b",
+    ]
+]
+
+# "What did we discuss earlier?" / "Summarize what we talked about."
+# These need the whole recent conversation (+ rolling summary), not the
+# lexical/pronoun heuristics.
+RECAP_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"\bwhat (did|have) we (discuss|discussed|talk|talked|cover|covered|say|said|do|done)\b",
+        r"\bsummari[sz]e\b.{0,40}\b(conversation|chat|discussion|we|so far|earlier)\b",
+        r"\b(recap|sum up)\b",
+        r"\bwhat have we\b",
+        r"\b(earlier|before) (in|during) (this|our) (chat|conversation)\b",
     ]
 ]
 
@@ -168,7 +186,67 @@ class EntityMention:
     text: str
 
 
+def _matches_recap_request(query: str) -> bool:
+    return any(pattern.search(query) for pattern in RECAP_PATTERNS)
+
+
 def conversation_memory(
+    *,
+    query: str,
+    conversation_history: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Public entry point.
+
+    - The rolling summary (a leading system message) is split off first so
+      it is never mistaken for an "older message" and never sliced away.
+    - Recap questions ("what did we discuss?") get the whole recent
+      conversation.
+    - Everything else goes through the existing selection logic.
+    - If a summary exists it is always returned first.
+    """
+
+    query = query.strip()
+
+    if not query:
+        raise ValueError("conversation_memory query cannot be empty.")
+
+    summary_message, regular_history = split_history(conversation_history or [])
+
+    if _matches_recap_request(query):
+        normalized = _normalize_history(regular_history)
+        selected = normalized[-MAX_TOTAL_MESSAGES:]
+        result: dict[str, Any] = {
+            "messages": [
+                {"role": item["role"], "content": item["content"]}
+                for item in selected
+            ],
+            "message_count": len(selected),
+            "used_recent_messages": len(selected),
+            "used_relevant_older_messages": 0,
+            "resolution": "recap",
+        }
+    else:
+        result = dict(
+            _select_messages(
+                query=query,
+                conversation_history=regular_history,
+            )
+        )
+
+    if summary_message is not None:
+        summary_text = str(summary_message.get("content", "")).strip()
+        if summary_text:
+            result["messages"] = [
+                {"role": "system", "content": summary_text}
+            ] + list(result.get("messages", []))
+            result["message_count"] = len(result["messages"])
+            result["has_summary"] = True
+
+    return result
+
+
+def _select_messages(
     *,
     query: str,
     conversation_history: list[dict[str, Any]],

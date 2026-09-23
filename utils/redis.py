@@ -1,12 +1,20 @@
-import redis
+import threading
 
+import redis
 from django.conf import settings
 
 
-_redis_client = None
+_redis_client=None
+_redis_lock=threading.Lock()
 
-CHAT_QUESTION_LIMIT = 15
-CHAT_COOLDOWN_SECONDS = 2 * 60 * 60  # 2 hours
+INGESTION_QUEUE="querypilot:ingestion:queue"
+
+REDIS_CONNECT_TIMEOUT=5
+REDIS_SOCKET_TIMEOUT=15
+INGESTION_POP_TIMEOUT=5
+
+CHAT_QUESTION_LIMIT=50
+CHAT_COOLDOWN_SECONDS=2*60*60
 
 
 def get_redis_client():
@@ -15,61 +23,81 @@ def get_redis_client():
 
     if _redis_client is None:
 
-        _redis_client = redis.Redis(
-            host=getattr(
-                settings,
-                "REDIS_HOST",
-                "127.0.0.1",
-            ),
-            port=getattr(
-                settings,
-                "REDIS_PORT",
-                6379,
-            ),
-            db=getattr(
-                settings,
-                "REDIS_DB",
-                0,
-            ),
-            decode_responses=True,
-        )
+        with _redis_lock:
 
-        _redis_client.ping()
+            if _redis_client is None:
+
+                _redis_client=redis.Redis(
+                    host=settings.REDIS_HOST,
+                    port=settings.REDIS_PORT,
+                    db=settings.REDIS_DB,
+                    socket_connect_timeout=REDIS_CONNECT_TIMEOUT,
+                    socket_timeout=REDIS_SOCKET_TIMEOUT,
+                    socket_keepalive=True,
+                    health_check_interval=30,
+                    decode_responses=True,
+                )
 
     return _redis_client
 
 
-def publish_job(job_id):
+def enqueue_job(job_id):
 
-    client = get_redis_client()
+    client=get_redis_client()
 
-    client.publish(
-        "admin_jobs",
+    client.rpush(
+        INGESTION_QUEUE,
         str(job_id),
     )
 
 
-def get_pubsub():
+def publish_job(job_id):
 
-    client = get_redis_client()
+    # Kept for compatibility with the existing upload API.
+    enqueue_job(job_id)
 
-    pubsub = client.pubsub()
 
-    pubsub.subscribe(
-        "admin_jobs"
-    )
+def get_next_job(
+    timeout=INGESTION_POP_TIMEOUT,
+):
 
-    return pubsub
+    client=get_redis_client()
+
+    try:
+
+        result=client.blpop(
+            INGESTION_QUEUE,
+            timeout=timeout,
+        )
+
+    except redis.exceptions.TimeoutError:
+
+        # A normal idle period must not kill the worker.
+        return None
+
+    if result is None:
+        return None
+
+    _,job_id=result
+
+    try:
+        return int(job_id)
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
 
 
 def check_chat_question_limit(user_id: int) -> tuple[bool, int]:
     """
-    Allow up to 10 questions.
+    Allow up to 50 questions.
 
-    Question 1-10:
+    Question 1-50:
         allowed
 
-    Question 11:
+    Question 51:
         rejected and starts a 2-hour cooldown
 
     During cooldown:
@@ -79,42 +107,55 @@ def check_chat_question_limit(user_id: int) -> tuple[bool, int]:
         (allowed, count)
     """
 
-    client = get_redis_client()
+    client=get_redis_client()
 
-    cooldown_key = (
+    cooldown_key=(
         f"querypilot:chat:cooldown:{user_id}"
     )
 
-    question_key = (
+    question_key=(
         f"querypilot:chat:questions:{user_id}"
     )
 
-    # Once cooldown exists, reject immediately.
     if client.exists(cooldown_key):
-        count = client.get(question_key)
-        return False, int(count or CHAT_QUESTION_LIMIT + 1)
 
-    # INCR is atomic in Redis.
-    count = client.incr(question_key)
+        count=client.get(
+            question_key
+        )
 
-    # Keep the normal usage window alive for 2 hours.
-    if count == 1:
+        return (
+            False,
+            int(
+                count
+                or CHAT_QUESTION_LIMIT+1
+            ),
+        )
+
+    count=client.incr(
+        question_key
+    )
+
+    if count==1:
+
         client.expire(
             question_key,
             CHAT_COOLDOWN_SECONDS,
         )
 
-    # First rejected request is question 11.
-    if count > CHAT_QUESTION_LIMIT:
+    if count>CHAT_QUESTION_LIMIT:
 
-        # Start a fresh 2-hour cooldown from the moment
-        # the user actually crosses the limit.
         client.setex(
             cooldown_key,
             CHAT_COOLDOWN_SECONDS,
             "1",
         )
 
-        return False, count
+        return (
+            False,
+            count,
+        )
 
-    return True, count
+    return (
+        True,
+        count,
+    )

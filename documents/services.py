@@ -1,4 +1,6 @@
-from documents.ingestion.pipeline import run_pipeline
+from documents.ingestion.pipeline import (
+    IngestionPipeline,
+)
 
 
 class IngestionService:
@@ -6,4 +8,6 @@ class IngestionService:
     @staticmethod
     def process(document):
 
-        run_pipeline(document)
+        return IngestionPipeline.run(
+            document
+        )

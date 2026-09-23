@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, TypedDict, Optional
+from typing import Any, Optional, TypedDict
 
 
 class AgentState(TypedDict, total=False):
@@ -10,10 +10,18 @@ class AgentState(TypedDict, total=False):
     conversation_history: list[dict[str, Any]]
     relevant_document_ids: list[int]
 
+    query_understanding: dict[str, Any]
+    resolved_references: dict[str, Any]
+    execution_plan: dict[str, Any]
+
     evidence: list[Any]
     retrieval_confidence: float
     known_facts: list[str]
     unresolved_questions: list[str]
+
+    pending_clarification: bool
+    clarification_options: list[dict[str, Any]]
+    error_code: str
 
     last_tool: str
     tool_history: list[dict[str, Any]]
@@ -21,15 +29,14 @@ class AgentState(TypedDict, total=False):
     total_tool_calls: int
 
     evidence_sufficient: bool
+    answerable: bool
+    insufficient_reasons: list[str]
+    recovery_attempts: int
+    deadline_monotonic: float
     final_evidence: list[Any]
-
     answer: str
-    # Grounding LLM was removed; keep this field for API
-    # compatibility but allow None to indicate no grounding
-    # check was performed.
     grounding_passed: Optional[bool]
     route: str
-
     error: str
     tool_failed: bool
 

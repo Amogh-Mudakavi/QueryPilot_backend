@@ -5,6 +5,7 @@ from typing import Any
 
 from retrieval.services.hybrid_retriever import (
     HybridRetriever,
+    RetrievalError,
 )
 
 
@@ -29,7 +30,6 @@ def _bound_evidence(
     total_chars = 0
 
     for item in evidence[:MAX_EVIDENCE_ITEMS]:
-
         if not isinstance(item, dict):
             continue
 
@@ -55,19 +55,30 @@ def _bound_evidence(
             remaining,
         )
 
-        bounded_item["content"] = (
-            content[:content_limit]
-        )
+        bounded_item["content"] = content[:content_limit]
 
         total_chars += len(
             bounded_item["content"]
         )
 
-        bounded.append(
-            bounded_item
-        )
+        bounded.append(bounded_item)
 
     return bounded
+
+
+def _error_result(
+    *,
+    error: RetrievalError,
+) -> dict[str, Any]:
+    """Return a stable structured retrieval error for the agent."""
+
+    return {
+        "error_code": error.code,
+        "error": error.message,
+        "evidence": [],
+        "confidence": 0.0,
+        "candidate_count": 0,
+    }
 
 
 def search_evidence(
@@ -77,13 +88,21 @@ def search_evidence(
     allowed_document_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     """
-    Retrieve bounded document evidence.
+    Retrieve bounded text evidence from workspace documents.
+
+    This tool is deliberately text-only. Table metadata is handled by
+    the table/evidence inspection path and should not compete with
+    ordinary document text retrieval here.
 
     If allowed_document_ids is supplied, retrieval is restricted
     to exactly those document IDs.
 
     An empty allow-list is treated as no allowed documents and
     therefore returns no evidence.
+
+    Retrieval failures are returned as structured data so the agent
+    can distinguish an empty result from an infrastructure/indexing
+    failure without depending on raw Chroma exception strings.
     """
 
     query = query.strip()
@@ -99,16 +118,26 @@ def search_evidence(
         )
 
     logger.info(
-        "search_evidence: workspace_id=%s allowed_document_ids=%s",
+        "search_evidence: workspace_id=%s allowed_document_ids=%s source_types=%s",
         workspace_id,
         allowed_document_ids,
+        ["text"],
     )
 
-    result = _retriever.retrieve(
-        query=query,
-        workspace_id=workspace_id,
-        allowed_document_ids=allowed_document_ids,
-    )
+    try:
+        result = _retriever.retrieve(
+            query=query,
+            workspace_id=workspace_id,
+            allowed_document_ids=allowed_document_ids,
+            source_types=["text"],
+        )
+    except RetrievalError as exc:
+        logger.error(
+            "search_evidence: retrieval failed code=%s message=%s",
+            exc.code,
+            exc.message,
+        )
+        return _error_result(error=exc)
 
     raw_evidence = [
         item.to_dict()
@@ -127,6 +156,8 @@ def search_evidence(
     )
 
     return {
+        "error_code": None,
+        "error": None,
         "evidence": evidence,
         "confidence": result.confidence,
         "candidate_count": result.candidate_count,

@@ -12,7 +12,12 @@ class User(AbstractUser):
         ("admin", "admin"),
     ]
 
-    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default="customer")
+    role = models.CharField(
+        max_length=20,
+        choices=ROLE_CHOICES,
+        default="customer",
+    )
+
     is_blocked = models.BooleanField(default=False)
 
     def __str__(self):
@@ -22,19 +27,29 @@ class User(AbstractUser):
 class RefreshToken(models.Model):
 
     user = models.ForeignKey(
-        User, on_delete=models.CASCADE, related_name="refresh_tokens"
+        User,
+        on_delete=models.CASCADE,
+        related_name="refresh_tokens",
     )
 
-    token = models.CharField(max_length=512, unique=True)
+    # Stores SHA-256 digest of the actual JWT, never the raw refresh token.
+    token = models.CharField(
+        max_length=64,
+        unique=True,
+    )
 
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(
+        auto_now_add=True
+    )
 
     expires_at = models.DateTimeField()
 
-    is_revoked = models.BooleanField(default=False)
+    is_revoked = models.BooleanField(
+        default=False
+    )
 
     def __str__(self):
-        return f"{self.user.email}"
+        return "RefreshToken"
 
 
 class EmailOTP(models.Model):
@@ -46,37 +61,63 @@ class EmailOTP(models.Model):
 
     email = models.EmailField()
 
-    otp = models.CharField(max_length=6)
+    # Stores a Django password hash of the OTP.
+    otp = models.CharField(
+        max_length=128
+    )
 
-    purpose = models.CharField(max_length=20, choices=PURPOSE_CHOICES)
+    purpose = models.CharField(
+        max_length=20,
+        choices=PURPOSE_CHOICES,
+    )
 
     expires_at = models.DateTimeField()
 
-    is_used = models.BooleanField(default=False)
+    is_used = models.BooleanField(
+        default=False
+    )
 
-    verification_attempts = models.IntegerField(default=0)
+    verification_attempts = models.PositiveSmallIntegerField(
+        default=0
+    )
 
-    last_sent_ip = models.GenericIPAddressField(null=True, blank=True)
+    last_sent_ip = models.GenericIPAddressField(
+        null=True,
+        blank=True,
+    )
 
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(
+        auto_now_add=True
+    )
 
     def __str__(self):
-        return f'{self.email} - {self.purpose}'
+        return f"EmailOTP ({self.purpose})"
 
 
 class PendingRegistration(models.Model):
 
-    username = models.CharField(max_length=100)
+    username = models.CharField(
+        max_length=100
+    )
 
-    email = models.EmailField(unique=True)
+    email = models.EmailField(
+        unique=True
+    )
 
-    password = models.CharField(max_length=255)
+    # This field already stores a password hash.
+    password = models.CharField(
+        max_length=255
+    )
 
-    is_verified = models.BooleanField(default=False)
+    is_verified = models.BooleanField(
+        default=False
+    )
 
     expires_at = models.DateTimeField()
 
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(
+        auto_now_add=True
+    )
 
     def __str__(self):
-        return self.email
+        return "PendingRegistration"

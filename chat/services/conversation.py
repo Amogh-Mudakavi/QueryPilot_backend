@@ -1,11 +1,15 @@
+import logging
+
+from django.db import transaction
+
 from chat.models import (
     Conversation,
     Message,
     ConversationDocument,
+    ConversationSettings,
 )
 
 from documents.models import Document
-import logging
 
 
 def create_conversation(
@@ -14,11 +18,25 @@ def create_conversation(
     user,
     title: str = "New Chat",
 ) -> Conversation:
-    return Conversation.objects.create(
-        workspace=workspace,
-        created_by=user,
-        title=title,
-    )
+    """
+    Create a conversation together with its default settings.
+
+    Every conversation gets exactly one ConversationSettings row.
+    The operation is atomic so we never end up with a conversation
+    without its corresponding settings.
+    """
+    with transaction.atomic():
+        conversation = Conversation.objects.create(
+            workspace=workspace,
+            created_by=user,
+            title=title,
+        )
+
+        ConversationSettings.objects.create(
+            conversation=conversation,
+        )
+
+    return conversation
 
 
 def get_conversation(
@@ -42,12 +60,26 @@ def add_message(
     conversation: Conversation,
     role: str,
     content: str,
+    metadata: dict | None = None,
 ) -> Message:
-    return Message.objects.create(
+    """
+    Persist a message and update the parent conversation timestamp.
+
+    Message rows remain the source of truth for conversation history.
+    """
+    message = Message.objects.create(
         conversation=conversation,
         role=role,
         content=content,
+        metadata=metadata or {},
     )
+
+    # Message activity should update the parent conversation so list
+    # ordering and Today/Yesterday grouping remain correct after the
+    # conversation already has a title.
+    conversation.save(update_fields=["updated_at"])
+
+    return message
 
 
 def attach_document(
@@ -56,10 +88,13 @@ def attach_document(
     document: Document,
 ) -> ConversationDocument:
     """
-    MVP rule:
-    maximum 3 attached documents.
-    """
+    Attach a document to a conversation.
 
+    MVP rules:
+        - Maximum 3 documents per conversation.
+        - Document must belong to the same workspace.
+        - Duplicate attachments are ignored through get_or_create().
+    """
     attached_count = (
         ConversationDocument.objects.filter(
             conversation=conversation
@@ -71,7 +106,7 @@ def attach_document(
             "Maximum of 3 documents allowed."
         )
 
-    # Enforce that attached documents must belong to the same workspace
+    # Enforce that attached documents must belong to the same workspace.
     if getattr(document, "workspace_id", None) != conversation.workspace_id:
         raise ValueError(
             "Cannot attach a document from a different workspace to this conversation."
@@ -85,11 +120,9 @@ def attach_document(
         getattr(document, "workspace_id", None),
     )
 
-    link, _ = (
-        ConversationDocument.objects.get_or_create(
-            conversation=conversation,
-            document=document,
-        )
+    link, _ = ConversationDocument.objects.get_or_create(
+        conversation=conversation,
+        document=document,
     )
 
     return link
@@ -100,6 +133,13 @@ def get_recent_history(
     conversation: Conversation,
     limit: int = 10,
 ) -> list[dict]:
+    """
+    Return the most recent messages in chronological order.
+
+    This helper is retained for places that still need direct recent
+    history retrieval. Conversation memory uses the same 10-message
+    policy at runtime.
+    """
     messages = (
         Message.objects.filter(
             conversation=conversation

@@ -6,6 +6,7 @@ Responsibilities:
     - Validate request data.
     - Resolve conversation ownership.
     - Create conversations.
+    - Read/update conversation settings.
     - Stream chat execution through Server-Sent Events.
 
 The views do NOT:
@@ -24,12 +25,14 @@ import json
 from django.http import StreamingHttpResponse
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.renderers import BaseRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from chat.models import Conversation
+from chat.models import Conversation, ConversationSettings
 from chat.serializers import (
     ConversationSerializer,
+    ConversationSettingsSerializer,
     CreateConversationSerializer,
     MessageSerializer,
     SendMessageSerializer,
@@ -45,10 +48,6 @@ from utils.redis import check_chat_question_limit
 from workspace.models import Workspace
 
 
-# ---------------------------------------------------------
-# Final user-facing message when the chat quota is exhausted
-# ---------------------------------------------------------
-
 CHAT_LIMIT_MESSAGE = (
     "Looks like I’ve hit the ceiling on the LLM credits available "
     "to this solo-developer project. I’ve exhausted the recovery "
@@ -59,6 +58,28 @@ CHAT_LIMIT_MESSAGE = (
     "someone who can. Give him the opportunity and the resources, "
     "and this product can go much further."
 )
+
+
+class EventStreamRenderer(BaseRenderer):
+    """
+    Renderer used only for DRF content negotiation.
+
+    The actual response is a StreamingHttpResponse, so DRF's
+    renderer is not responsible for rendering the stream body.
+    """
+
+    media_type = "text/event-stream"
+    format = "event-stream"
+    charset = "utf-8"
+    render_style = "binary"
+
+    def render(
+        self,
+        data,
+        accepted_media_type=None,
+        renderer_context=None,
+    ):
+        return data
 
 
 class ConversationListCreateView(APIView):
@@ -214,7 +235,128 @@ class ConversationDetailView(APIView):
         )
 
 
+class ConversationSettingsView(APIView):
+    """
+    Read or update settings for one conversation.
+
+    Settings are strictly scoped to the authenticated owner of the
+    conversation.
+
+    GET:
+        Returns the current conversation settings.
+
+    PATCH:
+        Updates one or more settings.
+
+    Older conversations that were created before the settings model
+    existed are handled with get_or_create(), so they automatically
+    receive the default settings.
+    """
+
+    permission_classes = [
+        IsAuthenticated,
+    ]
+
+    def _get_conversation(
+        self,
+        request,
+        conversation_id: int,
+    ) -> Conversation | None:
+        """
+        Resolve a conversation belonging to the authenticated user.
+
+        Returns None when the conversation does not exist or does not
+        belong to the requesting user.
+        """
+        try:
+            return Conversation.objects.get(
+                id=conversation_id,
+                created_by=request.user,
+            )
+        except Conversation.DoesNotExist:
+            return None
+
+    def get(
+        self,
+        request,
+        conversation_id: int,
+    ):
+        """
+        Return settings for an owned conversation.
+        """
+
+        conversation = self._get_conversation(
+            request,
+            conversation_id,
+        )
+
+        if conversation is None:
+            return Response(
+                {
+                    "detail": "Conversation not found.",
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        settings, _ = ConversationSettings.objects.get_or_create(
+            conversation=conversation,
+        )
+
+        serializer = ConversationSettingsSerializer(
+            settings,
+        )
+
+        return Response(
+            serializer.data,
+            status=status.HTTP_200_OK,
+        )
+
+    def patch(
+        self,
+        request,
+        conversation_id: int,
+    ):
+        """
+        Partially update settings for an owned conversation.
+        """
+
+        conversation = self._get_conversation(
+            request,
+            conversation_id,
+        )
+
+        if conversation is None:
+            return Response(
+                {
+                    "detail": "Conversation not found.",
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        settings, _ = ConversationSettings.objects.get_or_create(
+            conversation=conversation,
+        )
+
+        serializer = ConversationSettingsSerializer(
+            settings,
+            data=request.data,
+            partial=True,
+        )
+
+        serializer.is_valid(
+            raise_exception=True,
+        )
+
+        serializer.save()
+
+        return Response(
+            serializer.data,
+            status=status.HTTP_200_OK,
+        )
+
+
 class StreamMessageView(APIView):
+    renderer_classes = [EventStreamRenderer]
     """
     Stream one QueryPilot message using Server-Sent Events.
 

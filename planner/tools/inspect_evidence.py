@@ -95,26 +95,21 @@ def _get_semantic_content(
     collection = VectorStore.knowledge_collection()
 
     records = collection.get(
-        where={"workspace_id": workspace_id},
+        where={
+            "workspace_id": workspace_id,
+            "document_id": document_id,
+            "type": "table",
+            "table_name": table_name,
+        },
         include=["documents", "metadatas"],
     )
 
     documents = records.get("documents", [])
     metadatas = records.get("metadatas", [])
 
-    for index, content in enumerate(documents):
-        metadata = metadatas[index] if index < len(metadatas) else {}
-
-        if metadata.get("document_id") != document_id:
-            continue
-
-        if metadata.get("type") != "table":
-            continue
-
-        if metadata.get("table_name") != table_name:
-            continue
-
-        return content, metadata
+    if documents:
+        metadata = metadatas[0] if metadatas else {}
+        return documents[0], metadata if isinstance(metadata, dict) else {}
 
     return None, None
 

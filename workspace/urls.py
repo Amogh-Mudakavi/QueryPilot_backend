@@ -3,8 +3,10 @@ from django.urls import path
 from .views import (
     WorkspaceCreateAPIView,
     WorkspaceListAPIView,
-    WorkspaceDeleteAPIView,
+    WorkspaceDetailAPIView,
+    WorkspaceSettingsAPIView,
 )
+
 
 urlpatterns = [
     path(
@@ -19,6 +21,11 @@ urlpatterns = [
 
     path(
         "<int:workspace_id>/",
-        WorkspaceDeleteAPIView.as_view(),
+        WorkspaceDetailAPIView.as_view(),
+    ),
+
+    path(
+        "<int:workspace_id>/settings/",
+        WorkspaceSettingsAPIView.as_view(),
     ),
 ]

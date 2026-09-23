@@ -35,6 +35,7 @@ Flow:
 """
 
 import logging
+import time
 
 from documents.ingestion.parser import (
     LlamaParseService,
@@ -75,20 +76,11 @@ class IngestionPipeline:
         cls,
         document,
     ):
-        """
-        Main orchestration entrypoint.
-
-        If any step below fails, everything this run already wrote to
-        Chroma/SQLite for this document is cleaned up before the
-        exception is re-raised. Combined with SQLite being cleared up
-        front (see below) and every Chroma write being an upsert, this
-        makes it safe for the worker to retry a failed job from
-        scratch - a retry never has to reason about what a previous,
-        failed attempt already left behind.
-        """
 
         workspace_id = document.workspace_id
         document_id = document.id
+
+        started = time.monotonic()
 
         logger.info(
             "Starting ingestion for document %s (workspace %s).",
@@ -97,63 +89,62 @@ class IngestionPipeline:
         )
 
         try:
-            cls._run(document, workspace_id, document_id)
+            cls._run(
+                document,
+                workspace_id,
+                document_id,
+            )
+
         except Exception:
+
             logger.exception(
                 "Ingestion failed for document %s; cleaning up "
                 "partial writes.",
                 document_id,
             )
 
-            cls._cleanup_partial_ingestion(workspace_id, document_id)
+            cls._cleanup_partial_ingestion(
+                workspace_id,
+                document_id,
+            )
 
             raise
 
         logger.info(
-            "Completed ingestion for document %s.",
+            "Completed ingestion for document %s in %.2fs.",
             document_id,
+            time.monotonic() - started,
         )
 
     @classmethod
-    def _run(cls, document, workspace_id, document_id):
+    def _run(
+        cls,
+        document,
+        workspace_id,
+        document_id,
+    ):
 
-        # ----------------------------------
-        # Clear any SQLite tables left behind by a previous failed
-        # attempt for this document, so create_table/insert_rows below
-        # always start from a clean slate instead of appending onto
-        # stale partial data on retry.
-        # ----------------------------------
-
+        # Remove tables from a previous failed attempt.
         SQLiteManager.drop_document_tables(
             workspace_id=workspace_id,
             document_id=document_id,
         )
 
-        # ----------------------------------
-        # Parse document
-        # ----------------------------------
-
-        result = (
-            LlamaParseService.parse_document(
-                document.file.path
-            )
+        result = LlamaParseService.parse_document(
+            document.file.path
         )
 
-        # ----------------------------------
-        # Extract nodes
-        # ----------------------------------
-
-        text_nodes = (
-            LlamaAdapter.extract_text_nodes(
-                result
-            )
+        text_nodes = LlamaAdapter.extract_text_nodes(
+            result
         )
 
-        table_nodes = (
-            LlamaAdapter.extract_table_nodes(
-                result
-            )
+        table_nodes = LlamaAdapter.extract_table_nodes(
+            result
         )
+
+        # The raw LlamaParse result is no longer needed.
+        # Release it before chunking to reduce peak memory.
+        del result
 
         logger.info(
             "Document %s: %d text node(s), %d table node(s).",
@@ -162,13 +153,14 @@ class IngestionPipeline:
             len(table_nodes),
         )
 
-        chunker = (
-            StructureAwareChunker()
-        )
+        chunker = StructureAwareChunker()
 
         chunks = chunker.chunk(
             text_nodes
         )
+
+        # Chunking is complete; raw per-page text is no longer needed.
+        del text_nodes
 
         logger.info(
             "Document %s: generated %d chunk(s).",
@@ -176,10 +168,19 @@ class IngestionPipeline:
             len(chunks),
         )
 
+        stage_started = time.monotonic()
+
         VectorStore.store_chunks(
             workspace_id=workspace_id,
             document_id=document_id,
             chunks=chunks,
+        )
+
+        logger.info(
+            "Document %s: chunk embedding + Chroma upsert completed "
+            "in %.2fs.",
+            document_id,
+            time.monotonic() - stage_started,
         )
 
         table_metadata = []
@@ -189,11 +190,9 @@ class IngestionPipeline:
             start=1,
         ):
 
-            processed = (
-                TableProcessor.process(
-                    table_node=table_node,
-                    document_id=document_id,
-                )
+            processed = TableProcessor.process(
+                table_node=table_node,
+                document_id=document_id,
             )
 
             if not processed:
@@ -209,23 +208,17 @@ class IngestionPipeline:
                 f"_table_{index}"
             )
 
-            sqlite_payload = (
-                processed[
-                    "sqlite_payload"
-                ]
-            )
+            sqlite_payload = processed[
+                "sqlite_payload"
+            ]
 
-            headers = (
-                sqlite_payload[
-                    "headers"
-                ]
-            )
+            headers = sqlite_payload[
+                "headers"
+            ]
 
-            rows = (
-                sqlite_payload[
-                    "rows"
-                ]
-            )
+            rows = sqlite_payload[
+                "rows"
+            ]
 
             SQLiteManager.create_table(
                 table_name=table_name,
@@ -241,16 +234,18 @@ class IngestionPipeline:
                 workspace_id=workspace_id,
                 document_id=document_id,
                 table_name=table_name,
-                summary=processed[
-                    "semantic_text"
-                ],
+                summary=processed["semantic_text"],
             )
+
+        del table_nodes
 
         logger.info(
             "Document %s: processed %d table(s) into SQLite.",
             document_id,
             len(table_metadata),
         )
+
+        stage_started = time.monotonic()
 
         DocumentProfileBuilder.create(
             workspace_id=workspace_id,
@@ -260,34 +255,43 @@ class IngestionPipeline:
             table_metadata=table_metadata,
         )
 
-    @staticmethod
-    def _cleanup_partial_ingestion(workspace_id, document_id):
-        """
-        Best-effort removal of everything a failed run may have
-        written, so a retry starts clean and a permanently-failed
-        document doesn't leave orphaned vectors/tables behind.
+        logger.info(
+            "Document %s: document profile created in %.2fs.",
+            document_id,
+            time.monotonic() - stage_started,
+        )
 
-        Deliberately swallows its own errors (logged, not raised) -
-        this runs from inside an except block, and a secondary failure
-        here should not mask or replace the original ingestion error.
-        """
+        del chunks
+        del table_metadata
+
+    @staticmethod
+    def _cleanup_partial_ingestion(
+        workspace_id,
+        document_id,
+    ):
 
         try:
+
             VectorStore.delete_document(
                 document_id=document_id
             )
+
         except Exception:
+
             logger.exception(
                 "Cleanup: failed to delete vectors for document %s.",
                 document_id,
             )
 
         try:
+
             SQLiteManager.drop_document_tables(
                 workspace_id=workspace_id,
                 document_id=document_id,
             )
+
         except Exception:
+
             logger.exception(
                 "Cleanup: failed to drop SQLite tables for "
                 "document %s.",

@@ -19,7 +19,6 @@ TASK_MODELS = {
     "planner": "openai/gpt-oss-120b",
     "sql_generation": "openai/gpt-oss-20b",
     "answer_generation": "openai/gpt-oss-120b",
-    "grounding": "openai/gpt-oss-20b",
 }
 
 
@@ -41,8 +40,9 @@ DEFAULT_MAX_TOKENS = 1024
 # Total number of attempts, including the first request.
 MAX_ATTEMPTS = 3
 
-# Maximum time allowed for one provider request.
-REQUEST_TIMEOUT = 30.0
+# Maximum time allowed for ONE provider attempt. Worst case per LLM call is
+# roughly MAX_ATTEMPTS * REQUEST_TIMEOUT plus backoff (~65s at 3 x 20s).
+REQUEST_TIMEOUT = 20.0
 
 # Base retry delay. Backoff becomes roughly:
 # 1s -> 2s

@@ -1,7 +1,10 @@
 import logging
 from typing import Any
 
-logger = logging.getLogger(__name__)
+logger=logging.getLogger(__name__)
+
+MAX_SEMANTIC_CELL_CHARS=500
+MAX_SAMPLE_ROWS=10
 
 
 class TableProcessor:
@@ -19,160 +22,136 @@ class TableProcessor:
 
     @staticmethod
     def extract_table(
-        table_node: dict[str, Any],
-    ) -> dict[str, Any]:
-        """
-        Convert raw LlamaParse table into
-        QueryPilot standard format.
+        table_node: dict[str,Any],
+    )->dict[str,Any]:
 
-        LlamaParse currently returns:
-
-        {
-            "page": 1,
-            "rows": [...],
-            "csv": "...",
-            "html": "...",
-            "markdown": "..."
-        }
-
-        We treat first row as headers.
-        """
-
-        if not isinstance(table_node, dict):
+        if not isinstance(table_node,dict):
             raise ValueError(
                 "Expected a dict table_node from LlamaParse, "
                 f"got {type(table_node).__name__}."
             )
 
-        raw_rows = table_node.get(
-            "rows",
-            [],
-        )
+        raw_rows=table_node.get("rows") or []
+
+        if not isinstance(raw_rows,(list,tuple)):
+            raise ValueError(
+                "Table rows must be a list or tuple."
+            )
 
         if raw_rows:
-            headers = raw_rows[0]
-            rows = raw_rows[1:]
+            headers=raw_rows[0]
+            rows=raw_rows[1:]
         else:
-            headers = []
-            rows = []
+            headers=[]
+            rows=[]
+
+        if not isinstance(headers,(list,tuple)):
+            headers=[headers]
 
         return {
-            "title": f"Table Page {table_node.get('page', 0)}",
-            "page": table_node.get(
-                "page",
-                0,
-            ),
-            "headers": headers,
-            "rows": rows,
+            "title":f"Table Page {table_node.get('page',0)}",
+            "page":table_node.get("page",0),
+            "headers":list(headers),
+            "rows":rows,
         }
 
     @staticmethod
     def normalize_table(
-        headers: list[str],
-        rows: list[list[str]],
-    ) -> tuple[list[str], list[list[str]]]:
-        """
-        Clean table structure.
+        headers:list[str],
+        rows:list[list[str]],
+    )->tuple[list[str],list[list[str]]]:
 
-        IMPORTANT: financial tables from LlamaParse almost always have
-        a blank header cell over the row-label column, e.g.
+        normalized_headers=[]
+        used_headers=set()
 
-            ["", "September 30,<br/>2023", "September 24,<br/>2022"]
+        for index,header in enumerate(headers):
 
-        The old logic dropped any column whose HEADER cell was falsy -
-        which silently deleted the label column ("Cash and cash
-        equivalents", "Total assets", etc.) from every row, since it's
-        the column that's almost always unlabeled. That's the column
-        that makes the row identifiable at all, so this was destroying
-        the table's actual data, not just tidying it.
+            name=str(header).strip() or f"column_{index}"
 
-        Fix: keep every column. A blank header gets a placeholder name
-        instead of being used as a signal to delete the column.
-        """
+            base_name=name
+            suffix=2
 
-        headers = [
-            str(header).strip() or f"column_{index}"
-            for index, header in enumerate(headers)
-        ]
+            while name.lower() in used_headers:
 
-        valid_indexes = list(range(len(headers)))
+                name=f"{base_name}_{suffix}"
+                suffix+=1
 
-        normalized_rows = []
+            used_headers.add(name.lower())
+            normalized_headers.append(name)
+
+        column_count=len(normalized_headers)
+        normalized_rows=[]
 
         for row in rows:
 
-            cleaned_row = []
+            if not isinstance(row,(list,tuple)):
+                continue
 
-            for index in valid_indexes:
+            cleaned_row=[]
 
-                if index < len(row):
-                    cleaned_row.append(
-                        str(row[index]).strip()
-                    )
+            for index in range(column_count):
+
+                if index<len(row):
+                    value=row[index]
+
+                    if value is None:
+                        value=""
+                    else:
+                        value=str(value).strip()
                 else:
-                    cleaned_row.append("")
+                    value=""
+
+                cleaned_row.append(value)
 
             if not any(cleaned_row):
                 continue
 
-            normalized_rows.append(
-                cleaned_row
-            )
+            normalized_rows.append(cleaned_row)
 
-        return headers, normalized_rows
+        return normalized_headers,normalized_rows
 
     @staticmethod
     def validate_table(
-        headers: list[str],
-        rows: list[list[str]],
-    ) -> bool:
-        """
-        Reject obviously broken tables.
-        """
+        headers:list[str],
+        rows:list[list[str]],
+    )->bool:
 
         if not headers:
             return False
 
-        if not rows:
+        if len(headers)<2:
             return False
 
-        if len(headers) < 2:
+        if not rows:
             return False
 
         return True
 
     @staticmethod
     def build_metadata(
-        document_id: int,
-        page: int,
-        title: str,
-        headers: list[str],
-        rows: list[list[str]],
-    ) -> dict[str, Any]:
-        """
-        Metadata stored alongside vectors.
-        """
+        document_id:int,
+        page:int,
+        title:str,
+        headers:list[str],
+        rows:list[list[str]],
+    )->dict[str,Any]:
 
         return {
-            "document_id": document_id,
-            "page": page,
-            "title": title,
-            "columns": headers,
-            "row_count": len(rows),
+            "document_id":document_id,
+            "page":page,
+            "title":title,
+            "columns":headers,
+            "row_count":len(rows),
         }
 
     @staticmethod
     def serialize_for_embedding(
-        title: str,
-        headers: list[str],
-        rows: list[list[str]],
-    ) -> str:
-        """
-        Convert table into semantic text
-        for embedding storage.
-        """
+        title:str,
+        headers:list[str],
+        rows:list[list[str]],
+    )->str:
 
-        lines = [
+        lines=[
             f"Table: {title}",
             "",
             "Columns:",
@@ -183,13 +162,24 @@ class TableProcessor:
             "Sample Rows:",
         ]
 
-        for row in rows[:10]:
+        for row in rows[:MAX_SAMPLE_ROWS]:
+
+            values=[]
+
+            for value in row:
+
+                text=str(value)
+
+                if len(text)>MAX_SEMANTIC_CELL_CHARS:
+                    text=(
+                        text[:MAX_SEMANTIC_CELL_CHARS]
+                        + "..."
+                    )
+
+                values.append(text)
 
             lines.append(
-                " | ".join(
-                    str(value)
-                    for value in row
-                )
+                " | ".join(values)
             )
 
         return "\n".join(lines)
@@ -197,28 +187,23 @@ class TableProcessor:
     @classmethod
     def process(
         cls,
-        table_node: dict[str, Any],
-        document_id: int,
-    ) -> dict[str, Any] | None:
-        """
-        Main orchestration method.
-        """
+        table_node:dict[str,Any],
+        document_id:int,
+    )->dict[str,Any]|None:
 
-        table = cls.extract_table(
+        table=cls.extract_table(
             table_node
         )
 
-        headers, rows = cls.normalize_table(
+        headers,rows=cls.normalize_table(
             table["headers"],
             table["rows"],
         )
 
-        is_valid = cls.validate_table(
+        if not cls.validate_table(
             headers,
             rows,
-        )
-
-        if not is_valid:
+        ):
             logger.info(
                 "Table rejected for document %s (page %s): "
                 "%d headers, %d rows after normalization.",
@@ -229,7 +214,7 @@ class TableProcessor:
             )
             return None
 
-        metadata = cls.build_metadata(
+        metadata=cls.build_metadata(
             document_id=document_id,
             page=table["page"],
             title=table["title"],
@@ -237,21 +222,19 @@ class TableProcessor:
             rows=rows,
         )
 
-        semantic_text = (
-            cls.serialize_for_embedding(
-                title=table["title"],
-                headers=headers,
-                rows=rows,
-            )
+        semantic_text=cls.serialize_for_embedding(
+            title=table["title"],
+            headers=headers,
+            rows=rows,
         )
 
-        payload = {
-            "sqlite_payload": {
-                "headers": headers,
-                "rows": rows,
+        payload={
+            "sqlite_payload":{
+                "headers":headers,
+                "rows":rows,
             },
-            "metadata": metadata,
-            "semantic_text": semantic_text,
+            "metadata":metadata,
+            "semantic_text":semantic_text,
         }
 
         logger.debug(
