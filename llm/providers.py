@@ -1,16 +1,17 @@
 from collections.abc import Iterator
 import logging
 import random
+import threading
 import time
 
 from groq import Groq
 
 from .config import (
+    DEFAULT_COOLDOWN_SECONDS,
     GROQ_API_KEYS,
     MAX_ATTEMPTS,
     REQUEST_TIMEOUT,
     RETRY_BACKOFF_SECONDS,
-    TASK_KEY_OFFSET,
 )
 from .exceptions import (
     AuthenticationError,
@@ -44,10 +45,24 @@ class GroqProvider:
     Groq provider adapter.
 
     Responsibilities:
-        - Own Groq clients.
-        - Rotate configured API keys.
+        - Own Groq clients (one per API key).
+        - Distribute load using a per-model round-robin counter.
+        - Track per-(key_index, model) cooldowns to skip rate-limited buckets.
         - Execute normal and streaming requests.
         - Apply bounded retry handling around request creation.
+
+    Rate limit model:
+        Groq enforces limits per key per model, giving 6 independent buckets
+        across 3 keys and 2 model tiers (20b, 120b). A 429 on key0+20b says
+        nothing about key0+120b or key1+20b. Two independent counters — one
+        per model — distribute each tier's traffic evenly across all 3 keys
+        without the tiers interfering with each other.
+
+    429 handling:
+        On a 429 the (key, model) bucket is cooled immediately and the retry
+        selects the next available key with zero sleep. Sleep only occurs if
+        all 3 keys are simultaneously cooling for the requested model, and
+        only until the soonest cooldown expires.
 
     This layer intentionally does not:
         - emit SSE
@@ -55,9 +70,9 @@ class GroqProvider:
         - know about chat conversations
         - assemble frontend state
 
-    For streaming requests, retry decisions are made while establishing
-    the provider stream. Once a stream has successfully started, the
-    provider returns that live iterator to the caller unchanged.
+    For streaming requests, retry decisions are made while establishing the
+    provider stream. Once a stream has successfully started the provider
+    returns that live iterator unchanged.
     """
 
     def __init__(self):
@@ -67,30 +82,93 @@ class GroqProvider:
                 timeout=REQUEST_TIMEOUT,
                 # The Groq SDK retries on its own by default (same key, up to
                 # 2 extra tries). That multiplies with the MAX_ATTEMPTS loop
-                # below (worst case 3 x 3 attempts per call) and never rotates
-                # keys. Keep ONE retry layer: ours.
+                # below and never rotates keys. Keep ONE retry layer: ours.
                 max_retries=0,
             )
             for key in GROQ_API_KEYS
         ]
 
-        self.counters: dict[str, int] = {}
+        self._lock = threading.Lock()
 
-    def _get_client(self, task: str) -> Groq:
-        counter = self.counters.get(task, 0)
+        # Per-model round-robin counter: model_string -> next starting index.
+        # Each model tier advances independently so heavy 20b traffic does
+        # not skew the 120b distribution and vice-versa.
+        self._counters: dict[str, int] = {}
 
-        offset = TASK_KEY_OFFSET.get(
-            task,
-            0,
-        )
+        # Per-(key_index, model) cooldown expiry as a monotonic timestamp.
+        # A bucket is available when its expiry is <= time.monotonic().
+        self._cooldowns: dict[tuple[int, str], float] = {}
 
-        index = (
-            counter + offset
-        ) % len(self.clients)
+    # ------------------------------------------------------------------
+    # Key selection
+    # ------------------------------------------------------------------
 
-        self.counters[task] = counter + 1
+    def _get_client(self, model: str) -> tuple[Groq, int]:
+        """
+        Return the next available (client, key_index) for this model.
 
-        return self.clients[index]
+        Normal path (O(n)):
+            Scan keys in round-robin order, return the first whose
+            (key_index, model) bucket is not cooling. The counter advances
+            past the chosen key so the next call starts from the following
+            slot.
+
+        All-cooled path:
+            If every key is cooling, sleep outside the lock until the
+            soonest cooldown expires, then return that key. This is the
+            ONLY place a rate-limit-induced sleep can occur.
+        """
+        now = time.monotonic()
+        n = len(self.clients)
+
+        with self._lock:
+            counter = self._counters.get(model, 0)
+
+            for i in range(n):
+                index = (counter + i) % n
+                if self._cooldowns.get((index, model), 0.0) <= now:
+                    # Advance counter past this key so the next call
+                    # starts from the following slot.
+                    self._counters[model] = (index + 1) % n
+                    return self.clients[index], index
+
+            # All keys are cooling — find the one that recovers soonest.
+            soonest = min(
+                range(n),
+                key=lambda i: self._cooldowns.get((i, model), 0.0),
+            )
+            wait = self._cooldowns[(soonest, model)] - now
+
+        # Sleep outside the lock so other threads can make progress
+        # on different models or tasks while we wait.
+        if wait > 0:
+            logger.warning(
+                "[LLM] All keys cooling for model=%s — sleeping %.1fs",
+                model,
+                wait,
+            )
+            time.sleep(wait)
+
+        with self._lock:
+            self._counters[model] = (soonest + 1) % n
+
+        return self.clients[soonest], soonest
+
+    def _mark_cooldown(
+        self,
+        key_index: int,
+        model: str,
+        seconds: float,
+    ) -> None:
+        """Mark a (key_index, model) bucket as unavailable for `seconds`."""
+        with self._lock:
+            self._cooldowns[(key_index, model)] = (
+                time.monotonic() + seconds
+            )
+
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _log_usage(
@@ -107,7 +185,6 @@ class GroqProvider:
         generous can silently truncate answers, summaries or JSON.
         Diagnostics only: it must never affect the request.
         """
-
         try:
             finish = getattr(response.choices[0], "finish_reason", None)
             usage = getattr(response, "usage", None)
@@ -137,59 +214,50 @@ class GroqProvider:
         except Exception:
             pass
 
-    def _get_retry_delay(
-        self,
-        attempt: int,
-    ) -> float:
+    # ------------------------------------------------------------------
+    # Retry helpers
+    # ------------------------------------------------------------------
+
+    def _get_retry_delay(self, attempt: int) -> float:
         """
-        Small exponential backoff with jitter.
+        Small exponential backoff with jitter for non-429 failures.
 
-        attempt=1 -> about 1s
-        attempt=2 -> about 2s
+        attempt=1 -> ~1s
+        attempt=2 -> ~2s
         """
-
-        base_delay = (
-            RETRY_BACKOFF_SECONDS
-            * (2 ** (attempt - 1))
-        )
-
-        jitter = random.uniform(
-            0,
-            0.25,
-        )
-
+        base_delay = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+        jitter = random.uniform(0, 0.25)
         return base_delay + jitter
 
     @staticmethod
-    def _get_status_code(
-        exc,
-    ):
-        return getattr(
-            exc,
-            "status_code",
-            None,
-        )
+    def _get_status_code(exc):
+        return getattr(exc, "status_code", None)
 
     @staticmethod
-    def _is_retryable_status(
-        status,
-    ):
-        return status in {
-            429,
-            500,
-            502,
-            503,
-            504,
-        }
+    def _is_retryable_status(status) -> bool:
+        return status in {500, 502, 503, 504}
 
     @staticmethod
-    def _is_timeout_exception(
-        exc,
-    ) -> bool:
-        return (
-            "timeout"
-            in exc.__class__.__name__.lower()
-        )
+    def _is_timeout_exception(exc) -> bool:
+        return "timeout" in exc.__class__.__name__.lower()
+
+    @staticmethod
+    def _parse_retry_after(exc) -> float | None:
+        """
+        Extract the Retry-After value (seconds) from a 429 response header.
+        Returns None if the header is absent or unparseable.
+        """
+        try:
+            headers = getattr(
+                getattr(exc, "response", None), "headers", None
+            )
+            if headers:
+                value = headers.get("retry-after")
+                if value is not None:
+                    return float(value)
+        except (TypeError, ValueError):
+            pass
+        return None
 
     def _handle_failure(
         self,
@@ -198,111 +266,98 @@ class GroqProvider:
         task: str,
         model: str,
         attempt: int,
-    ) -> bool:
+        key_index: int,
+    ) -> None:
         """
-        Log a provider failure and determine whether the caller should
-        retry the request.
+        Log a provider failure and either raise a terminal exception or
+        return to allow the caller to retry.
 
-        Returns:
-            True  -> retry
-            False -> caller must raise the mapped terminal exception
+        429 path:
+            Marks (key_index, model) as cooled using the Retry-After header
+            or DEFAULT_COOLDOWN_SECONDS as a fallback, then returns
+            immediately with no sleep. The next _get_client call will skip
+            the cooled bucket and pick the next healthy key.
+
+        All other retryable failures (timeouts, 5xx, no-status network
+        errors) use a short exponential backoff before the next attempt.
+        These errors are not key-specific so no cooldown is set.
         """
-
-        status = self._get_status_code(
-            exc
-        )
+        status = self._get_status_code(exc)
 
         logger.warning(
-            "[LLM] task=%s model=%s attempt=%s/%s "
-            "status=%s type=%s retry_after=%s error=%s",
+            "[LLM] task=%s model=%s key=%s attempt=%s/%s "
+            "status=%s type=%s error=%s",
             task,
             model,
+            key_index,
             attempt,
             MAX_ATTEMPTS,
             status,
             type(exc).__name__,
-            getattr(
-                getattr(getattr(exc, "response", None), "headers", None) or {},
-                "get",
-                lambda *_: None,
-            )("retry-after"),
             exc,
         )
 
-        if status in (
-            401,
-            403,
-        ):
-            raise AuthenticationError(
-                str(exc)
-            ) from exc
+        # --- terminal: bad credentials ---
+        if status in (401, 403):
+            raise AuthenticationError(str(exc)) from exc
 
-        if self._is_timeout_exception(
-            exc
-        ):
+        # --- 429: cool this bucket, retry immediately on next key ---
+        if status == 429:
+            retry_after = self._parse_retry_after(exc)
+            cooldown = (
+                retry_after
+                if retry_after is not None
+                else DEFAULT_COOLDOWN_SECONDS
+            )
+            self._mark_cooldown(key_index, model, cooldown)
+            logger.info(
+                "[LLM] key=%s model=%s rate-limited — cooled for %.1fs",
+                key_index,
+                model,
+                cooldown,
+            )
+            if attempt >= MAX_ATTEMPTS:
+                raise RateLimitError(str(exc)) from exc
+            # No sleep — _get_client will skip this key on the next attempt.
+            return
+
+        # --- timeout ---
+        if self._is_timeout_exception(exc):
             if attempt < MAX_ATTEMPTS:
-                time.sleep(
-                    self._get_retry_delay(
-                        attempt
-                    )
-                )
-                return True
+                time.sleep(self._get_retry_delay(attempt))
+                return
+            raise TimeoutError("Groq request timed out.") from exc
 
-            raise TimeoutError(
-                "Groq request timed out."
-            ) from exc
-
-        if self._is_retryable_status(
-            status
-        ):
+        # --- retryable 5xx ---
+        if self._is_retryable_status(status):
             if attempt < MAX_ATTEMPTS:
-                time.sleep(
-                    self._get_retry_delay(
-                        attempt
-                    )
-                )
-                return True
+                time.sleep(self._get_retry_delay(attempt))
+                return
+            raise ProviderUnavailableError(str(exc)) from exc
 
-            if status == 429:
-                raise RateLimitError(
-                    str(exc)
-                ) from exc
-
-            raise ProviderUnavailableError(
-                str(exc)
-            ) from exc
-
-        # Network/connection style failures often have no HTTP status.
+        # --- network / connection errors (no HTTP status) ---
         if status is None:
             if attempt < MAX_ATTEMPTS:
-                time.sleep(
-                    self._get_retry_delay(
-                        attempt
-                    )
-                )
-                return True
-
+                time.sleep(self._get_retry_delay(attempt))
+                return
             raise ProviderUnavailableError(
                 f"Groq request failed: {exc}"
             ) from exc
 
-        # Bad request errors are deterministic and should not be retried.
+        # --- bad request: deterministic, do not retry ---
         if status == 400:
-            raise InvalidResponseError(
-                str(exc)
-            ) from exc
+            raise InvalidResponseError(str(exc)) from exc
 
+        # --- any other unexpected status ---
         if attempt < MAX_ATTEMPTS:
-            time.sleep(
-                self._get_retry_delay(
-                    attempt
-                )
-            )
-            return True
+            time.sleep(self._get_retry_delay(attempt))
+            return
 
-        raise ProviderUnavailableError(
-            f"Groq failed: {exc}"
-        ) from exc
+        raise ProviderUnavailableError(f"Groq failed: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
 
     def generate(
         self,
@@ -323,44 +378,28 @@ class GroqProvider:
             Returns the normal Groq completion response.
 
         For stream=True:
-            Returns Groq's live streaming iterator.
-
-        Important:
-            Once Groq successfully returns a streaming iterator, this
-            method does not consume it. The caller owns the stream from
-            that point onward.
+            Returns Groq's live streaming iterator. Once the stream is
+            successfully started this method does not consume it — the
+            caller owns it from that point onward.
         """
-
         extra_params = {}
-
-        # Reasoning models can spend completion tokens on internal
-        # reasoning. Keep reasoning low when explicitly requested.
         if include_reasoning is False:
-            extra_params[
-                "reasoning_effort"
-            ] = "low"
+            extra_params["reasoning_effort"] = "low"
 
         last_error = None
 
-        for attempt in range(
-            1,
-            MAX_ATTEMPTS + 1,
-        ):
-            client = self._get_client(
-                task
-            )
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            client, key_index = self._get_client(model)
 
             try:
-                response = (
-                    client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        response_format=response_format,
-                        stream=stream,
-                        **extra_params,
-                    )
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format=response_format,
+                    stream=stream,
+                    **extra_params,
                 )
 
                 if stream:
@@ -384,17 +423,15 @@ class GroqProvider:
 
             except Exception as exc:
                 last_error = exc
-
                 self._handle_failure(
                     exc=exc,
                     task=task,
                     model=model,
                     attempt=attempt,
+                    key_index=key_index,
                 )
 
-        raise ProviderUnavailableError(
-            f"Groq failed: {last_error}"
-        )
+        raise ProviderUnavailableError(f"Groq failed: {last_error}")
 
     def generate_text_stream(
         self,
@@ -416,7 +453,6 @@ class GroqProvider:
         already yielded data. At that point the request has begun and a
         transparent retry could duplicate part of the answer.
         """
-
         response = self.generate(
             task=task,
             model=model,
@@ -432,44 +468,28 @@ class GroqProvider:
 
         try:
             for chunk in response:
-                choices = getattr(
-                    chunk,
-                    "choices",
-                    None,
-                )
-
+                choices = getattr(chunk, "choices", None)
                 if not choices:
                     continue
 
                 for choice in choices:
-                    delta = getattr(
-                        choice,
-                        "delta",
-                        None,
-                    )
-
+                    delta = getattr(choice, "delta", None)
                     if delta is None:
                         continue
 
-                    content = getattr(
-                        delta,
-                        "content",
-                        None,
-                    )
-
+                    content = getattr(delta, "content", None)
                     if not content:
                         continue
 
                     yielded_any = True
-
                     yield content
 
         except Exception as exc:
             # Do not retry here. The stream has already been handed to
             # the caller and may already have produced partial output.
             logger.exception(
-                "[LLM] Streaming response failed "
-                "after stream start: task=%s model=%s",
+                "[LLM] Streaming response failed after stream start: "
+                "task=%s model=%s",
                 task,
                 model,
             )
@@ -486,7 +506,7 @@ class GroqProvider:
 _provider = None
 
 
-def get_provider():
+def get_provider() -> GroqProvider:
     global _provider
 
     if _provider is None:

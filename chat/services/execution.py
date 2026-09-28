@@ -4,97 +4,28 @@ Canonical streaming execution entrypoint for QueryPilot.
 Flow:
 
     load conversation settings
-        ↓
-    load conversation memory (if enabled)
-        ↓
-    persist user message
-        ↓
-    deterministic scope boundary (2.5)
-        (clearly out-of-scope requests are refused here and never
-         reach the planner, retrieval, Chroma, or SQL)
-        ↓
-    optional LLM scope boundary (2.6, fail-open, toggleable via
-        settings.SCOPE_GUARD_LLM_ENABLED)
-        ↓
-    Evidence Agent
-        (query understanding → workspace/entity resolution →
-         execution planning → tool dispatch → evidence validation →
-         answer generation, all inside one LangGraph run)
-        ↓
-    source extraction (chat.services.sources.build_sources)
-    citation extraction/validation (chat.services.citations)
-        ↓
-    grounding evaluation (deterministic, fail-closed, from validated
-    citations; independent of the citations_enabled display setting)
-        ↓
-    apply citation setting
-        ↓
-    normalized metadata (sources + citations + thoughts +
-    grounding_passed + route)
-        ↓
-    persist assistant message (content + metadata)
-        ↓
-    update rolling conversation memory (if enabled)
-        ↓
-    conversation title
-        ↓
-    final SSE event (same metadata, not a second structure)
+        -> load conversation memory (if enabled)
+        -> persist user message
+        -> deterministic scope boundary (2.5)
+        -> optional LLM scope boundary (2.6, fail-open)
+        -> Evidence Agent (single LangGraph run)
+        -> source extraction + citation extraction/validation
+        -> grounding evaluation (deterministic, fail-closed)
+        -> apply citation setting
+        -> normalized metadata
+        -> persist assistant message
+        -> update rolling conversation memory (if enabled)
+        -> conversation title
+        -> final SSE event
 
-Sources, citations, and safe progress "thoughts" are all built
-deterministically from data the agent already produced. None of this
-calls an LLM a second time and none of it changes the answer generation
-pipeline itself.
+Follow-up resource context (memory enabled only):
 
-Scope boundaries:
-
-    2.5 Deterministic (no LLM): ScopeGuard.deterministic_route() uses
-        pure string logic. Clearly out-of-scope requests (general
-        programming, external knowledge, prompt-injection attempts
-        asking for code) receive a fixed refusal and never reach the
-        planner, retrieval, Chroma, or SQL.
-
-    2.6 LLM (optional, fail-open): requests the deterministic boundary
-        could not decide are classified by the scope-guard LLM (task
-        "scope_guard"). Only OUT blocks; DOCUMENT, CHITCHAT, and
-        CLARIFY proceed to the agent. If the scope LLM fails for any
-        reason, the request proceeds to the agent unchanged. This is
-        not a second answer generator: it never produces user-visible
-        prose.
-
-Conversation memory:
-
-    rolling summary of older messages
-        +
-    latest 10 completed messages
-        +
-    current user query
-
-When memory is disabled for a conversation, the rolling summary and
-recent conversation history are not supplied to the planner, and the
-rolling summary is not updated after the response.
-
-The rolling summary is conversational context only. It is never treated
-as authoritative document or table evidence.
-
-Citation setting:
-
-    citations_enabled=True
-        → citation markers and validated citation metadata are retained.
-
-    citations_enabled=False
-        → citation markers are removed from the answer and the
-          `citations` metadata list is empty. This affects display only;
-          grounding_passed is still computed from the validated citations.
-
-Document scope:
-
-    Workspace
-        ↓
-    all documents belonging to that workspace
-        ↓
-    every conversation in that workspace can use them
-
-Documents are workspace-level sources, not conversation-level sources.
+    the previous turn's deterministically resolved documents/tables
+    are carried into the next request's planner state so contextual
+    references ("that table", "the previous one", "the second table")
+    resolve against what was actually established last turn. Catalog
+    facts only (ids, titles, table names) - never evidence payloads,
+    SQL, or raw internal state.
 """
 
 from __future__ import annotations
@@ -109,7 +40,7 @@ from django.conf import settings
 
 from documents.models import Document
 
-from chat.models import ConversationSettings
+from chat.models import ConversationSettings, Message
 from chat.services.citations import extract_citations, find_marker_numbers
 from chat.services.conversation import (
     add_message,
@@ -127,43 +58,33 @@ from chat.services.title import (
 )
 
 from llm.router import router
-from planner.services.agent import agent_graph
-from planner.services.scope_guard import ScopeGuard
+from planner.services.agent_service import agent_graph
+from planner.services.scope_guard_services import ScopeGuard
 from planner.services.state import AgentState
 
 logger = logging.getLogger(__name__)
 
-# Whole-request time budget. Checked by the agent between stages; a single
-# LLM call cannot be interrupted from here, so ALSO set a per-call timeout
-# in the provider client.
 REQUEST_BUDGET_SECONDS = 90
 
 FAILURE_MESSAGE = "I couldn't complete this request. Please try again."
 
-# Fixed response for clearly out-of-scope requests. Emitted before the
-# agent runs: no planner, no retrieval, no Chroma, or SQL.
 OUT_OF_SCOPE_MESSAGE = (
     "I can't help with this request. I can answer questions within "
     "the scope of the documents available in this workspace."
 )
 
-# Optional second scope stage: the scope-guard LLM classifies requests
-# the deterministic boundary could not decide. Fail-open, toggleable.
-# Set SCOPE_GUARD_LLM_ENABLED = False in settings to disable (the
-# deterministic boundary keeps working either way).
 SCOPE_GUARD_LLM_ENABLED = getattr(
     settings,
     "SCOPE_GUARD_LLM_ENABLED",
     True,
 )
 
-# Bounds for the safe, user-facing progress "thoughts" persisted with
-# an assistant message. These are the same events already emitted on
-# the SSE stream today -- nothing new is captured, and nothing internal
-# (raw LangGraph state, tool payloads, exception text) is included.
-# This is only a defensive cap on stored size.
 MAX_THOUGHTS = 30
 MAX_THOUGHT_MESSAGE_CHARS = 300
+
+# Follow-up resource context: metadata key and bound.
+PLANNER_CONTEXT_KEY = "planner_context"
+MAX_PRIOR_CONTEXT_MATCHES = 5
 
 
 def _generate_title_if_needed(
@@ -171,25 +92,11 @@ def _generate_title_if_needed(
     conversation,
     user_message: str,
 ) -> None:
-    """
-    Generate a conversation title the first time a meaningful
-    conversation message is processed.
-
-    Titles are generated using documents belonging to the entire
-    workspace because workspace documents are shared by all
-    conversations in that workspace.
-    """
     if conversation.title != "New Chat":
         return
 
-    # Use the conversation's first meaningful user message as the
-    # basis for title generation. Fall back to the supplied message
-    # when no earlier user message exists.
     first_user = get_first_user_message(conversation=conversation)
 
-    # First MEANINGFUL user message: a leading "Hello" must not title the
-    # chat. If nothing meaningful exists yet, leave "New Chat" and try again
-    # on a later turn. Once a title exists this function returns above.
     user_query_for_title = next(
         (
             query
@@ -202,8 +109,6 @@ def _generate_title_if_needed(
     if user_query_for_title is None:
         return
 
-    # Workspace-level documents: documents belong directly to the
-    # workspace. There is no conversation-specific document boundary.
     documents = (
         Document.objects.filter(
             workspace_id=conversation.workspace_id,
@@ -216,7 +121,6 @@ def _generate_title_if_needed(
 
     for document in documents:
         metadata = getattr(document, "metadata", None)
-
         if metadata is not None and metadata.summary:
             document_profiles.append(metadata.summary)
 
@@ -233,14 +137,6 @@ def _track(
     thoughts: list[dict[str, Any]],
     event: ChatEvent,
 ) -> ChatEvent:
-    """
-    Record a safe, user-facing progress event as a "thought" entry.
-
-    Only ever called on ChatEvent objects that are already being sent
-    out over SSE (see the yield sites below) -- this never captures
-    anything that wasn't already intentionally user-facing, and never
-    captures raw internal state.
-    """
     thoughts.append(
         {
             "event": event.event,
@@ -253,12 +149,6 @@ def _track(
 def _bound_thoughts(
     thoughts: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """
-    Return a bounded copy of the user-facing progress events.
-
-    This prevents the persisted metadata from growing without limit
-    while preserving the most recent progress events.
-    """
     bounded: list[dict[str, Any]] = []
 
     for item in thoughts[-MAX_THOUGHTS:]:
@@ -274,17 +164,89 @@ def _bound_thoughts(
     return bounded
 
 
+def _compact_planner_context(final_result: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Compact, deterministic record of the documents/tables this request
+    resolved BY NAME, for the NEXT request's contextual reference
+    resolution. Catalog facts only. Entities are deliberately
+    excluded: they are values, not sources.
+    """
+    references = (
+        final_result.get("resolved_references", {}) or {}
+    ).get("references", [])
+
+    matches: list[dict[str, Any]] = []
+    for item in references:
+        if not isinstance(item, dict) or item.get("status") != "RESOLVED":
+            continue
+        match = item.get("match", {})
+        if (
+            not isinstance(match, dict)
+            or match.get("type") not in {"document", "table"}
+        ):
+            continue
+        matches.append(
+            {
+                "type": match.get("type"),
+                "document_id": match.get("document_id"),
+                "title": match.get("title") or match.get("document_title"),
+                "table_name": match.get("table_name"),
+            }
+        )
+        if len(matches) >= MAX_PRIOR_CONTEXT_MATCHES:
+            break
+    return matches
+
+
+def _prior_tool_history(conversation) -> list[dict[str, Any]]:
+    """
+    Seed the agent's tool_history with the PREVIOUS turn's resolved
+    documents/tables so deterministic contextual resolution can anchor
+    "that table" / "the previous one" / "the second table" to what was
+    actually established last turn. Only the single most recent
+    assistant message is used. Fails open to [] (previous behavior).
+    """
+    try:
+        last_metadata = (
+            Message.objects.filter(
+                conversation=conversation,
+                role="ASSISTANT",
+            )
+            .order_by("-id")
+            .values_list("metadata", flat=True)
+            .first()
+        ) or {}
+
+        prior_matches = last_metadata.get(PLANNER_CONTEXT_KEY) or []
+        if not isinstance(prior_matches, list) or not prior_matches:
+            return []
+
+        return [
+            {
+                "stage": "query_understanding",
+                "resolution": {
+                    "references": [
+                        {"status": "RESOLVED", "match": match}
+                        for match in prior_matches
+                        if isinstance(match, dict)
+                    ],
+                },
+            }
+        ]
+    except Exception:
+        logger.exception(
+            "Could not load prior planner context (conversation_id=%s); "
+            "continuing without it",
+            conversation.id,
+        )
+        return []
+
+
 def _out_of_scope_response(
     *,
     conversation,
     thoughts: list[dict[str, Any]],
 ) -> ChatEvent:
-    """
-    Persist the fixed out-of-scope refusal and build the final event.
-
-    Used by both scope stages (deterministic and LLM). No planner,
-    no retrieval, no Chroma, no SQL, no answer model ever runs.
-    """
     metadata: dict[str, Any] = {
         "sources": [],
         "citations": [],
@@ -321,13 +283,6 @@ def _chitchat_response(
     user_message: str,
     thoughts: list[dict[str, Any]],
 ) -> ChatEvent:
-    """
-    Generate a short conversational response and emit it through the
-    same final `complete` event contract used by the normal chat stream.
-
-    Chitchat intentionally bypasses the evidence agent, retrieval,
-    citations, grounding, and structured document-answer generation.
-    """
     system_prompt = (
         "You are QueryPilot's casual conversational assistant. "
         "Respond naturally to lightweight social conversation. "
@@ -407,23 +362,10 @@ def _sanitize_citation_markers(
     valid_indices: set[int],
     keep_valid: bool,
 ) -> str:
-    """
-    Make the answer text agree with the citation metadata.
-
-    - Markers that do not correspond to a real source are always removed
-      (they would render as dead "[17]" text).
-    - Valid markers are removed only when citations are disabled.
-
-    Only the marker (and one preceding space) is touched. Newlines,
-    indentation, tables and code blocks are left alone.
-    """
-
     def replace(match: re.Match[str]) -> str:
         number = int(match.group(1))
-
         if keep_valid and number in valid_indices:
             return match.group(0)
-
         return ""
 
     return _CITATION_MARKER_PATTERN.sub(replace, answer).strip()
@@ -436,19 +378,6 @@ def _evaluate_grounding(
     citations: list[dict[str, Any]],
     route: str,
 ) -> bool | None:
-    """
-    Deterministic, fail-closed grounding check for a normal ANSWER.
-
-    Passes only when ALL of the following hold:
-      - the answer text carries at least one marker;
-      - every marker in the text maps to a real source (no invalid marker);
-      - the validated citation list is exactly the set of markers in the
-        text (no citation without a marker, no marker without a citation).
-
-    Non-ANSWER routes (NOT_FOUND, clarification, ERROR, ...) keep their
-    existing semantics and are not evaluated (None). The result does not
-    depend on the citations_enabled display setting.
-    """
     if route != "ANSWER":
         return None
 
@@ -479,40 +408,8 @@ def execute_message_stream(
     conversation_id: int,
     user_message: str,
 ) -> Iterator[ChatEvent]:
-    """
-    Execute one QueryPilot message and stream its progress/events.
-
-    Conversation settings are loaded before execution.
-
-    `memory_enabled=True`:
-        The planner receives rolling summary + latest 10 completed
-        messages + current user query through AgentState["query"].
-
-    `memory_enabled=False`:
-        No conversation summary or recent message history is supplied
-        to the planner.
-
-    `citations_enabled=True`:
-        Generated citation markers and validated citation metadata are
-        preserved.
-
-    `citations_enabled=False`:
-        Numeric citation markers are removed from the answer and the
-        citation metadata list is emptied. grounding_passed is still
-        evaluated before markers are removed.
-
-    After a successful assistant response is persisted, rolling memory
-    is refreshed only when memory is enabled.
-    """
     conversation = get_conversation(conversation_id)
 
-    # ---------------------------------------------------------
-    # 0. Load conversation settings
-    #
-    # Settings are created automatically for new conversations.
-    # get_or_create() also protects older conversations created before
-    # ConversationSettings existed.
-    # ---------------------------------------------------------
     conversation_settings, _ = ConversationSettings.objects.get_or_create(
         conversation=conversation,
     )
@@ -520,19 +417,8 @@ def execute_message_stream(
     memory_enabled = conversation_settings.memory_enabled
     citations_enabled = conversation_settings.citations_enabled
 
-    # Safe, user-facing progress events collected as this generator
-    # runs, so they can be persisted alongside the assistant message
-    # once it's saved.
     thoughts: list[dict[str, Any]] = []
 
-    # ---------------------------------------------------------
-    # 1. Load conversation memory when enabled
-    #
-    # Memory is loaded BEFORE persisting the current user message so
-    # the current query is not duplicated in planner history.
-    #
-    # When memory is disabled, conversation_history remains empty.
-    # ---------------------------------------------------------
     conversation_history: list[dict[str, str]] = []
 
     if memory_enabled:
@@ -560,9 +446,6 @@ def execute_message_stream(
             memory_context.get("recent_messages", [])
         )
 
-    # ---------------------------------------------------------
-    # 2. Persist current user message
-    # ---------------------------------------------------------
     add_message(
         conversation=conversation,
         role="USER",
@@ -586,14 +469,6 @@ def execute_message_stream(
             ),
         )
 
-    # ---------------------------------------------------------
-    # 2.5 Deterministic scope boundary (no LLM, no retrieval)
-    #
-    # Clearly out-of-scope requests (general programming, external
-    # knowledge, prompt-injection attempts asking for code) are
-    # refused here. They never reach the planner, retrieval, Chroma,
-    # or SQL. Pure string logic: no LLM call, no measurable latency.
-    # ---------------------------------------------------------
     deterministic_route = ScopeGuard.deterministic_route(user_message)
 
     if deterministic_route == "OUT":
@@ -611,30 +486,12 @@ def execute_message_stream(
         )
         return
 
-    # ---------------------------------------------------------
-    # Workspace-level document boundary
-    #
-    # Every conversation belonging to this workspace has access
-    # to the same document set. Loaded before the optional LLM
-    # scope stage because that stage needs the allowed ID set.
-    # ---------------------------------------------------------
     document_ids = list(
         Document.objects.filter(
             workspace_id=conversation.workspace_id,
         ).values_list("id", flat=True)
     )
 
-    # ---------------------------------------------------------
-    # 2.6 LLM scope boundary (optional, fail-open)
-    #
-    # Requests the deterministic boundary could not decide are
-    # classified by the scope-guard LLM (task "scope_guard", already
-    # configured in llm.config.TASK_MODELS). OUT stops normal agent
-    # execution, CHITCHAT gets a short conversational response, and
-    # DOCUMENT/CLARIFY continue to the agent. If the scope LLM fails
-    # for any reason, the request proceeds to the agent unchanged
-    # (fail-open).
-    # ---------------------------------------------------------
     if SCOPE_GUARD_LLM_ENABLED:
         try:
             scope_decision = ScopeGuard().classify(
@@ -670,13 +527,6 @@ def execute_message_stream(
                 conversation.id,
             )
 
-    # ---------------------------------------------------------
-    # 3. Evidence Agent
-    #
-    # Query understanding, workspace/entity resolution, execution
-    # planning, tool dispatch, and answer generation all happen
-    # inside a single LangGraph run (planner.services.agent).
-    # ---------------------------------------------------------
     state: AgentState = {
         "query": user_message,
         "workspace_id": conversation.workspace_id,
@@ -687,7 +537,12 @@ def execute_message_stream(
         "known_facts": [],
         "unresolved_questions": [],
         "last_tool": "",
-        "tool_history": [],
+        # Seeded with the PREVIOUS turn's resolved documents/tables
+        # (memory enabled only) for contextual reference resolution.
+        # Fails open to [] - identical to previous behavior.
+        "tool_history": (
+            _prior_tool_history(conversation) if memory_enabled else []
+        ),
         "iteration_count": 0,
         "total_tool_calls": 0,
         "evidence_sufficient": False,
@@ -760,13 +615,6 @@ def execute_message_stream(
         )
         failure_code = "EXECUTION_ERROR"
 
-    # ---------------------------------------------------------
-    # 8. Ensure agent completed
-    #
-    # On failure the user's message is already persisted, so persist a
-    # matching assistant message too. History then stays paired and a
-    # reload shows what happened instead of an unanswered question.
-    # ---------------------------------------------------------
     if final_result is None and not failure_code:
         failure_code = "NO_FINAL_STATE"
 
@@ -802,20 +650,12 @@ def execute_message_stream(
 
     final_evidence = final_result.get("final_evidence", [])
 
-    # ---------------------------------------------------------
-    # 8.1 Extract sources/citations deterministically
-    #
-    # workspace_id is passed into citation extraction so source
-    # resolution is independently restricted to this workspace.
-    # ---------------------------------------------------------
     sources, citations = extract_citations(
         answer=answer,
         evidence=final_evidence,
         workspace_id=conversation.workspace_id,
     )
 
-    # Evaluate BEFORE sanitizing/stripping so the display setting cannot
-    # change the grounding verdict.
     grounding_passed = _evaluate_grounding(
         answer=answer,
         sources=sources,
@@ -832,6 +672,7 @@ def execute_message_stream(
     if not citations_enabled:
         citations = []
 
+    # Client-facing metadata: NEVER contains planner context.
     metadata: dict[str, Any] = {
         "sources": sources,
         "citations": citations,
@@ -840,24 +681,26 @@ def execute_message_stream(
         "route": final_route,
     }
 
-    # ---------------------------------------------------------
-    # 10. Persist assistant answer (+ metadata)
-    # ---------------------------------------------------------
+    # Persisted metadata: the same client-facing fields, plus this
+    # turn's resolved documents/tables so the NEXT request can resolve
+    # contextual references against them. Skipped for ERROR (nothing
+    # established) and NEEDS_CLARIFICATION (no choice made yet).
+    persisted_metadata = dict(metadata)
+    if memory_enabled and final_route not in {
+        "ERROR",
+        "NEEDS_CLARIFICATION",
+    }:
+        persisted_metadata[PLANNER_CONTEXT_KEY] = _compact_planner_context(
+            final_result
+        )
+
     add_message(
         conversation=conversation,
         role="ASSISTANT",
         content=answer,
-        metadata=metadata,
+        metadata=persisted_metadata,
     )
 
-    # ---------------------------------------------------------
-    # 10.05 Internally handled agent failure
-    #
-    # The agent catches most failures and returns a normal final state
-    # with route == "ERROR". The assistant message is persisted above so
-    # history stays paired, but the client must be told the request
-    # FAILED, not that it completed. Skip memory/title work on failures.
-    # ---------------------------------------------------------
     if final_route == "ERROR":
         yield ChatEvent(
             event="error",
@@ -871,13 +714,6 @@ def execute_message_stream(
         )
         return
 
-    # ---------------------------------------------------------
-    # 10.1 Update rolling conversation memory
-    #
-    # Only update memory when the conversation setting allows memory.
-    # Memory compression is separate from the evidence/answer pipeline.
-    # A memory update failure must never invalidate a successful answer.
-    # ---------------------------------------------------------
     if memory_enabled:
         try:
             update_rolling_summary(conversation=conversation)
@@ -887,9 +723,6 @@ def execute_message_stream(
                 conversation.id,
             )
 
-    # ---------------------------------------------------------
-    # 11. Conversation title
-    # ---------------------------------------------------------
     try:
         _generate_title_if_needed(
             conversation=conversation,
@@ -901,9 +734,6 @@ def execute_message_stream(
             conversation.id,
         )
 
-    # ---------------------------------------------------------
-    # 12. Final SSE event
-    # ---------------------------------------------------------
     yield ChatEvent(
         event="complete",
         message="Request completed.",

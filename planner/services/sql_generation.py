@@ -135,11 +135,23 @@ SQL PARAMETERS:
 Rules:
 - Use table and column names exactly as provided.
 - Never invent or rename identifiers.
+- A document/file title (for example "salary.xlsx" or "policy.pdf") is NOT
+  a SQLite table name unless that exact string appears in the supplied
+  "tables" list as "table_name". Never use filenames or document titles
+  directly in FROM/JOIN clauses.
 - Use JOIN when multiple STRUCTURED BUSINESS/OPERATIONAL tables are actually
   required to answer the factual part of the question.
 - Only generate SELECT or WITH ... SELECT queries.
 - Never generate INSERT, UPDATE, DELETE, REPLACE, CREATE, DROP,
   ALTER, ATTACH, DETACH, PRAGMA, or VACUUM.
+- NEVER query SQLite schema/catalog objects such as sqlite_master,
+  sqlite_schema, sqlite_temp_master, sqlite_temp_schema, or
+  pragma_table_list. The exact workspace tables are already supplied in
+  the "tables" input; schema discovery is unnecessary and prohibited.
+- When the user asks to inspect, enumerate, or show the contents of
+  available tables, query the actual table name(s) supplied in "tables"
+  directly. Never write a metadata query whose purpose is to discover
+  table names.
 - Use parameters for user values when practical.
 - If table data is not required, return needs_sql=false, UNLESS the input has
   "sql_required": true. Then the caller has already decided this request
@@ -149,9 +161,14 @@ Rules:
 REPAIR MODE:
 You may receive a "previous_attempt" object: the SQL and parameters that
 were already tried, plus EITHER an "error" from SQLite OR "zero_rows": true.
-- Fix the real problem: a wrong table/column name, a wrong CAST, or a filter
-  that does not match the stored value.
+- Fix the real problem: a wrong table/column name, a wrong CAST, a filter
+  that does not match the stored value, or an invalid schema-discovery
+  query.
 - Use only table and column names from "tables". Never invent identifiers.
+- If the previous attempt queried sqlite_master, sqlite_schema,
+  pragma_table_list, or any other schema/catalog object, discard that
+  approach completely and query the actual allowed table name(s) supplied
+  in "tables".
 - If "zero_rows" is true and "resolved_entities" is present, that entity
   DOES exist in the data: filter on the exact resolved value, column and
   table, and do not add extra conditions taken from the user's wording.
@@ -206,6 +223,7 @@ def generate_sql(
     resolved_entities: list[dict[str, Any]] | None = None,
     previous_attempt: dict[str, Any] | None = None,
     sql_required: bool = False,
+    planner_notes: list[str] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "user_question": query,
@@ -229,6 +247,12 @@ def generate_sql(
     if previous_attempt:
         # Repair mode: one bounded retry, driven by the real failure.
         payload["previous_attempt"] = previous_attempt
+
+    if planner_notes:
+        # Deterministic notes produced by contextual source resolution.
+        # These clarify WHICH resource was selected; they do not grant the
+        # model permission to invent identifiers or broaden the SQL scope.
+        payload["planner_notes"] = [str(note) for note in planner_notes if note]
 
     response = router.generate(
         task="sql_generation",

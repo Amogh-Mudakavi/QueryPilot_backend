@@ -36,6 +36,12 @@ MAX_TABLE_ROWS_IN_PAYLOAD = 50
 
 MAX_CELL_CHARS = 300
 
+# GPT-OSS can spend completion budget on internal reasoning before emitting
+# the strict JSON object. The previous 1536-token cap could terminate the
+# response before a valid JSON document was produced.
+ANSWER_MAX_OUTPUT_TOKENS = 4096
+ANSWER_STREAM_MAX_OUTPUT_TOKENS = 2048
+
 # Presentation only. QueryPilot is currency-agnostic: no symbol is applied
 
 # unless settings.QUERYPILOT_CURRENCY_SYMBOL is set. Amounts are otherwise
@@ -46,25 +52,46 @@ DEFAULT_CURRENCY_SYMBOL = None
 
 
 
+
+
 ANSWER_RESPONSE_FORMAT = {
+
     "type": "json_schema",
+
     "json_schema": {
+
         "name": "querypilot_answer",
+
         "strict": True,
+
         "schema": {
+
             "type": "object",
+
             "properties": {
+
                 "answer": {"type": "string"},
+
                 "citations": {
+
                     "type": "array",
+
                     "items": {"type": "integer"},
+
                 },
+
             },
+
             "required": ["answer", "citations"],
+
             "additionalProperties": False,
+
         },
+
     },
+
 }
+
 
 
 def _bound_history(
@@ -102,6 +129,8 @@ def _bound_history(
         total_chars += len(content)
 
     return bounded
+
+
 
 
 
@@ -148,6 +177,8 @@ def _shrink_structured(content: Any) -> Any:
         shrunk["rows_omitted_from_prompt"] = len(rows) - MAX_TABLE_ROWS_IN_PAYLOAD
 
     return shrunk
+
+
 
 
 
@@ -249,6 +280,8 @@ def _bound_evidence(
 
 
 
+
+
 # ---------------------------------------------------------------------------
 
 # Currency presentation (never touches a number, only the symbol before it)
@@ -262,6 +295,8 @@ _FOREIGN_CURRENCY = re.compile(r"USD|US\$|\$\s?\d|EUR|€|£|GBP")
 # matching inside a word.
 
 _CURRENCY_PREFIX = re.compile(r"(?<![A-Za-z])(?:US\$|\$|₹|Rs\.?|INR)\s?(?=\d)")
+
+
 
 
 
@@ -286,6 +321,8 @@ def _default_currency_symbol() -> str | None:
         symbol = DEFAULT_CURRENCY_SYMBOL
 
     return symbol or None
+
+
 
 
 
@@ -327,6 +364,8 @@ def _currency_symbol_for(evidence: list[Any]) -> str | None:
 
 
 
+
+
 def _normalize_currency(answer: str, symbol: str | None) -> str:
 
     """Make every money amount use one symbol. Digits are never modified."""
@@ -336,6 +375,8 @@ def _normalize_currency(answer: str, symbol: str | None) -> str:
         return answer
 
     return _CURRENCY_PREFIX.sub(symbol, answer)
+
+
 
 
 
@@ -419,7 +460,11 @@ def _build_payload(
 
 
 
+
+
 _INTERNAL_MARKER = re.compile(r" ?【[^】]*】")
+
+
 
 
 
@@ -451,6 +496,8 @@ def _clean_answer(
 
 
 
+
+
 _MARKER = re.compile(r" ?\[(\d{1,3})\]")
 
 # "[1, 2]" is not something the downstream validator recognises, so it is
@@ -458,6 +505,8 @@ _MARKER = re.compile(r" ?\[(\d{1,3})\]")
 # rewritten to "[1][2]" before validation. Numbers are never changed.
 
 _GROUPED_MARKER = re.compile(r"\[(\d{1,3}(?:\s*,\s*\d{1,3})+)\]")
+
+
 
 
 
@@ -475,6 +524,8 @@ def _expand_grouped_markers(text: str) -> str:
 
 
 
+
+
 def _parse_answer_response(raw: str, *, evidence_count: int) -> str:
 
     """
@@ -485,17 +536,17 @@ def _parse_answer_response(raw: str, *, evidence_count: int) -> str:
 
     Deterministic and fail-closed:
 
-      \- The markers in the answer text are the source of truth.
+- The markers in the answer text are the source of truth.
 
-      \- Any marker outside 1..evidence_count is stripped (never remapped).
+- Any marker outside 1..evidence_count is stripped (never remapped).
 
-      \- Declared citations that never appear as a marker are ignored; an
+- Declared citations that never appear as a marker are ignored; an
 
         index is never added to the text or to the result on the model's
 
         say-so alone.
 
-      \- Non-JSON output keeps the prose but loses every marker, so
+- Non-JSON output keeps the prose but loses every marker, so
 
         grounding fails downstream.
 
@@ -609,6 +660,8 @@ def _parse_answer_response(raw: str, *, evidence_count: int) -> str:
 
 
 
+
+
 def generate_answer(
 
     *,
@@ -647,7 +700,7 @@ def generate_answer(
 
         temperature=0.0,
 
-        max_tokens=1536,
+        max_tokens=ANSWER_MAX_OUTPUT_TOKENS,
 
         response_format=ANSWER_RESPONSE_FORMAT,
 
@@ -676,6 +729,8 @@ def generate_answer(
         _currency_symbol_for(evidence),
 
     )
+
+
 
 
 
@@ -729,7 +784,7 @@ def generate_answer_stream(
 
         temperature=0.0,
 
-        max_tokens=1024,
+        max_tokens=ANSWER_STREAM_MAX_OUTPUT_TOKENS,
 
         include_reasoning=False,
 

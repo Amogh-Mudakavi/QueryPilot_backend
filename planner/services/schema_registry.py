@@ -85,8 +85,7 @@ def get_workspace_catalog(
     """Return a deterministic workspace resource catalog.
 
     When schema is supplied, reuse it instead of rebuilding the SQLite
-    schema for the same operation. Existing callers keep the original
-    behavior by leaving schema unset.
+    schema for the same operation.
     """
     if workspace_id <= 0:
         raise ValueError("workspace_id must be greater than zero.")
@@ -142,8 +141,11 @@ def _detect_numeric_columns(
 
 
 def _is_number(value: Any) -> bool:
+    # Values like "25,000" are numeric with a thousands separator:
+    # plain float("25,000") fails and the column then loses its CAST
+    # protection in SQL generation. Strip commas before testing.
     try:
-        float(value)
+        float(str(value).replace(",", ""))
         return True
     except (TypeError, ValueError):
         return False

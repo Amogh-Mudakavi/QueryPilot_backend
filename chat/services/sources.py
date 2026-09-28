@@ -12,45 +12,25 @@ Indexing contract (this is the piece that makes citations work):
 
     Each source row's "index" is the 1-based POSITION of the evidence
     item it was extracted from, in the exact same `evidence` list/
-    order that was supplied to answer generation
-    (planner.services.answer.generate_answer, which serializes
-    `evidence` as an ordered JSON array and does not reorder it).
+    order that was supplied to answer generation.
 
     The answer prompt (planner/prompts/answer.py) instructs the model
     to cite a claim using [n] where n is that same 1-based evidence
     position. Because both sides read the same list in the same
     order, index N here always means the same thing as marker [N] in
-    the answer text -- no separate renumbering, lookup table, or
-    guessing is required downstream (see chat.services.citations).
+    the answer text.
 
 This intentionally does NOT deduplicate source rows *across* evidence
-items (two different evidence items that happen to reference the same
-document/page keep their own distinct indices), because collapsing
-them would break the 1:1 correspondence between citation markers and
-evidence positions. Duplicate rows produced *within* a single
-evidence item (e.g. the same table listed twice) are still deduplicated,
-since those would otherwise be indistinguishable duplicates under one
-citation marker.
-
-Building on top of / preserving the field extraction that the
-previous chat.services.execution._build_sources() implementation
-used, so both normal document evidence (top-level or metadata-embedded
-document_id, chunk_index, page_start/page_end, heading) and
-table-query evidence (an embedded `sources` list of
-{document_id, table_name} entries) continue to be supported.
+items, because collapsing them would break the 1:1 correspondence
+between citation markers and evidence positions. Duplicate rows
+produced *within* a single evidence item are still deduplicated.
 
 Workspace scoping:
 
-    Sources are resolved against the current workspace.
-
-    A document can only appear in the returned source list when:
-
-        Document.id == referenced document_id
-        AND
-        Document.workspace_id == workspace_id
-
-    Evidence referring to a document outside the supplied workspace
-    is ignored rather than returned with incomplete metadata.
+    Sources are resolved against the current workspace. A document can
+    only appear in the returned source list when it belongs to that
+    workspace. Evidence referring to a document outside the supplied
+    workspace is ignored rather than returned with incomplete metadata.
 """
 
 from __future__ import annotations
@@ -67,25 +47,6 @@ def build_sources(
 ) -> list[dict[str, Any]]:
     """
     Build an indexed source list from final evidence.
-
-    Parameters:
-        evidence:
-            Final evidence produced by the agent, in the exact order
-            supplied to answer generation.
-
-        workspace_id:
-            Workspace that owns the active conversation. Every
-            referenced document must belong to this workspace.
-
-    Returns:
-        A flat list of source dictionaries. Every returned source has
-        an "index" field containing the 1-based position of the
-        evidence item from which it was extracted.
-
-    Workspace safety:
-        Document references are resolved using both document ID and
-        workspace ID. Foreign-workspace document references are
-        excluded completely.
     """
 
     if not evidence:
@@ -132,10 +93,6 @@ def build_sources(
 
     # ---------------------------------------------------------
     # Resolve only documents belonging to the active workspace.
-    #
-    # This is the defense-in-depth boundary. Even if malformed or
-    # unexpected evidence contains a document ID from another
-    # workspace, it will never enter the returned source list.
     # ---------------------------------------------------------
 
     document_names: dict[int, str] = {}
@@ -157,8 +114,6 @@ def build_sources(
             for document in documents
         }
 
-    # Only document IDs that were actually resolved inside the
-    # current workspace are allowed to become source rows.
     valid_document_ids = set(
         document_names.keys()
     )
@@ -177,10 +132,24 @@ def build_sources(
         rows_for_item: list[dict[str, Any]] = []
 
         # ---------------------------------------------------------
+        # Case 0:
+        # Product knowledge is a real, citable source even though it
+        # is not a workspace document. Without this row, every answer
+        # from PRODUCT_KNOWLEDGE carries an invalid citation marker
+        # (stripped downstream) and fails grounding.
+        # ---------------------------------------------------------
+        if item.get("source_type") == "product_knowledge":
+            rows_for_item.append(
+                {
+                    "document_id": None,
+                    "document_name": "QueryPilot",
+                    "source_type": "product",
+                }
+            )
+
+        # ---------------------------------------------------------
         # Case A:
         # Normal document evidence.
-        #
-        # Supports top-level or metadata-embedded document_id.
         # ---------------------------------------------------------
 
         document_id = (
@@ -194,8 +163,6 @@ def build_sources(
             except (TypeError, ValueError):
                 document_id = None
 
-        # A document reference is accepted only when the document
-        # was successfully resolved inside the current workspace.
         if (
             document_id is not None
             and document_id in valid_document_ids
@@ -280,7 +247,6 @@ def build_sources(
                 except (TypeError, ValueError):
                     continue
 
-                # Foreign-workspace document references are excluded.
                 if doc_id not in valid_document_ids:
                     continue
 
@@ -301,8 +267,6 @@ def build_sources(
 
         # ---------------------------------------------------------
         # Dedupe rows produced within this one evidence item only.
-        #
-        # Evidence items retain their original citation index.
         # ---------------------------------------------------------
 
         seen_row_keys: set[tuple[Any, ...]] = set()

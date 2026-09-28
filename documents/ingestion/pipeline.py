@@ -131,7 +131,8 @@ class IngestionPipeline:
         )
 
         result = LlamaParseService.parse_document(
-            document.file.path
+            document.file.path,
+            file_hash=document.file_hash,
         )
 
         text_nodes = LlamaAdapter.extract_text_nodes(
@@ -190,6 +191,21 @@ class IngestionPipeline:
             start=1,
         ):
 
+            # CHECKPOINT 3B: verify the exact table payload entering the
+            # structured-data stage. If values are already empty here, the
+            # problem is upstream of TableProcessor/SQLite.
+            logger.info(
+                "[CHECKPOINT 3B] TABLE PROCESSOR INPUT #%d: page=%s "
+                "rows_count=%d headers=%r rows=%r.",
+                index,
+                table_node.get("page"),
+                len(table_node.get("rows") or []),
+                (table_node.get("rows") or [])[0]
+                if (table_node.get("rows") or []) else [],
+                (table_node.get("rows") or [])[1:]
+                if len(table_node.get("rows") or []) > 1 else [],
+            )
+
             processed = TableProcessor.process(
                 table_node=table_node,
                 document_id=document_id,
@@ -220,6 +236,17 @@ class IngestionPipeline:
                 "rows"
             ]
 
+            # CHECKPOINT 4: exact payload immediately before SQLite insert.
+            logger.info(
+                "[CHECKPOINT 4] SQLITE INPUT #%d: table=%s headers=%r "
+                "rows_count=%d rows=%r.",
+                index,
+                table_name,
+                headers,
+                len(rows),
+                rows,
+            )
+
             SQLiteManager.create_table(
                 table_name=table_name,
                 columns=headers,
@@ -228,6 +255,13 @@ class IngestionPipeline:
             SQLiteManager.insert_rows(
                 table_name=table_name,
                 rows=rows,
+            )
+
+            logger.info(
+                "[CHECKPOINT 5] SQLITE INSERT COMPLETED #%d: table=%s rows_count=%d.",
+                index,
+                table_name,
+                len(rows),
             )
 
             VectorStore.store_table_metadata(
@@ -296,4 +330,4 @@ class IngestionPipeline:
                 "Cleanup: failed to drop SQLite tables for "
                 "document %s.",
                 document_id,
-            )
+            )   

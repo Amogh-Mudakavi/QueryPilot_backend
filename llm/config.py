@@ -22,18 +22,6 @@ TASK_MODELS = {
 }
 
 
-# Different starting positions so different tasks
-# do not all begin with the same API key.
-TASK_KEY_OFFSET = {
-    "scope_guard": 0,
-    "chitchat": 0,
-    "planner": 0,
-    "sql_generation": 1,
-    "answer_generation": 1,
-    "grounding": 2,
-}
-
-
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_MAX_TOKENS = 1024
 
@@ -44,8 +32,10 @@ MAX_ATTEMPTS = 3
 # roughly MAX_ATTEMPTS * REQUEST_TIMEOUT plus backoff (~65s at 3 x 20s).
 REQUEST_TIMEOUT = 20.0
 
-# Base retry delay. Backoff becomes roughly:
-# 1s -> 2s
+# Base retry delay for non-429 failures (timeouts, network errors).
+# Backoff sequence: 1s -> 2s
 RETRY_BACKOFF_SECONDS = 1.0
+
+DEFAULT_COOLDOWN_SECONDS = 60.0
 
 DEFAULT_PROVIDER = "groq"

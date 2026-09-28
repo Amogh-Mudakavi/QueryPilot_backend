@@ -43,6 +43,10 @@ from documents.ingestion.pipeline import (
     IngestionPipeline,
 )
 
+from documents.ingestion.sqlite import (
+    SQLiteManager,
+)
+
 from documents.ingestion.vectors import (
     VectorStore,
 )
@@ -67,12 +71,14 @@ WORKER_CONCURRENCY = int(
     )
 )
 
+
 JOB_STALE_SECONDS = int(
     os.getenv(
         "INGESTION_JOB_STALE_SECONDS",
         "1800",
     )
 )
+
 
 HEARTBEAT_SECONDS = int(
     os.getenv(
@@ -81,12 +87,14 @@ HEARTBEAT_SECONDS = int(
     )
 )
 
+
 RECOVERY_INTERVAL_SECONDS = int(
     os.getenv(
         "INGESTION_RECOVERY_INTERVAL_SECONDS",
         "30",
     )
 )
+
 
 MAX_JOB_ATTEMPTS = int(
     os.getenv(
@@ -259,6 +267,103 @@ def _mark_failed(
     )
 
 
+def _delete_failed_document(document):
+
+    document_id = document.id
+    workspace_id = document.workspace_id
+    cleanup_errors = []
+
+    try:
+
+        VectorStore.delete_document(
+            document_id=document_id
+        )
+
+    except Exception:
+
+        logger.exception(
+            "[INGESTION] Vector cleanup failed "
+            "for permanently failed document %s",
+            document_id,
+        )
+
+        cleanup_errors.append(
+            "vectors"
+        )
+
+    try:
+
+        SQLiteManager.drop_document_tables(
+            workspace_id=workspace_id,
+            document_id=document_id,
+        )
+
+    except Exception:
+
+        logger.exception(
+            "[INGESTION] SQLite cleanup failed "
+            "for permanently failed document %s",
+            document_id,
+        )
+
+        cleanup_errors.append(
+            "tables"
+        )
+
+    try:
+
+        if document.file:
+
+            document.file.delete(
+                save=False
+            )
+
+    except Exception:
+
+        logger.exception(
+            "[INGESTION] File cleanup failed "
+            "for permanently failed document %s",
+            document_id,
+        )
+
+        cleanup_errors.append(
+            "file"
+        )
+
+    try:
+
+        document.delete()
+
+    except Exception:
+
+        logger.exception(
+            "[INGESTION] Database cleanup failed "
+            "for permanently failed document %s",
+            document_id,
+        )
+
+        cleanup_errors.append(
+            "database"
+        )
+
+    if cleanup_errors:
+
+        logger.error(
+            "[INGESTION] Permanently failed document %s "
+            "was deleted, but cleanup may be incomplete: %s",
+            document_id,
+            ", ".join(cleanup_errors),
+        )
+
+    else:
+
+        logger.info(
+            "[INGESTION] Permanently failed document %s "
+            "deleted successfully.",
+            document_id,
+        )
+
+
 def _mark_for_retry(
     job,
     document,
@@ -383,6 +488,10 @@ def process_ingestion_job(
                 "after %s attempts.",
                 job.id,
                 job.attempts,
+            )
+
+            _delete_failed_document(
+                document
             )
 
     finally:

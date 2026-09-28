@@ -26,8 +26,8 @@ Performance notes
   which oversubscribes small or shared machines.
 - Embedding start/completion and Chroma upsert completion are logged
   with timings so slow stages are visible in the worker logs.
-- The model stays fp32: quantization or half precision would change
-  the embedding values and therefore retrieval semantics.
+- Quantized ONNX inference is used after validation against the FP32
+  ONNX baseline for embedding similarity and retrieval stability.
 """
 
 from __future__ import annotations
@@ -147,18 +147,27 @@ class VectorStore:
                     try:
                         cls._embedder = SentenceTransformer(
                             EMBEDDING_MODEL,
+                            backend="onnx",
+                            model_kwargs={
+                                "file_name": "onnx/model_quantized.onnx",
+                            },
                             local_files_only=True,
                             trust_remote_code=False,
                         )
                     except OSError:
                         cls._embedder = SentenceTransformer(
                             EMBEDDING_MODEL,
+                            backend="onnx",
+                            model_kwargs={
+                                "file_name": "onnx/model_quantized.onnx",
+                            },
                             trust_remote_code=False,
                         )
 
                     logger.info(
                         "[EMBEDDING] Model ready: %s "
-                        "(torch_threads=%s, batch_size=%s).",
+                        "(backend=onnx, quantized=true, torch_threads=%s, "
+                        "batch_size=%s).",
                         EMBEDDING_MODEL,
                         threads,
                         EMBEDDING_BATCH_SIZE,

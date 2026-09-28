@@ -699,16 +699,31 @@ class ScopeGuard:
         )
 
         return normalized in {
-            "hi",
-            "hello",
-            "hey",
-            "thanks",
-            "thank you",
-            "thanks!",
-            "hello!",
-            "hi!",
-            "hey!",
-        }
+    "hi",
+    "hello",
+    "hey",
+    "thanks",
+    "thank you",
+    "thx",
+    "hmm",
+    "hmmm",
+    "huh",
+    "okay",
+    "ok",
+    "cool",
+    "got it",
+    "thanks!",
+    "hello!",
+    "hi!",
+    "hey!",
+    "hmm!",
+    "hmmm!",
+    "huh!",
+    "okay!",
+    "ok!",
+    "cool!",
+    "got it!",
+}
 
     @staticmethod
     def _validate_decision(

@@ -71,20 +71,99 @@ class DocumentUploadAPIView(APIView):
 
         if existing_document:
 
-            return Response(
-                {
-                    "message":"Document already exists.",
-                    "document_id":existing_document.id,
-                    "status":existing_document.status,
-                    "duplicate":True,
-                },
-                status=status.HTTP_200_OK,
-            )
+            if existing_document.status=="failed":
+
+                failed_document_id=existing_document.id
+                cleanup_errors=[]
+
+                try:
+
+                    VectorStore.delete_document(
+                        document_id=failed_document_id
+                    )
+
+                except Exception:
+
+                    logger.exception(
+                        "Vector cleanup failed for stale failed "
+                        "document %s",
+                        failed_document_id,
+                    )
+
+                    cleanup_errors.append(
+                        "vectors"
+                    )
+
+                try:
+
+                    SQLiteManager.drop_document_tables(
+                        workspace_id=workspace.id,
+                        document_id=failed_document_id,
+                    )
+
+                except Exception:
+
+                    logger.exception(
+                        "SQLite cleanup failed for stale failed "
+                        "document %s",
+                        failed_document_id,
+                    )
+
+                    cleanup_errors.append(
+                        "tables"
+                    )
+
+                try:
+
+                    if existing_document.file:
+
+                        existing_document.file.delete(
+                            save=False
+                        )
+
+                except Exception:
+
+                    logger.exception(
+                        "File cleanup failed for stale failed "
+                        "document %s",
+                        failed_document_id,
+                    )
+
+                    cleanup_errors.append(
+                        "file"
+                    )
+
+                existing_document.delete()
+
+                if cleanup_errors:
+
+                    logger.warning(
+                        "Stale failed document %s deleted with "
+                        "possible cleanup issues: %s",
+                        failed_document_id,
+                        ", ".join(cleanup_errors),
+                    )
+
+            else:
+
+                return Response(
+                    {
+                        "message":"Document already exists.",
+                        "document_id":existing_document.id,
+                        "status":existing_document.status,
+                        "duplicate":True,
+                    },
+                    status=status.HTTP_200_OK,
+                )
 
         document_count=(
             Document.objects.filter(
-                workspace=workspace
-            ).count()
+                workspace=workspace,
+            )
+            .exclude(
+                status="failed",
+            )
+            .count()
         )
 
         if document_count>=3:
@@ -165,7 +244,10 @@ class DocumentListAPIView(APIView):
 
         documents=(
             Document.objects.filter(
-                workspace=workspace
+                workspace=workspace,
+            )
+            .exclude(
+                status="failed",
             )
             .order_by("-uploaded_at")
         )

@@ -49,6 +49,26 @@ def _client_ip(request):
     return request.META.get("REMOTE_ADDR")
 
 
+def _pending_registration_expires_at(now=None):
+    """Return the lifetime of a pending registration draft.
+
+    The draft intentionally lives longer than one OTP so an expired OTP can
+    be resent without forcing the user to type the whole registration again.
+    No database migration is required because this is application-level TTL.
+    """
+    now = now or timezone.now()
+    configured_minutes = int(
+        getattr(
+            settings,
+            "PENDING_REGISTRATION_LIFETIME_MINUTES",
+            30,
+        )
+    )
+    otp_minutes = int(settings.OTP_LIFETIME_MINUTES)
+    minutes = max(configured_minutes, otp_minutes, 30)
+    return now + timedelta(minutes=minutes)
+
+
 def _invalid_otp_response():
     return Response(
         {"error": "Invalid or expired OTP."},
@@ -98,9 +118,11 @@ class RequestRegisterView(APIView):
 
         hashed_otp = hash_otp(otp)
 
-        expires_at = timezone.now() + timedelta(
+        now = timezone.now()
+        otp_expires_at = now + timedelta(
             minutes=settings.OTP_LIFETIME_MINUTES
         )
+        pending_expires_at = _pending_registration_expires_at(now)
 
         try:
             with transaction.atomic():
@@ -118,14 +140,14 @@ class RequestRegisterView(APIView):
                     username=serializer.validated_data["username"],
                     email=email,
                     password=hashed_password,
-                    expires_at=expires_at,
+                    expires_at=pending_expires_at,
                 )
 
                 EmailOTP.objects.create(
                     email=email,
                     otp=hashed_otp,
                     purpose="register",
-                    expires_at=expires_at,
+                    expires_at=otp_expires_at,
                     last_sent_ip=ip_address,
                 )
 
@@ -159,6 +181,138 @@ class RequestRegisterView(APIView):
                 {
                     "error": (
                         "Could not process registration. "
+                        "Please try again."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+
+class ResendRegistrationOTPView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = EmailSerializer(data=request.data)
+
+        if not serializer.is_valid():
+            return Response(
+                {"error": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        email = serializer.validated_data["email"].strip().lower()
+        ip_address = _client_ip(request)
+
+        if not can_send_otp(email, ip_address):
+            return Response(
+                {
+                    "error": "Please wait before requesting another OTP."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not check_hourly_limit(email, ip_address):
+            return Response(
+                {
+                    "error": (
+                        "Maximum OTP limit reached. "
+                        "Please try again later."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        now = timezone.now()
+
+        try:
+            with transaction.atomic():
+                pending_user = (
+                    PendingRegistration.objects
+                    .select_for_update()
+                    .filter(email__iexact=email)
+                    .first()
+                )
+
+                if pending_user is None:
+                    return Response(
+                        {
+                            "error": (
+                                "No active registration found. "
+                                "Please register again."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                if pending_user.expires_at <= now:
+                    PendingRegistration.objects.filter(
+                        pk=pending_user.pk
+                    ).delete()
+
+                    EmailOTP.objects.filter(
+                        email__iexact=email,
+                        purpose="register",
+                        is_used=False,
+                    ).delete()
+
+                    return Response(
+                        {
+                            "error": (
+                                "Registration expired. "
+                                "Please register again."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                otp = generate_otp()
+                hashed_otp = hash_otp(otp)
+
+                otp_expires_at = now + timedelta(
+                    minutes=settings.OTP_LIFETIME_MINUTES
+                )
+
+                # Invalidate the previous challenge before creating the new one.
+                EmailOTP.objects.filter(
+                    email__iexact=email,
+                    purpose="register",
+                    is_used=False,
+                ).delete()
+
+                EmailOTP.objects.create(
+                    email=email,
+                    otp=hashed_otp,
+                    purpose="register",
+                    expires_at=otp_expires_at,
+                    last_sent_ip=ip_address,
+                )
+
+                # Extend the draft too, so the user has a fresh window to
+                # complete the registration after the resend.
+                pending_user.expires_at = _pending_registration_expires_at(now)
+                pending_user.save(
+                    update_fields=["expires_at"]
+                )
+
+                send_otp_email(email, otp)
+
+            return Response(
+                {
+                    "message": (
+                        "A new OTP has been sent successfully. Please check "
+                        "your email inbox and spam folder too."
+                    )
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except Exception:
+            logger.exception("Registration OTP resend flow failed")
+
+            return Response(
+                {
+                    "error": (
+                        "Could not resend the OTP. "
                         "Please try again."
                     )
                 },
@@ -203,10 +357,9 @@ class VerifyOTP(APIView):
                         update_fields=["is_used"]
                     )
 
-                    PendingRegistration.objects.filter(
-                        email=email
-                    ).delete()
-
+                    # Keep the pending registration alive until its own TTL.
+                    # The user can now request a fresh OTP instead of being
+                    # forced to restart the entire registration flow.
                     return _invalid_otp_response()
 
                 if (
@@ -500,6 +653,7 @@ class ResetPasswordView(APIView):
                 )
 
                 otp_record.is_used = True
+
                 otp_record.save(
                     update_fields=["is_used"]
                 )
