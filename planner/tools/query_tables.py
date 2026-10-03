@@ -1,14 +1,17 @@
+"""Tools Query Tables module for QueryPilot."""
+
 from __future__ import annotations
 
 import logging
 import math
+import re
 import sqlite3
 import time
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from django.conf import settings
-
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +20,65 @@ QUERY_TIMEOUT_SECONDS = 3.0
 
 MAX_PARAMETERS = 50
 MAX_PARAMETER_STRING_LENGTH = 1000
+
+
+_DATE_NAME_TOKENS = frozenset({"date", "dob", "datetime", "timestamp"})
+_EXCEL_EPOCH = date(1899, 12, 30)
+
+_SERIAL_MIN = 20000.0
+_SERIAL_MAX = 80000.0
+
+
+def _is_date_named(column: str) -> bool:
+    spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(column))
+    words = re.findall(r"[a-z0-9]+", spaced.lower())
+    return any(word in _DATE_NAME_TOKENS for word in words)
+
+
+def _serial_value(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not re.fullmatch(r"\d{5}(?:\.\d+)?", text):
+            return None
+        number = float(text)
+    else:
+        return None
+    if not math.isfinite(number):
+        return None
+    return number if _SERIAL_MIN <= number <= _SERIAL_MAX else None
+
+
+def _serial_to_iso(number: float) -> str:
+    moment = datetime.combine(_EXCEL_EPOCH, datetime.min.time()) + timedelta(
+        days=number
+    )
+    if number == int(number):
+        return moment.date().isoformat()
+    return moment.replace(microsecond=0).isoformat(sep=" ")
+
+
+def _normalize_date_columns(
+    columns: list[str],
+    rows: list[dict[str, Any]],
+) -> dict[str, str]:
+    """Convert serial-valued date columns to ISO in place; report which."""
+    converted: dict[str, str] = {}
+    for column in columns:
+        if not _is_date_named(column):
+            continue
+        present = [row.get(column) for row in rows if row.get(column) not in (None, "")]
+        if not present or any(_serial_value(v) is None for v in present):
+            continue
+        for row in rows:
+            value = row.get(column)
+            if value not in (None, ""):
+                row[column] = _serial_to_iso(_serial_value(value))
+        converted[column] = "spreadsheet date serial number converted to calendar date"
+    return converted
 
 
 def _validate_parameters(
@@ -36,24 +98,18 @@ def _validate_parameters(
         return []
 
     if not isinstance(parameters, (list, tuple)):
-        raise ValueError(
-            "SQL parameters must be a list of scalar values."
-        )
+        raise ValueError("SQL parameters must be a list of scalar values.")
 
     if len(parameters) > MAX_PARAMETERS:
-        raise ValueError(
-            f"Too many SQL parameters (max {MAX_PARAMETERS})."
-        )
+        raise ValueError(f"Too many SQL parameters (max {MAX_PARAMETERS}).")
 
     validated: list[Any] = []
 
     for position, value in enumerate(parameters):
-
         if value is None:
             validated.append(value)
             continue
 
-        # bool is a subclass of int, so it is covered here as well.
         if not isinstance(value, (str, int, float)):
             raise ValueError(
                 f"SQL parameter at position {position} must be a "
@@ -63,14 +119,10 @@ def _validate_parameters(
 
         if isinstance(value, float) and not math.isfinite(value):
             raise ValueError(
-                f"SQL parameter at position {position} must be a "
-                f"finite number."
+                f"SQL parameter at position {position} must be a finite number."
             )
 
-        if (
-            isinstance(value, str)
-            and len(value) > MAX_PARAMETER_STRING_LENGTH
-        ):
+        if isinstance(value, str) and len(value) > MAX_PARAMETER_STRING_LENGTH:
             raise ValueError(
                 f"SQL parameter at position {position} is too long "
                 f"(max {MAX_PARAMETER_STRING_LENGTH} characters)."
@@ -90,58 +142,33 @@ def query_tables(
 ) -> dict[str, Any]:
 
     if workspace_id <= 0:
-        raise ValueError(
-            "workspace_id must be greater than zero."
-        )
+        raise ValueError("workspace_id must be greater than zero.")
 
-    # Also covers needs_sql=true with sql=None from the SQL generator.
     if not isinstance(sql, str) or not sql.strip():
-        raise ValueError(
-            "SQL query cannot be empty."
-        )
+        raise ValueError("SQL query cannot be empty.")
 
     sql = sql.strip()
 
-    if not sql.lower().startswith(
-        ("select", "with")
-    ):
-        raise ValueError(
-            "Only read-only SQL queries are allowed."
-        )
+    if not sql.lower().startswith(("select", "with")):
+        raise ValueError("Only read-only SQL queries are allowed.")
 
-    statement = (
-        sql.rstrip()
-        .rstrip(";")
-        .rstrip()
-    )
+    statement = sql.rstrip().rstrip(";").rstrip()
 
     if ";" in statement:
-        raise ValueError(
-            "Multiple SQL statements are not allowed."
-        )
+        raise ValueError("Multiple SQL statements are not allowed.")
 
-    validated_parameters = _validate_parameters(
-        parameters
-    )
+    validated_parameters = _validate_parameters(parameters)
 
-    allowed_tables = _get_workspace_tables(
-        workspace_id
-    )
+    allowed_tables = _get_workspace_tables(workspace_id)
 
     if not allowed_tables:
-        raise ValueError(
-            "No tables are available for this workspace."
-        )
+        raise ValueError("No tables are available for this workspace.")
 
     if allowed_table_names is not None:
-        allowed_tables.intersection_update(
-            allowed_table_names
-        )
+        allowed_tables.intersection_update(allowed_table_names)
 
         if not allowed_tables:
-            raise ValueError(
-                "No tables are allowed for this query."
-            )
+            raise ValueError("No tables are allowed for this query.")
 
     logger.info(
         "query_tables: workspace_id=%s allowed_table_names=%s",
@@ -168,10 +195,7 @@ def query_tables(
     start = time.monotonic()
 
     connection.set_progress_handler(
-        lambda: int(
-            time.monotonic() - start
-            >= QUERY_TIMEOUT_SECONDS
-        ),
+        lambda: int(time.monotonic() - start >= QUERY_TIMEOUT_SECONDS),
         10_000,
     )
 
@@ -181,29 +205,16 @@ def query_tables(
             validated_parameters,
         )
 
-        # Fetch one extra row so "truncated" is only True when there
-        # really were more rows than the cap (not merely exactly the cap).
-        fetched = cursor.fetchmany(
-            MAX_RESULTS + 1
-        )
+        fetched = cursor.fetchmany(MAX_RESULTS + 1)
 
         truncated = len(fetched) > MAX_RESULTS
         rows = fetched[:MAX_RESULTS]
 
-        columns = [
-            column[0]
-            for column in (
-                cursor.description or []
-            )
-        ]
+        columns = [column[0] for column in (cursor.description or [])]
 
-        rows_list = [
-            {
-                column: row[column]
-                for column in columns
-            }
-            for row in rows
-        ]
+        rows_list = [{column: row[column] for column in columns} for row in rows]
+
+        date_columns = _normalize_date_columns(columns, rows_list)
 
         result = {
             "success": True,
@@ -211,10 +222,11 @@ def query_tables(
             "rows": rows_list,
             "row_count": len(rows_list),
             "truncated": truncated,
-            "tables_used": sorted(
-                tables_used
-            ),
+            "tables_used": sorted(tables_used),
         }
+
+        if date_columns:
+            result["date_columns"] = date_columns
 
         logger.info(
             "query_tables: returned %d rows tables_used=%s",
@@ -225,25 +237,17 @@ def query_tables(
         return result
 
     except sqlite3.Error as exc:
-        raise ValueError(
-            f"Table query failed: {exc}"
-        ) from exc
+        raise ValueError(f"Table query failed: {exc}") from exc
 
     finally:
         connection.close()
 
 
 def _database_path() -> str:
-    path = (
-        Path(settings.BASE_DIR)
-        / "storage"
-        / "workspace_data.db"
-    )
+    path = Path(settings.BASE_DIR) / "storage" / "workspace_data.db"
 
     if not path.exists():
-        raise ValueError(
-            f"SQLite database not found: {path}"
-        )
+        raise ValueError(f"SQLite database not found: {path}")
 
     return str(path)
 
@@ -271,12 +275,12 @@ def _get_workspace_tables(
         return {
             row[0]
             for row in rows
-            if isinstance(row[0], str)
-            and row[0].startswith(prefix)
+            if isinstance(row[0], str) and row[0].startswith(prefix)
         }
 
     finally:
         connection.close()
+
 
 def _authorizer(
     allowed_tables: set[str],
@@ -321,11 +325,8 @@ def _authorizer(
             return sqlite3.SQLITE_DENY
 
         if action == sqlite3.SQLITE_READ:
-
             table_name = arg1
 
-            # SQLite schema tables are global metadata, not workspace data.
-            # Never expose them through planner-generated SQL.
             if table_name in {
                 "sqlite_master",
                 "sqlite_temp_master",
@@ -338,9 +339,7 @@ def _authorizer(
                 return sqlite3.SQLITE_DENY
 
             if table_name in allowed_tables:
-                tables_used.add(
-                    table_name
-                )
+                tables_used.add(table_name)
 
         return sqlite3.SQLITE_OK
 

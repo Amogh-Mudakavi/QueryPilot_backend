@@ -1,59 +1,27 @@
-"""
-QueryPilot document parser.
+"""Document ingestion parser for QueryPilot.
 
-Routing:
-    PDF  → LiteParse  →  (failure / empty content)  → LlamaParse fallback
-    DOCX → LlamaParse
-    XLSX → LlamaParse
-    CSV  → LlamaParse
+This module normalizes extracted text and table content into the internal
+page/item structure consumed by the ingestion pipeline and downstream
+retrieval. It handles PDF fallback routing between LiteParse and LlamaParse,
+keeps structured table rows intact for SQL-facing consumers, and manages
+parse-cache access keyed by file hash and schema version.
 
-Internal normalized shape produced by both paths:
-
-    result
-     └── items
-          └── pages: list[SimpleNamespace]
-               ├── page_number: int          ← always an int (1-based index if missing)
-               └── items: list[SimpleNamespace]
-                    ├── type: "text" | "table"
-                    ├── md: str               ← markdown representation
-                    ├── value: str            ← same as md
-                    # table items additionally carry:
-                    ├── rows: list[list[str]] ← 2-D; rows[0] = header row
-                    ├── csv: str
-                    └── html: str
-
-LlamaAdapter reads this shape to produce text_nodes and table_nodes for
-the rest of the pipeline.  Neither the adapter nor anything downstream
-ever imports liteparse or llama_cloud directly.
-
-[FIX] Salary-loss diagnosis changes (this file ONLY; no LlamaParse API
-parameter was added, removed, or altered):
-    1. PARSE_CACHE_SCHEMA_VERSION bumped 2 → 3. parse_document() caches the
-       NORMALIZED result, so v2 cache entries hold normalized rows produced
-       by the pre-fix normalization (numeric cells dropped to ""). Without a
-       version bump, those poisoned rows are re-served on every re-ingest of
-       the same file and every normalization fix appears to "not work".
-    2. LLAMAPARSE_CACHE_BYPASS env switch: forces a fresh LlamaParse request
-       and skips BOTH the cache read and the cache write. For diagnosis only;
-       unset it after the fix is confirmed.
-    3. [CHECKPOINT 0] runtime identity log: proves which parser module /
-       bytecode the running worker is actually executing and that _cell_text()
-       keeps numeric cells. Definitive stale-worker / duplicate-module detector.
-    4. _cell_text() hardened: a cell dict/object whose "text" (or first
-       attribute) is "" but whose "value" holds the data can no longer yield "".
-    5. CHECKPOINT 1/2/3 value logs promoted from debug to INFO for the
-       diagnostic run (revert to debug once the fix is confirmed).
+Important invariants:
+- Parsed results are normalized before they reach the adapter layer.
+- Cached parse outputs must be invalidated when normalization changes.
+- This module is responsible for extraction and normalization only; it does not
+  decide scope, answer generation, retrieval, or SQL execution.
 """
 
 import csv as _csv
 import hashlib
 import io
 import json
-import os
-from html.parser import HTMLParser
 import logging
+import os
 import threading
 import time
+from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -62,35 +30,21 @@ from liteparse import LiteParse
 
 from utils.redis import get_redis_client
 
-
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# MIME type hints passed to LlamaParse on upload.
-# LlamaParse also infers from the filename extension, but an explicit hint
-# prevents misclassification of XLSX vs XLS vs CSV.
-# ---------------------------------------------------------------------------
 _MIME: dict[str, str] = {
-    ".pdf":  "application/pdf",
-    ".docx": "application/vnd.openxmlformats-officedocument"
-             ".wordprocessingml.document",
-    ".xlsx": "application/vnd.openxmlformats-officedocument"
-             ".spreadsheetml.sheet",
-    ".csv":  "text/csv",
-    ".txt":  "text/plain",
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".csv": "text/csv",
+    ".txt": "text/plain",
 }
 
-# Suffixes where a table_count of 0 after LlamaParse is a red flag.
+
 _STRUCTURED_SUFFIXES = frozenset({".xlsx", ".csv"})
 
-# ---------------------------------------------------------------------------
-# LlamaParse operational settings.
-# These mirror the previously working parser so retries/polling/caching keep
-# the same behavior while allowing the active tier/version to come from
-# Django settings. The default tier is agentic for higher-fidelity structured
-# document extraction.
-# ---------------------------------------------------------------------------
+
 PARSE_TIMEOUT_SECONDS = 600.0
 PARSE_POLLING_INTERVAL = 2.0
 PARSE_MAX_INTERVAL = 5.0
@@ -111,23 +65,9 @@ PARSE_VERSION = getattr(
 
 PARSE_CACHE_PREFIX = "querypilot:llamaparse:"
 
-# Increment this whenever the shape/normalization of cached parse results
-# changes. This prevents stale results produced by an older parser from
-# bypassing the current normalization logic.
-#
-# [FIX] Bumped 2 → 3. The cache stores the NORMALIZED result (not the raw API
-# response), so the v2 keys hold rows normalized by the pre-fix cell logic
-# (numeric cells dropped to ""). Because the key did not change, the
-# _cell_text numeric fix was masked: every re-ingest of the same file kept
-# returning the poisoned v2 rows. v3 makes every existing entry unreachable;
-# fresh, correct rows are cached under v3 on the next parse.
+
 PARSE_CACHE_SCHEMA_VERSION = "3"
 
-# [FIX] Runtime identity markers for CHECKPOINT 0.
-# PARSER_MODULE_PATH proves which file the worker imported.
-# PARSER_SOURCE_DIGEST is computed from the file AT IMPORT TIME: if it differs
-# from `sha256sum documents/ingestion/parser.py` on disk, the running worker
-# imported the file before the latest edit (stale bytecode).
 PARSER_MODULE_PATH = str(Path(__file__).resolve())
 
 
@@ -151,19 +91,11 @@ class LlamaParseService:
     LlamaAdapter and the rest of the pipeline are format-agnostic.
     """
 
-    # ------------------------------------------------------------------
-    # Singletons – lazy, double-checked, locked.
-    # ------------------------------------------------------------------
-
     _liteparse: "LiteParse | None" = None
     _liteparse_lock = threading.Lock()
 
     _llama_client = None
     _llama_client_lock = threading.Lock()
-
-    # ==================================================================
-    # Parse cache helpers
-    # ==================================================================
 
     @staticmethod
     def _cache_bypass_enabled() -> bool:
@@ -255,7 +187,6 @@ class LlamaParseService:
                 payload,
             )
         except Exception:
-            # Cache failure must never fail ingestion.
             return
 
     @classmethod
@@ -272,10 +203,6 @@ class LlamaParseService:
             )
             return
         cls._write_cache(cache_key, result)
-
-    # ==================================================================
-    # Generic helpers
-    # ==================================================================
 
     @staticmethod
     def _value(obj, key, default=None):
@@ -322,12 +249,9 @@ class LlamaParseService:
                     text = cls._cell_text(cell[key])
                     if text:
                         return text
-            # All present values were empty after conversion.
+
             return "" if saw_value else ""
 
-        # LlamaParse SDK/model objects may expose the value under an
-        # attribute. Prefer the first non-empty attribute value so an empty
-        # "text" next to a populated "value" does not lose the data.
         saw_value = False
         for attr in ("text", "value", "content"):
             if hasattr(cell, attr):
@@ -339,19 +263,9 @@ class LlamaParseService:
                         return text
 
         if saw_value:
-            # At least one recognized attribute existed but everything was
-            # empty — the cell is genuinely empty. Do NOT str() the whole
-            # object here (that would leak repr garbage).
             return ""
 
-        # Last-resort scalar conversion. This keeps uncommon scalar-like
-        # values (for example Decimal or date/datetime objects) instead of
-        # silently turning them into empty strings.
         return str(cell).strip()
-
-    # ==================================================================
-    # Table representation helpers
-    # ==================================================================
 
     @classmethod
     def _rows_to_representation(
@@ -367,30 +281,26 @@ class LlamaParseService:
             return {"rows": [], "csv": "", "html": "", "markdown": ""}
 
         header = all_rows[0]
-        data   = all_rows[1:]
-        width  = len(header)
+        data = all_rows[1:]
+        width = len(header)
 
-        # Markdown
         md_lines = [
             "| " + " | ".join(str(c) for c in header) + " |",
             "| " + " | ".join("---" for _ in header) + " |",
         ]
         for row in data:
             padded = list(row[:width]) + [""] * max(0, width - len(row))
-            md_lines.append(
-                "| " + " | ".join(str(c) for c in padded[:width]) + " |"
-            )
+            md_lines.append("| " + " | ".join(str(c) for c in padded[:width]) + " |")
         markdown = "\n".join(md_lines)
 
-        # CSV
         buf = io.StringIO()
         _csv.writer(buf).writerows(all_rows)
         csv_text = buf.getvalue().strip()
 
         return {
-            "rows":     all_rows,
-            "csv":      csv_text,
-            "html":     "",
+            "rows": all_rows,
+            "csv": csv_text,
+            "html": "",
             "markdown": markdown,
         }
 
@@ -416,18 +326,9 @@ class LlamaParseService:
         """Parse a CSV string into list[list[str]], skipping blank rows."""
         try:
             reader = _csv.reader(io.StringIO(csv_text))
-            return [
-                list(row)
-                for row in reader
-                if any(cell.strip() for cell in row)
-            ]
+            return [list(row) for row in reader if any(cell.strip() for cell in row)]
         except Exception:
             return []
-
-    # ==================================================================
-    # Markdown → items parser
-    # (used independently and as a fallback when LlamaParse rows=[])
-    # ==================================================================
 
     @staticmethod
     def _split_md_row(line: str) -> list[str]:
@@ -460,9 +361,9 @@ class LlamaParseService:
         Used as a fallback when LlamaParse returns a table item whose
         rows field is empty but whose md field contains the table.
         """
-        lines  = markdown.splitlines()
+        lines = markdown.splitlines()
         items: list[SimpleNamespace] = []
-        buf:   list[str] = []
+        buf: list[str] = []
         i = 0
 
         def flush_text() -> None:
@@ -475,7 +376,7 @@ class LlamaParseService:
 
         while i < len(lines):
             line = lines[i]
-            # Pipe-table: current line has "|" and the NEXT line is a separator
+
             if (
                 i + 1 < len(lines)
                 and "|" in line
@@ -483,7 +384,7 @@ class LlamaParseService:
             ):
                 flush_text()
                 header = cls._split_md_row(line)
-                i += 2                          # skip header + separator
+                i += 2
                 data: list[list[str]] = []
                 while i < len(lines):
                     rl = lines[i].strip()
@@ -560,10 +461,6 @@ class LlamaParseService:
         except Exception:
             return []
 
-    # ==================================================================
-    # Table extraction with multi-level fallback
-    # ==================================================================
-
     @classmethod
     def _extract_table_rows(cls, item) -> list[list[str]]:
         """
@@ -578,19 +475,14 @@ class LlamaParseService:
         LlamaParse returns the content only in structured rows, HTML/markdown,
         or CSV form.
         """
-        # 1. Structured rows
+
         raw = cls._value(item, "rows", []) or []
         if raw:
             normalized = cls._normalize_raw_rows(raw)
             if normalized:
                 return normalized
 
-        # 2. Markdown/HTML fallback from the md field
-        md = (
-            cls._value(item, "md", None)
-            or cls._value(item, "markdown", "")
-            or ""
-        )
+        md = cls._value(item, "md", None) or cls._value(item, "markdown", "") or ""
         if md:
             html_rows = cls._html_to_rows(str(md))
             if html_rows:
@@ -612,7 +504,6 @@ class LlamaParseService:
                         )
                         return rows
 
-        # 3. Explicit HTML field fallback
         html_text = cls._value(item, "html", "") or ""
         html_rows = cls._html_to_rows(str(html_text))
         if html_rows:
@@ -622,14 +513,12 @@ class LlamaParseService:
             )
             return html_rows
 
-        # 4. CSV fallback
         csv_text = cls._value(item, "csv", "") or ""
         if csv_text:
             rows = cls._csv_to_rows(str(csv_text))
             if rows:
                 logger.debug(
-                    "[PARSER] Recovered table rows from CSV fallback "
-                    "(%d rows).",
+                    "[PARSER] Recovered table rows from CSV fallback (%d rows).",
                     len(rows),
                 )
                 return rows
@@ -645,10 +534,10 @@ class LlamaParseService:
         Returns None when the block contains no usable data.
         """
         header = cls._value(block, "header", []) or []
-        rows   = cls._value(block, "rows",   []) or []
+        rows = cls._value(block, "rows", []) or []
 
         header_strs = [cls._cell_text(c) for c in header]
-        row_strs    = [
+        row_strs = [
             [cls._cell_text(c) for c in row]
             for row in rows
             if isinstance(row, (list, tuple))
@@ -659,10 +548,6 @@ class LlamaParseService:
 
         all_rows = ([header_strs] + row_strs) if header_strs else row_strs
         return cls._rows_to_representation(all_rows)
-
-    # ==================================================================
-    # LiteParse result normalisation
-    # ==================================================================
 
     @classmethod
     def _normalize_liteparse_result(cls, result) -> SimpleNamespace:
@@ -677,18 +562,16 @@ class LlamaParseService:
         normalized_pages: list[SimpleNamespace] = []
 
         for page in pages:
-            page_number = (
-                cls._value(page, "page_num",    None)
-                or cls._value(page, "page_number", None)
+            page_number = cls._value(page, "page_num", None) or cls._value(
+                page, "page_number", None
             )
             blocks = cls._value(page, "blocks", []) or []
-            items:  list[SimpleNamespace] = []
+            items: list[SimpleNamespace] = []
 
             if blocks:
                 for block in blocks:
                     kind = cls._value(block, "kind", "") or ""
 
-                    # ── structured table ─────────────────────────────
                     if kind == "table":
                         table = cls._block_to_table(block)
                         if table is None:
@@ -705,7 +588,6 @@ class LlamaParseService:
                         )
                         continue
 
-                    # ── uncertain grid (keep as text, not a table) ───
                     if kind == "grid_fallback":
                         text = cls._value(block, "text", "")
                         if text:
@@ -718,7 +600,6 @@ class LlamaParseService:
                             )
                         continue
 
-                    # ── text / heading / list_item ───────────────────
                     text = cls._value(block, "text", "")
                     if not text:
                         continue
@@ -734,18 +615,14 @@ class LlamaParseService:
                         text = "#" * level + " " + text
 
                     elif kind == "list_item":
-                        marker  = cls._value(block, "marker", "-")
+                        marker = cls._value(block, "marker", "-")
                         ordered = bool(cls._value(block, "ordered", False))
-                        pfx     = marker or ("1." if ordered else "-")
-                        text    = f"{pfx} {text}"
+                        pfx = marker or ("1." if ordered else "-")
+                        text = f"{pfx} {text}"
 
-                    items.append(
-                        SimpleNamespace(type="text", md=text, value=text)
-                    )
+                    items.append(SimpleNamespace(type="text", md=text, value=text))
 
             else:
-                # Older LiteParse binding: no blocks, fall back to page text.
-                # This is a plain-text safety path; no table extraction.
                 text = cls._value(page, "text", "")
                 if text:
                     items.append(
@@ -760,16 +637,11 @@ class LlamaParseService:
                 SimpleNamespace(page_number=page_number, items=items)
             )
 
-        # Assign sequential page numbers to pages that had no number.
         for idx, pg in enumerate(normalized_pages, start=1):
             if not isinstance(pg.page_number, int):
                 pg.page_number = idx
 
         return SimpleNamespace(items=SimpleNamespace(pages=normalized_pages))
-
-    # ==================================================================
-    # LlamaParse result normalisation
-    # ==================================================================
 
     @classmethod
     def _log_raw_llamaparse_table_checkpoint(cls, result, path: Path) -> None:
@@ -847,9 +719,6 @@ class LlamaParseService:
                         len(str(raw_html)),
                     )
 
-                    # [FIX] Promoted from debug to INFO for the salary-loss
-                    # diagnosis: shows the actual raw cell values. Revert to
-                    # logger.debug once the fix is confirmed.
                     logger.info("[CHECKPOINT 1] RAW table rows=%r", raw_rows)
                     logger.info(
                         "[CHECKPOINT 1] RAW table cell types (first 3 rows)=%r",
@@ -862,8 +731,7 @@ class LlamaParseService:
 
             if raw_table_count == 0:
                 logger.warning(
-                    "[CHECKPOINT 1] RAW LlamaParse returned ZERO table items "
-                    "for %s.",
+                    "[CHECKPOINT 1] RAW LlamaParse returned ZERO table items for %s.",
                     path.name,
                 )
             else:
@@ -900,29 +768,28 @@ class LlamaParseService:
         for idx, page in enumerate(pages, start=1):
             page_number = (
                 cls._value(page, "page_number", None)
-                or cls._value(page, "page_num",    None)
+                or cls._value(page, "page_num", None)
                 or idx
             )
             normalized_items: list[SimpleNamespace] = []
 
-            for item in (cls._value(page, "items", []) or []):
+            for item in cls._value(page, "items", []) or []:
                 item_type = cls._value(item, "type", "")
 
                 if item_type == "table":
                     rows = cls._extract_table_rows(item)
 
                     md = (
-                        cls._value(item, "md",       None)
+                        cls._value(item, "md", None)
                         or cls._value(item, "markdown", "")
                         or ""
                     )
-                    csv_text = cls._value(item, "csv",  "") or ""
-                    html     = cls._value(item, "html", "") or ""
+                    csv_text = cls._value(item, "csv", "") or ""
+                    html = cls._value(item, "html", "") or ""
 
-                    # Build representations from rows if the API omitted them.
                     if rows and not md:
-                        rep      = cls._rows_to_representation(rows)
-                        md       = rep["markdown"]
+                        rep = cls._rows_to_representation(rows)
+                        md = rep["markdown"]
                         csv_text = csv_text or rep["csv"]
 
                     logger.info(
@@ -930,17 +797,10 @@ class LlamaParseService:
                         len(rows),
                         len(rows[0]) if rows else 0,
                     )
-                    # [FIX] Promoted from debug to INFO for the diagnosis:
-                    # shows the actual normalized values + Python types, so a
-                    # float→"" loss at this exact boundary is visible. Revert
-                    # to logger.debug once confirmed.
                     logger.info("[CHECKPOINT 2] NORMALIZED rows=%r", rows)
                     logger.info(
                         "[CHECKPOINT 2] NORMALIZED cell types (first 3 rows)=%r",
-                        [
-                            [type(cell).__name__ for cell in row]
-                            for row in rows[:3]
-                        ],
+                        [[type(cell).__name__ for cell in row] for row in rows[:3]],
                     )
 
                     normalized_items.append(
@@ -955,11 +815,7 @@ class LlamaParseService:
                     )
                     continue
 
-                # Non-table item
-                text = (
-                    cls._value(item, "md",    None)
-                    or cls._value(item, "value", None)
-                )
+                text = cls._value(item, "md", None) or cls._value(item, "value", None)
                 if not text:
                     continue
 
@@ -973,18 +829,10 @@ class LlamaParseService:
 
         return SimpleNamespace(items=SimpleNamespace(pages=normalized_pages))
 
-    # ==================================================================
-    # Content check
-    # ==================================================================
-
     @staticmethod
     def _has_content(result) -> bool:
         pages = getattr(getattr(result, "items", None), "pages", []) or []
         return any(getattr(p, "items", []) for p in pages)
-
-    # ==================================================================
-    # Client getters (lazy, thread-safe)
-    # ==================================================================
 
     @classmethod
     def _get_liteparse(cls) -> LiteParse:
@@ -1016,9 +864,7 @@ class LlamaParseService:
 
                     api_key = getattr(settings, "LLAMA_CLOUD_API_KEY", None)
                     if not api_key:
-                        raise ValueError(
-                            "LLAMA_CLOUD_API_KEY is not configured."
-                        )
+                        raise ValueError("LLAMA_CLOUD_API_KEY is not configured.")
 
                     cls._llama_client = LlamaCloud(
                         api_key=api_key,
@@ -1026,23 +872,15 @@ class LlamaParseService:
                     )
         return cls._llama_client
 
-    # ==================================================================
-    # LiteParse parser
-    # ==================================================================
-
     @classmethod
     def _parse_with_liteparse(cls, path: Path) -> SimpleNamespace:
         """Parse a PDF with LiteParse.  Raises on failure or empty output."""
-        parser     = cls._get_liteparse()
-        result     = parser.parse(path)
+        parser = cls._get_liteparse()
+        result = parser.parse(path)
         normalized = cls._normalize_liteparse_result(result)
         if not cls._has_content(normalized):
             raise ValueError("LiteParse returned no extractable content.")
         return normalized
-
-    # ==================================================================
-    # LlamaParse parser
-    # ==================================================================
 
     @classmethod
     def _parse_with_llamaparse(cls, path: Path) -> SimpleNamespace:
@@ -1053,13 +891,8 @@ class LlamaParseService:
         )
 
         client = cls._get_llama_client()
-        mime   = _MIME.get(path.suffix.lower(), "application/octet-stream")
+        mime = _MIME.get(path.suffix.lower(), "application/octet-stream")
 
-        # ── File upload ──────────────────────────────────────────────
-        # Keep the previously working SDK upload form: pass the Path
-        # directly so the SDK opens and uploads the real workbook/PDF.
-        # Each parse uploads the file anew → a new file_id → no reuse of a
-        # previous parse job or stale server-side result.
         logger.info("[LLAMAPARSE] Uploading: %s (%s)", path.name, mime)
 
         uploaded_file = client.files.create(
@@ -1072,7 +905,6 @@ class LlamaParseService:
             getattr(uploaded_file, "id", "?"),
         )
 
-        # ── Parse ────────────────────────────────────────────────────
         logger.info(
             "[LLAMAPARSE] Parse request: tier=%s version=%s expand=%s "
             "polling_interval=%ss max_interval=%ss timeout=%ss backoff=linear.",
@@ -1101,22 +933,19 @@ class LlamaParseService:
             time.perf_counter() - started,
         )
 
-        # CHECKPOINT 1: inspect the raw response before QueryPilot touches it.
         cls._log_raw_llamaparse_table_checkpoint(result, path)
 
         normalized = cls._normalize_llamaparse_result(result)
 
-        pages      = getattr(getattr(normalized, "items", None), "pages", []) or []
+        pages = getattr(getattr(normalized, "items", None), "pages", []) or []
         item_count = sum(len(getattr(p, "items", [])) for p in pages)
 
         if item_count == 0:
-            raise ValueError(
-                "LlamaParse returned no extractable content."
-            )
+            raise ValueError("LlamaParse returned no extractable content.")
 
         table_count = sum(
             1
-            for p    in pages
+            for p in pages
             for item in getattr(p, "items", [])
             if getattr(item, "type", None) == "table"
         )
@@ -1128,7 +957,6 @@ class LlamaParseService:
             table_count,
         )
 
-        # Structured files with zero tables are a sign something is wrong.
         if table_count == 0 and path.suffix.lower() in _STRUCTURED_SUFFIXES:
             logger.warning(
                 "[LLAMAPARSE] WARNING: %s parsed to 0 table items "
@@ -1139,34 +967,20 @@ class LlamaParseService:
 
         return normalized
 
-    # ==================================================================
-    # Public entry point
-    # ==================================================================
-
     @classmethod
     def parse_document(
         cls,
         file_path: str,
-        file_hash:  "str | None" = None,
+        file_hash: "str | None" = None,
     ) -> SimpleNamespace:
 
         path = Path(file_path)
 
         if not path.is_file():
-            raise FileNotFoundError(
-                f"Document file not found at '{file_path}'."
-            )
+            raise FileNotFoundError(f"Document file not found at '{file_path}'.")
 
         suffix = path.suffix.lower()
 
-        # [FIX] CHECKPOINT 0 — runtime identity + normalization sanity.
-        # Proves which parser module/bytecode the running worker is actually
-        # executing. If sanity_cell != '25000.0', the worker is running stale
-        # code (pre-fix module still in memory, or a shadowing parser module
-        # on sys.path — the module= path reveals which). If module= or
-        # source_digest= differs from the file on disk
-        # (`sha256sum documents/ingestion/parser.py`), the worker imported
-        # parser.py before the latest edit — restart the worker.
         logger.info(
             "[CHECKPOINT 0] RUNTIME IDENTITY: module=%s source_digest=%s "
             "pid=%s tier=%s version=%s schema=v%s cache_bypass=%s | "
@@ -1183,15 +997,6 @@ class LlamaParseService:
             cls._cell_text(None),
         )
 
-        # LlamaParse results are cached; LiteParse remains local and fast.
-        # This prevents retries from re-uploading and re-parsing the same
-        # document. The cache key includes tier/version so changing the
-        # parsing configuration automatically bypasses older results.
-        #
-        # [FIX] NOTE: this cache stores the NORMALIZED result, not the raw
-        # API response. Any change to normalization logic MUST bump
-        # PARSE_CACHE_SCHEMA_VERSION, otherwise stale (pre-fix) rows keep
-        # being served and the fix appears not to work.
         if file_hash is None:
             file_hash = cls._file_hash(path)
 
@@ -1222,20 +1027,19 @@ class LlamaParseService:
                 )
                 return cached_result
 
-        # ── PDF: LiteParse first, LlamaParse on failure ───────────────
         if suffix == ".pdf":
             logger.info("[PARSER] Routing PDF to LiteParse: %s", path.name)
             started = time.perf_counter()
 
             try:
                 normalized = cls._parse_with_liteparse(path)
-                elapsed    = time.perf_counter() - started
+                elapsed = time.perf_counter() - started
 
                 pages = getattr(getattr(normalized, "items", None), "pages", []) or []
-                item_count  = sum(len(getattr(p, "items", [])) for p in pages)
+                item_count = sum(len(getattr(p, "items", [])) for p in pages)
                 table_count = sum(
                     1
-                    for p    in pages
+                    for p in pages
                     for item in getattr(p, "items", [])
                     if getattr(item, "type", None) == "table"
                 )
@@ -1263,7 +1067,6 @@ class LlamaParseService:
                 cls._write_cache_if_allowed(cache_key, result, path.name)
                 return result
 
-        # ── Non-PDF: LlamaParse directly ──────────────────────────────
         logger.info(
             "[PARSER] Routing non-PDF to LlamaParse: %s (%s)",
             path.name,
@@ -1272,11 +1075,6 @@ class LlamaParseService:
         result = cls._parse_with_llamaparse(path)
         cls._write_cache_if_allowed(cache_key, result, path.name)
         return result
-
-
-# ============================================================================
-# LlamaAdapter
-# ============================================================================
 
 
 class LlamaAdapter:
@@ -1295,14 +1093,11 @@ class LlamaAdapter:
         for page in pages:
             page_number = getattr(page, "page_number", None)
 
-            for item in (getattr(page, "items", None) or []):
+            for item in getattr(page, "items", None) or []:
                 if getattr(item, "type", None) == "table":
                     continue
 
-                text = (
-                    getattr(item, "md",    None)
-                    or getattr(item, "value", None)
-                )
+                text = getattr(item, "md", None) or getattr(item, "value", None)
                 if not text:
                     continue
 
@@ -1318,30 +1113,28 @@ class LlamaAdapter:
         for page in pages:
             page_number = getattr(page, "page_number", None)
 
-            for item in (getattr(page, "items", None) or []):
+            for item in getattr(page, "items", None) or []:
                 if getattr(item, "type", None) != "table":
                     continue
 
                 rows = getattr(item, "rows", []) or []
 
-                # CHECKPOINT 3: what actually leaves the parser/adapter.
                 logger.info(
                     "[CHECKPOINT 3] ADAPTER table page=%s rows_count=%d columns=%d.",
                     page_number,
                     len(rows),
                     len(rows[0]) if rows else 0,
                 )
-                # [FIX] Promoted from debug to INFO for the diagnosis.
                 logger.info("[CHECKPOINT 3] ADAPTER rows=%r", rows)
 
                 table_nodes.append(
                     {
-                        "page":     page_number,
-                        "rows":     rows,
-                        "csv":      getattr(item, "csv",   ""),
-                        "html":     getattr(item, "html",  ""),
-                        "markdown": getattr(item, "md",    ""),
+                        "page": page_number,
+                        "rows": rows,
+                        "csv": getattr(item, "csv", ""),
+                        "html": getattr(item, "html", ""),
+                        "markdown": getattr(item, "md", ""),
                     }
                 )
 
-        return table_nodes  
+        return table_nodes

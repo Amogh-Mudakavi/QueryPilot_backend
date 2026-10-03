@@ -42,7 +42,6 @@ import torch
 from django.conf import settings
 from sentence_transformers import SentenceTransformer
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -95,7 +94,6 @@ def _resolve_torch_threads() -> int:
 
 
 class VectorStore:
-
     _client = None
     _embedder = None
 
@@ -107,17 +105,10 @@ class VectorStore:
     def get_client(cls):
 
         if cls._client is None:
-
             with cls._client_lock:
-
                 if cls._client is None:
-
                     cls._client = chromadb.PersistentClient(
-                        path=str(
-                            settings.BASE_DIR
-                            / "storage"
-                            / "chroma"
-                        )
+                        path=str(settings.BASE_DIR / "storage" / "chroma")
                     )
 
         return cls._client
@@ -126,11 +117,8 @@ class VectorStore:
     def get_embedder(cls):
 
         if cls._embedder is None:
-
             with cls._embedder_lock:
-
                 if cls._embedder is None:
-
                     threads = _resolve_torch_threads()
 
                     try:
@@ -139,8 +127,7 @@ class VectorStore:
                         )
                     except Exception:
                         logger.exception(
-                            "[EMBEDDING] Could not set torch "
-                            "num_threads=%s.",
+                            "[EMBEDDING] Could not set torch num_threads=%s.",
                             threads,
                         )
 
@@ -178,22 +165,12 @@ class VectorStore:
     @classmethod
     def knowledge_collection(cls):
 
-        return (
-            cls.get_client()
-            .get_or_create_collection(
-                KNOWLEDGE_COLLECTION
-            )
-        )
+        return cls.get_client().get_or_create_collection(KNOWLEDGE_COLLECTION)
 
     @classmethod
     def document_collection(cls):
 
-        return (
-            cls.get_client()
-            .get_or_create_collection(
-                DOCUMENT_COLLECTION
-            )
-        )
+        return cls.get_client().get_or_create_collection(DOCUMENT_COLLECTION)
 
     @classmethod
     def embed(
@@ -204,18 +181,10 @@ class VectorStore:
         texts = list(texts)
 
         if not texts:
-            raise ValueError(
-                "Cannot embed an empty list of texts."
-            )
+            raise ValueError("Cannot embed an empty list of texts.")
 
-        if any(
-            not isinstance(text, str)
-            or not text.strip()
-            for text in texts
-        ):
-            raise ValueError(
-                "All texts must be non-empty strings."
-            )
+        if any(not isinstance(text, str) or not text.strip() for text in texts):
+            raise ValueError("All texts must be non-empty strings.")
 
         model = cls.get_embedder()
 
@@ -227,11 +196,7 @@ class VectorStore:
             EMBEDDING_BATCH_SIZE,
         )
 
-        # One heavy model is shared by all ingestion threads.
-        # Serializing encode() avoids multiple CPU-heavy calls
-        # competing for the same model at the same time.
         with cls._embedding_lock:
-
             vectors = model.encode(
                 texts,
                 batch_size=EMBEDDING_BATCH_SIZE,
@@ -270,25 +235,15 @@ class VectorStore:
             len(chunks),
             CHROMA_BATCH_SIZE,
         ):
+            batch = chunks[start : start + CHROMA_BATCH_SIZE]
 
-            batch = chunks[
-                start:start + CHROMA_BATCH_SIZE
-            ]
+            documents = [chunk["text"] for chunk in batch]
 
-            documents = [
-                chunk["text"]
-                for chunk in batch
-            ]
-
-            ids = [
-                f"doc_{document_id}_chunk_{chunk['chunk_index']}"
-                for chunk in batch
-            ]
+            ids = [f"doc_{document_id}_chunk_{chunk['chunk_index']}" for chunk in batch]
 
             metadatas = []
 
             for chunk in batch:
-
                 metadatas.append(
                     {
                         "workspace_id": workspace_id,
@@ -313,8 +268,7 @@ class VectorStore:
             upserted += len(batch)
 
         logger.info(
-            "[CHROMA] upsert completed: %d chunk(s) for document %s "
-            "in %.2fs.",
+            "[CHROMA] upsert completed: %d chunk(s) for document %s in %.2fs.",
             upserted,
             document_id,
             time.monotonic() - started,
@@ -329,20 +283,12 @@ class VectorStore:
         summary,
     ):
 
-        if (
-            not isinstance(summary, str)
-            or not summary.strip()
-        ):
-            raise ValueError(
-                "Table metadata summary cannot be empty."
-            )
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError("Table metadata summary cannot be empty.")
 
         collection = cls.knowledge_collection()
 
-        table_id = (
-            f"doc_{document_id}_table_"
-            f"{table_name}_metadata"
-        )
+        table_id = f"doc_{document_id}_table_{table_name}_metadata"
 
         collection.upsert(
             ids=[table_id],
@@ -359,8 +305,7 @@ class VectorStore:
         )
 
         logger.info(
-            "[CHROMA] upsert completed: table metadata '%s' for "
-            "document %s.",
+            "[CHROMA] upsert completed: table metadata '%s' for document %s.",
             table_name,
             document_id,
         )
@@ -374,26 +319,15 @@ class VectorStore:
         profile_text,
     ):
 
-        if (
-            not isinstance(profile_text, str)
-            or not profile_text.strip()
-        ):
-            raise ValueError(
-                "Document profile cannot be empty."
-            )
+        if not isinstance(profile_text, str) or not profile_text.strip():
+            raise ValueError("Document profile cannot be empty.")
 
         collection = cls.document_collection()
 
         collection.upsert(
-            ids=[
-                f"document_{document_id}"
-            ],
-            documents=[
-                profile_text
-            ],
-            embeddings=cls.embed(
-                [profile_text]
-            ),
+            ids=[f"document_{document_id}"],
+            documents=[profile_text],
+            embeddings=cls.embed([profile_text]),
             metadatas=[
                 {
                     "workspace_id": workspace_id,
@@ -405,10 +339,89 @@ class VectorStore:
         )
 
         logger.info(
-            "[CHROMA] upsert completed: document profile for "
-            "document %s.",
+            "[CHROMA] upsert completed: document profile for document %s.",
             document_id,
         )
+
+    @classmethod
+    def get_document_profiles(
+        cls,
+        workspace_id,
+        document_ids,
+    ):
+        """Retrieve planner document profiles for one workspace."""
+        try:
+            workspace_id = int(workspace_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("workspace_id must be an integer.") from exc
+
+        if workspace_id <= 0:
+            raise ValueError("workspace_id must be greater than zero.")
+
+        normalized_ids = []
+        for value in document_ids or []:
+            try:
+                document_id = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("document_ids must contain integer ids.") from exc
+
+            if document_id <= 0:
+                raise ValueError("document_ids must contain positive ids.")
+
+            if document_id not in normalized_ids:
+                normalized_ids.append(document_id)
+
+        if not normalized_ids:
+            return {}
+
+        try:
+            result = cls.document_collection().get(
+                ids=[f"document_{document_id}" for document_id in normalized_ids],
+                include=["documents", "metadatas"],
+            )
+        except Exception:
+            logger.exception(
+                "[CHROMA] document profile retrieval failed for workspace %s.",
+                workspace_id,
+            )
+            return {}
+
+        documents = result.get("documents", []) if isinstance(result, dict) else []
+        metadatas = result.get("metadatas", []) if isinstance(result, dict) else []
+
+        if not isinstance(documents, list):
+            documents = []
+        if not isinstance(metadatas, list):
+            metadatas = []
+
+        requested = set(normalized_ids)
+        profiles = {}
+
+        for index, profile_text in enumerate(documents):
+            metadata = (
+                metadatas[index]
+                if index < len(metadatas) and isinstance(metadatas[index], dict)
+                else {}
+            )
+
+            try:
+                profile_workspace_id = int(metadata.get("workspace_id"))
+                document_id = int(metadata.get("document_id"))
+            except (TypeError, ValueError):
+                continue
+
+            if profile_workspace_id != workspace_id or document_id not in requested:
+                continue
+
+            if isinstance(profile_text, str) and profile_text.strip():
+                profiles[document_id] = profile_text
+
+        logger.info(
+            "[CHROMA] retrieved %d document profile(s) for workspace %s.",
+            len(profiles),
+            workspace_id,
+        )
+        return profiles
 
     @classmethod
     def delete_document(
@@ -419,25 +432,16 @@ class VectorStore:
         errors = []
 
         try:
-            cls.knowledge_collection().delete(
-                where={
-                    "document_id": document_id
-                }
-            )
+            cls.knowledge_collection().delete(where={"document_id": document_id})
         except Exception as exc:
             errors.append(exc)
 
         try:
-            cls.document_collection().delete(
-                where={
-                    "document_id": document_id
-                }
-            )
+            cls.document_collection().delete(where={"document_id": document_id})
         except Exception as exc:
             errors.append(exc)
 
         if errors:
             raise RuntimeError(
-                f"Vector deletion failed for document {document_id}: "
-                f"{errors}"
+                f"Vector deletion failed for document {document_id}: {errors}"
             )

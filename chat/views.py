@@ -47,7 +47,6 @@ from chat.services.execution import (
 from utils.redis import check_chat_question_limit
 from workspace.models import Workspace
 
-
 CHAT_LIMIT_MESSAGE = (
     "Looks like I’ve hit the ceiling on the LLM credits available "
     "to this solo-developer project. I’ve exhausted the recovery "
@@ -100,9 +99,7 @@ class ConversationListCreateView(APIView):
         Return conversations belonging to the requested workspace.
         """
 
-        workspace_id = request.query_params.get(
-            "workspace_id"
-        )
+        workspace_id = request.query_params.get("workspace_id")
 
         if not workspace_id:
             return Response(
@@ -155,9 +152,7 @@ class ConversationListCreateView(APIView):
             raise_exception=True,
         )
 
-        workspace_id = serializer.validated_data[
-            "workspace_id"
-        ]
+        workspace_id = serializer.validated_data["workspace_id"]
 
         try:
             workspace = Workspace.objects.get(
@@ -222,12 +217,10 @@ class ConversationDetailView(APIView):
 
         messages = conversation.messages.all()
 
-        conversation_data["messages"] = (
-            MessageSerializer(
-                messages,
-                many=True,
-            ).data
-        )
+        conversation_data["messages"] = MessageSerializer(
+            messages,
+            many=True,
+        ).data
 
         return Response(
             conversation_data,
@@ -356,17 +349,15 @@ class ConversationSettingsView(APIView):
 
 
 class StreamMessageView(APIView):
-    renderer_classes = [EventStreamRenderer]
-    """
-    Stream one QueryPilot message using Server-Sent Events.
+    """Stream one QueryPilot message using Server-Sent Events.
 
     This is the canonical chat execution endpoint.
 
-    User messages are persisted before execution begins.
-    Successful assistant answers are persisted before the final
-    `complete` event is emitted.
+    User messages are persisted before execution begins. Successful assistant
+    answers are persisted before the final `complete` event is emitted.
     """
 
+    renderer_classes = [EventStreamRenderer]
     permission_classes = [
         IsAuthenticated,
     ]
@@ -387,13 +378,9 @@ class StreamMessageView(APIView):
             raise_exception=True,
         )
 
-        conversation_id = serializer.validated_data[
-            "conversation_id"
-        ]
+        conversation_id = serializer.validated_data["conversation_id"]
 
-        message = serializer.validated_data[
-            "message"
-        ]
+        message = serializer.validated_data["message"]
 
         try:
             conversation = Conversation.objects.get(
@@ -407,20 +394,6 @@ class StreamMessageView(APIView):
                 },
                 status=status.HTTP_404_NOT_FOUND,
             )
-
-        # ---------------------------------------------------------
-        # Per-user question limit
-        #
-        # First 10 questions:
-        #     normal QueryPilot execution
-        #
-        # Question 11:
-        #     return the fixed solo-developer message
-        #     without calling any LLM
-        #
-        # During the 2-hour cooldown:
-        #     immediately return the same message
-        # ---------------------------------------------------------
 
         allowed, _ = check_chat_question_limit(
             user_id=request.user.id,
@@ -483,10 +456,7 @@ class StreamMessageView(APIView):
 
             except Exception:
                 error_payload = {
-                    "message": (
-                        "We couldn't complete "
-                        "this request."
-                    ),
+                    "message": ("We couldn't complete this request."),
                 }
 
                 yield (

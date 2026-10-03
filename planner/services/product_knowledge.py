@@ -1,43 +1,38 @@
+"""Services Product Knowledge module for QueryPilot."""
+
 from __future__ import annotations
 
 DEVELOPER_FACTS: dict[str, str] = {
     "name": "Amogh Mudakavi",
-
     "education": (
         "Amogh Mudakavi completed his B.Tech in Electronics and Communication "
         "Engineering (ECE) at PES University, Bengaluru."
     ),
-
     "why_querypilot_was_built": (
         "Amogh built QueryPilot to create a production-oriented AI application "
         "that combines backend engineering, RAG, structured data querying, "
         "LLM orchestration, document processing, and secure data access in one system."
     ),
-
     "technical_focus": (
         "His primary technical focus is backend engineering and AI engineering, "
         "with an emphasis on building reliable, scalable systems rather than "
         "frontend-heavy applications."
     ),
-
     "skills": (
         "His technical skills include Python, Django, Django REST Framework, "
         " MySQL, PostgreSQL, MongoDB, Redis, "
         "Docker, AWS, vector databases, RAG systems, embeddings, "
         "hybrid retrieval, reranking, and LLM application development."
     ),
-
     "querypilot_focus": (
         "QueryPilot reflects his interest in production-grade AI systems, especially "
         "RAG pipelines, document intelligence, structured data access, LLM agents, "
         "retrieval systems, security boundaries, and backend architecture."
     ),
-
     "career_goal": (
         "Amogh wants to build a career in backend and AI engineering, with a long-term "
         "goal of working on strong product engineering and machine-learning systems."
     ),
-
     "project_goal": (
         "QueryPilot was built as a serious engineering project rather than a simple "
         "LLM demo, with emphasis on correctness, security, retrieval quality, "

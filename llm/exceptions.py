@@ -33,6 +33,12 @@ class InvalidResponseError(LLMError):
     pass
 
 
+class RequestTooLargeError(LLMError):
+    """Raised when the request itself exceeds a provider request-size limit."""
+
+    pass
+
+
 class TimeoutError(LLMError):
     """Raised when an LLM request times out."""
 

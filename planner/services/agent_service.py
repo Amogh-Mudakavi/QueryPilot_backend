@@ -1,3 +1,5 @@
+"""Services Agent Service module for QueryPilot."""
+
 from __future__ import annotations
 
 import json
@@ -13,8 +15,21 @@ from llm.exceptions import InvalidResponseError
 from llm.router import router
 from planner.prompts.agent import ACTION_SCHEMA, SYSTEM_PROMPT
 from planner.services.answer import generate_answer
-from planner.services.entity_resolution import resolve_references
-from planner.services.history import bound_history_for_planner
+from planner.services.cross_document_join import run_cross_document_join
+from planner.services.document_coverage import build_document_evidence
+from planner.services.entity_resolution import (
+    resolve_entities_from_query,
+    resolve_references,
+)
+from planner.services.evidence import (
+    assign_citation_indexes,
+    finalize_structured,
+    reconcile_coverage_notes,
+)
+from planner.services.history import (
+    bound_history_for_planner,
+    resolve_replay,
+)
 from planner.services.intent import ROW_RESULT_OPERATIONS, build_execution_plan
 from planner.services.product_knowledge import get_product_knowledge
 from planner.services.schema_registry import (
@@ -28,26 +43,32 @@ from planner.services.sufficiency import (
     documents_insufficient,
     insufficiency_note,
 )
+from planner.services.table_selection import select_tables
 from planner.tools.conversation_memory import conversation_memory
 from planner.tools.query_tables import query_tables
-from planner.tools.search_evidence import search_evidence
+from planner.tools.search_evidence import fetch_document_chunks, search_evidence
 from planner.tools.source_metadata import source_metadata
 
 logger = logging.getLogger(__name__)
 
 MAX_EVIDENCE = 8
 
+
+MAX_EVIDENCE_CROSS_DOCUMENT = 12
+
+
+MAX_EVIDENCE_WITH_COVERAGE = 24
+
 PLANNER_MAX_COMPLETION_TOKENS = 1000
 
-# Exactly ONE recovery attempt per request, shared across all tools.
+
 MAX_RECOVERY_ATTEMPTS = 1
 
-# Set from data, not by guessing. None = threshold check off.
+
 MIN_RETRIEVAL_CONFIDENCE: float | None = None
 
 DEFAULT_FAILURE_MESSAGE = (
-    "I could not complete that request because the required data "
-    "operation failed."
+    "I could not complete that request because the required data operation failed."
 )
 
 ERROR_MESSAGES = {
@@ -56,8 +77,7 @@ ERROR_MESSAGES = {
         "Please try again, or try a simpler question."
     ),
     "DATABASE_ERROR": (
-        "I couldn't reach the workspace data just now. Please try again "
-        "in a moment."
+        "I couldn't reach the workspace data just now. Please try again in a moment."
     ),
     "ANSWER_GENERATION_ERROR": (
         "I found the relevant information but couldn't write up the "
@@ -73,10 +93,6 @@ CHITCHAT_REPLIES = {
     "thank you": "You're welcome! Let me know if you'd like to look at anything else.",
     "thx": "You're welcome! Let me know if you'd like to look at anything else.",
 }
-
-# Cross-document evidence bound: maximum tables pulled from resolved
-# documents per request. Deterministic schema order, inside MAX_EVIDENCE.
-MAX_DOCUMENT_TABLES = 3
 
 
 class AgentRuntimeError(Exception):
@@ -132,11 +148,6 @@ def _emit_event(
     get_stream_writer()(payload)
 
 
-# ---------------------------------------------------------------------------
-# Deadline / small helpers
-# ---------------------------------------------------------------------------
-
-
 def _past_deadline(state: AgentState) -> bool:
     deadline = state.get("deadline_monotonic")
     return bool(deadline) and time.monotonic() > float(deadline)
@@ -164,12 +175,146 @@ def _chitchat_reply(query: str) -> str | None:
     return CHITCHAT_REPLIES.get(normalized)
 
 
-# ---------------------------------------------------------------------------
-# Graph nodes
-# ---------------------------------------------------------------------------
+def _resolved_entity_values_from_resolution(
+    resolution: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Extract resolved entity matches from a resolution object."""
+    if not isinstance(resolution, dict):
+        return []
+
+    entities: list[dict[str, Any]] = []
+    for item in resolution.get("references", []) or []:
+        if not isinstance(item, dict) or item.get("status") != "RESOLVED":
+            continue
+        match = item.get("match")
+        if not isinstance(match, dict) or match.get("type") != "entity":
+            continue
+        value = match.get("value")
+        locations = match.get("locations")
+        if value and isinstance(locations, list) and locations:
+            entities.append({"value": value, "locations": locations})
+    return entities
+
+
+def _merge_entity_fallback(
+    primary: dict[str, Any],
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Add only deterministic entity matches from a structured fallback pass.
+
+    Existing document/table resolutions and ambiguities stay authoritative;
+    a fallback result only replaces a NOT_FOUND reference with a deterministic
+    entity result.
+    """
+    merged = dict(primary)
+    primary_refs = [dict(item) for item in primary.get("references", []) or []]
+    fallback_by_reference = {
+        str(item.get("reference") or ""): item
+        for item in fallback.get("references", []) or []
+        if isinstance(item, dict) and item.get("reference")
+    }
+
+    changed = False
+    for index, current in enumerate(primary_refs):
+        if current.get("status") != "NOT_FOUND":
+            continue
+        reference = str(current.get("reference") or "")
+        candidate = fallback_by_reference.get(reference)
+        if not isinstance(candidate, dict):
+            continue
+        candidate_status = candidate.get("status")
+        if candidate_status not in {"RESOLVED", "AMBIGUOUS"}:
+            continue
+        if candidate_status == "RESOLVED":
+            match = candidate.get("match")
+            if not isinstance(match, dict) or match.get("type") != "entity":
+                continue
+        current.update(candidate)
+        primary_refs[index] = current
+        changed = True
+
+    if not changed:
+        return primary
+
+    merged["references"] = primary_refs
+    merged["has_ambiguity"] = any(
+        item.get("status") == "AMBIGUOUS" for item in primary_refs
+    )
+    merged["has_resolved"] = any(
+        item.get("status") == "RESOLVED" for item in primary_refs
+    )
+    return merged
+
+
+def _merge_query_entity_fallback(
+    primary: dict[str, Any],
+    entities: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Append deterministic entities found directly in the current query."""
+    if not entities:
+        return primary
+
+    merged = dict(primary)
+    references = [dict(item) for item in primary.get("references", []) or []]
+    existing_entities = {
+        str(item.get("match", {}).get("value") or "").casefold()
+        for item in references
+        if item.get("status") == "RESOLVED"
+        and isinstance(item.get("match"), dict)
+        and item.get("match", {}).get("type") == "entity"
+    }
+
+    changed = False
+    for entity in entities:
+        value = str(entity.get("value") or "").strip()
+        locations = entity.get("locations")
+        if not value or not isinstance(locations, list) or not locations:
+            continue
+        if value.casefold() in existing_entities:
+            continue
+        match = {
+            "type": "entity",
+            "value": value,
+            "locations": locations,
+        }
+        if entity.get("document_id") is not None:
+            match["document_id"] = entity.get("document_id")
+        if entity.get("document_title"):
+            match["document_title"] = entity.get("document_title")
+        references.append(
+            {
+                "reference": value,
+                "status": "RESOLVED",
+                "match": match,
+            }
+        )
+        existing_entities.add(value.casefold())
+        changed = True
+
+    if not changed:
+        return primary
+
+    merged["references"] = references
+    merged["has_resolved"] = True
+    return merged
 
 
 def agent_node(state: AgentState) -> dict[str, Any]:
+    original_query = str(state.get("query", "")).strip()
+
+    carry: dict[str, Any] = {}
+    replay = resolve_replay(original_query, state.get("conversation_history", []))
+    if replay:
+        previous_task, effective_query = replay
+        logger.info(
+            "Correction replay activated: current=%r previous_user_task=%r",
+            original_query,
+            previous_task,
+        )
+        carry = {"query": effective_query, "conversation_history": []}
+        state = {**state, **carry}
+
     reply = _chitchat_reply(state.get("query", ""))
     if reply is not None:
         return {
@@ -219,25 +364,62 @@ def agent_node(state: AgentState) -> dict[str, Any]:
             category_hint=understanding.get("category_hint"),
         )
 
-        # Deterministic contextual resolution ("the second table",
-        # "that document", "the previous one", "it"). Runs AFTER name
-        # resolution and BEFORE planning; the LLM never picks the
-        # actual resource. Failure is non-fatal.
         try:
             resolution = _resolve_contextual_references(state, resolution)
         except Exception:
-            logger.exception(
-                "Contextual reference resolution failed; continuing"
-            )
+            logger.exception("Contextual reference resolution failed; continuing")
 
-        # Deterministic source shapes (which resolved documents actually
-        # expose tables) so planning picks the evidence path from what
-        # the source IS, never from name guessing.
         plan = build_execution_plan(
             understanding,
             resolution,
             _resolved_source_shapes(state, understanding, resolution),
         )
+
+        if (
+            "TABLE_QUERY" in plan.get("capabilities", [])
+            and not _resolved_entity_values_from_resolution(resolution)
+            and understanding.get("references")
+        ):
+            try:
+                fallback_resolution = resolve_references(
+                    workspace_id=state["workspace_id"],
+                    references=understanding.get("references", []),
+                    category_hint="structured",
+                )
+                resolution = _merge_entity_fallback(
+                    resolution,
+                    fallback_resolution,
+                )
+            except Exception:
+                logger.exception("Structured entity-resolution fallback failed")
+
+        if "TABLE_QUERY" in plan.get(
+            "capabilities", []
+        ) and not _resolved_entity_values_from_resolution(resolution):
+            try:
+                schema = get_workspace_schema(state["workspace_id"])
+                query_entities = resolve_entities_from_query(
+                    workspace_id=state["workspace_id"],
+                    query=str(state.get("query", "")),
+                    schema=schema,
+                )
+                updated_resolution = _merge_query_entity_fallback(
+                    resolution,
+                    query_entities,
+                )
+                if updated_resolution != resolution:
+                    resolution = updated_resolution
+                    plan = build_execution_plan(
+                        understanding,
+                        resolution,
+                        _resolved_source_shapes(state, understanding, resolution),
+                    )
+                    logger.info(
+                        "Current-query entity resolution activated: %s",
+                        query_entities,
+                    )
+            except Exception:
+                logger.exception("Current-query entity resolution failed")
 
     except AgentRuntimeError as exc:
         logger.exception("Query understanding failed")
@@ -277,11 +459,7 @@ def agent_node(state: AgentState) -> dict[str, Any]:
         }
 
     clarification = plan.get("status") == "NEEDS_CLARIFICATION"
-    message = (
-        "Clarification required."
-        if clarification
-        else "Request understood."
-    )
+    message = "Clarification required." if clarification else "Request understood."
 
     _emit_event(
         event="planning",
@@ -296,6 +474,7 @@ def agent_node(state: AgentState) -> dict[str, Any]:
     )
 
     return {
+        **carry,
         "query_understanding": understanding,
         "resolved_references": resolution,
         "execution_plan": plan,
@@ -305,12 +484,734 @@ def agent_node(state: AgentState) -> dict[str, Any]:
         + [
             {
                 "stage": "query_understanding",
+                "original_query": original_query,
                 "understanding": understanding,
                 "resolution": resolution,
                 "plan": plan,
             }
         ],
     }
+
+
+def _with_table_scope(
+    state: AgentState,
+    capabilities: list[str],
+) -> AgentState:
+    """
+    Evidence selection for structured sources: a resolved document does not
+    make every one of its tables relevant. Decide, from profiles and schema
+    metadata, which tables this question needs BEFORE anything is read.
+    The result travels in state["table_scope"]; absent means "no narrowing".
+    """
+    resolved_ids = set(_resolved_document_ids(state))
+    if "TABLE_QUERY" not in capabilities:
+        return state
+
+    try:
+        schema = get_workspace_schema(
+            state["workspace_id"],
+            include_sample_rows=True,
+        )
+        entity_tables = {
+            str(location.get("table_name"))
+            for entity in _resolved_entity_values(state)
+            for location in entity.get("locations", [])
+            if location.get("table_name")
+        }
+        if not resolved_ids and not entity_tables:
+            candidates = list(schema)
+        else:
+            candidates = [
+                item
+                for item in schema
+                if _coerce_int(item.get("document_id")) in resolved_ids
+                or str(item.get("table_name")) in entity_tables
+            ]
+        selected = select_tables(
+            workspace_id=state["workspace_id"],
+            query=str(state.get("query", "")),
+            understanding=state.get("query_understanding", {}) or {},
+            candidates=candidates,
+            forced_table_names=entity_tables,
+        )
+    except Exception:
+        logger.exception("table scope selection failed; not narrowing")
+        return state
+
+    if not selected:
+        return state
+
+    scoped = dict(state)
+    scoped["table_scope"] = sorted(selected)
+    return scoped
+
+
+def _table_scope(state: AgentState) -> set[str] | None:
+    scope = state.get("table_scope")
+    return {str(name) for name in scope} if scope else None
+
+
+def _in_table_scope(
+    state: AgentState,
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    scope = _table_scope(state)
+    if not scope:
+        return items
+    return [item for item in items if str(item.get("table_name")) in scope]
+
+
+def _documents_without_text(coverage: Any) -> set[int]:
+    """
+    Resolved documents that own no text chunks (purely structured sources),
+    from the coverage report. Text lookups against them can never match.
+    """
+    if not isinstance(coverage, list):
+        return set()
+    ids: set[int] = set()
+    for entry in coverage:
+        if isinstance(entry, dict) and entry.get("total") == 0:
+            document_id = _coerce_int(entry.get("document_id"))
+            if document_id is not None:
+                ids.add(document_id)
+    return ids
+
+
+def _evidence_table_names(item: Any) -> set[str]:
+    if not isinstance(item, dict):
+        return set()
+    return {
+        str(source.get("table_name"))
+        for source in item.get("sources", []) or []
+        if isinstance(source, dict) and source.get("table_name")
+    }
+
+
+def _evidence_rows(item: Any) -> list[dict[str, Any]]:
+    content = item.get("content") if isinstance(item, dict) else None
+    rows = content.get("rows") if isinstance(content, dict) else None
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+def _row_signature(row: dict[str, Any]) -> str:
+    return json.dumps(row, sort_keys=True, default=str)
+
+
+_POPULATION_CONTEXT_PATTERNS = (
+    r"\b(?:all|every|each|among|across|overall|entire|whole|population)\b",
+    r"\b(?:percentage|percent|share|proportion|ratio)\s+of\s+(?:the\s+)?total\b",
+    r"\b(?:sum|total|average|mean|count)\s+(?:of|across|among)\b",
+    r"\b(?:highest|lowest|maximum|minimum|top|bottom|rank|ranking)\b",
+    r"\b(?:compare|compared\s+with|difference\s+between|more\s+than|less\s+than|greater\s+than)\b",
+)
+
+
+def _query_requires_population_context(
+    query: str,
+    operation: str = "",
+) -> bool:
+    """
+    Determine whether the requested answer needs source-wide context.
+
+    This is intentionally domain-neutral. It does not know about employees,
+    sales, salaries, or any other business field. It only recognizes query
+    semantics that require more than one entity row, such as population
+    aggregates, rankings, comparisons, or shares of a total.
+    """
+    text = str(query or "").strip()
+    if not text:
+        return False
+
+    normalized_operation = str(operation or "").strip().lower()
+    if normalized_operation in {
+        "list",
+        "ranking",
+        "rank",
+        "compare",
+        "comparison",
+        "aggregate",
+        "population",
+    }:
+        return True
+
+    return any(
+        re.search(pattern, text, flags=re.IGNORECASE)
+        for pattern in _POPULATION_CONTEXT_PATTERNS
+    )
+
+
+def _is_complete_table_evidence(item: Any) -> bool:
+    content = item.get("content") if isinstance(item, dict) else None
+    if not isinstance(content, dict) or content.get("truncated"):
+        return False
+
+    rows = content.get("rows")
+    if not isinstance(rows, list):
+        return False
+
+    counts = content.get("source_table_row_counts")
+    if isinstance(counts, dict) and len(counts) == 1:
+        try:
+            return len(rows) == int(next(iter(counts.values())))
+        except (TypeError, ValueError):
+            pass
+
+    return bool(content.get("rows_returned", len(rows)) == len(rows))
+
+
+def _table_names(item: Any) -> set[str]:
+    return _evidence_table_names(item)
+
+
+def _prioritize_focused_tables(
+    structured: list[Any],
+    *,
+    query: str = "",
+    operation: str = "",
+) -> list[Any]:
+    """Choose one canonical representation of table facts without losing semantics."""
+    needs_population = _query_requires_population_context(query, operation)
+    by_table: dict[str, dict[str, list[Any]]] = {}
+
+    for item in structured:
+        names = _table_names(item)
+        content = item.get("content") if isinstance(item, dict) else None
+        if len(names) != 1 or not isinstance(content, dict):
+            continue
+        role = str(content.get("evidence_role") or "")
+        if role not in {"document_table", "query_result", "key_joined", "entity_row"}:
+            continue
+        name = next(iter(names))
+        by_table.setdefault(name, {}).setdefault(role, []).append(item)
+
+    drop_ids: set[int] = set()
+    for table_name, groups in by_table.items():
+        full_items = groups.get("document_table", [])
+        query_items = groups.get("query_result", [])
+        focused_items = groups.get("key_joined", []) + groups.get("entity_row", [])
+        complete_full = any(_is_complete_table_evidence(item) for item in full_items)
+        if not complete_full:
+            continue
+
+        full_rows: set[str] = set()
+        target_full = next(
+            (item for item in full_items if _is_complete_table_evidence(item)),
+            full_items[0],
+        )
+        for row in _evidence_rows(target_full):
+            full_rows.add(_row_signature(row))
+
+        if needs_population:
+            for item in query_items:
+                semantics = (item.get("content") or {}).get("query_semantics") or {}
+                kind = semantics.get("type")
+                single_ranking = kind == "ranking" and semantics.get("limit") == 1
+                if kind in {"aggregate", "grouped", "positional"} or single_ranking:
+                    for full in full_items:
+                        drop_ids.add(id(full))
+                    continue
+                if kind == "ranking":
+                    continue
+                rows = {_row_signature(r) for r in _evidence_rows(item)}
+                if rows and rows <= full_rows:
+                    drop_ids.add(id(item))
+        else:
+            for item in query_items + focused_items:
+                rows = {_row_signature(r) for r in _evidence_rows(item)}
+                if not rows or rows <= full_rows:
+                    drop_ids.add(id(item))
+
+        for item in focused_items:
+            content = item.get("content") or {}
+            if not isinstance(content, dict):
+                continue
+            keys = [
+                str(key) for key in content.get("matched_keys", []) if str(key).strip()
+            ]
+            if not keys:
+                continue
+            target_content = target_full.setdefault("content", {})
+            existing = [
+                str(key)
+                for key in target_content.get("matched_keys", [])
+                if str(key).strip()
+            ]
+            target_content["matched_keys"] = list(dict.fromkeys(existing + keys))
+            drop_ids.add(id(item))
+
+    return [item for item in structured if id(item) not in drop_ids]
+
+
+def _canonicalize_evidence(items: list[Any]) -> list[Any]:
+    """Deterministically remove exact duplicate evidence while preserving provenance."""
+    result: list[Any] = []
+    seen_exact: set[tuple[Any, ...]] = set()
+    table_seen_rows: dict[tuple[str, str], set[str]] = {}
+
+    for item in items:
+        if not isinstance(item, dict):
+            result.append(item)
+            continue
+
+        content = item.get("content")
+        role = (
+            str(content.get("evidence_role") or "") if isinstance(content, dict) else ""
+        )
+        names = tuple(sorted(_evidence_table_names(item)))
+
+        if (
+            names
+            and isinstance(content, dict)
+            and role in {"document_table", "key_joined", "entity_row", "query_result"}
+        ):
+            key = (names, role)
+            rows = content.get("rows")
+            if isinstance(rows, list):
+                unique_rows = []
+                seen_rows = table_seen_rows.setdefault(key, set())
+                for row in rows:
+                    signature = (
+                        _row_signature(row) if isinstance(row, dict) else str(row)
+                    )
+                    if signature in seen_rows:
+                        continue
+                    seen_rows.add(signature)
+                    unique_rows.append(row)
+                content = dict(content)
+                content["rows"] = unique_rows
+                item = dict(item)
+                item["content"] = content
+
+            exact_key = (
+                "table",
+                names,
+                role,
+                _row_signature(
+                    {
+                        str(k): v
+                        for k, v in content.items()
+                        if k not in {"rows", "success", "interpretation"}
+                    }
+                ),
+            )
+            if exact_key in seen_exact and not content.get("rows"):
+                continue
+            seen_exact.add(exact_key)
+            result.append(item)
+            continue
+
+        metadata = (
+            item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        )
+        exact_key = (
+            str(item.get("source_type") or ""),
+            _coerce_int(item.get("document_id")),
+            metadata.get("chunk_index"),
+            str(content or ""),
+        )
+        if exact_key in seen_exact:
+            continue
+        seen_exact.add(exact_key)
+        result.append(item)
+
+    return result
+
+
+_NOTE_KINDS = {
+    "evidence_note",
+    "retrieval_assessment",
+    "source_resolution",
+    "document_coverage",
+    "coverage_note",
+}
+_NON_DATA_STATUSES = {
+    "",
+    "NOT_FOUND",
+    "RETRIEVAL_ERROR",
+    "PARTIAL",
+    "INSUFFICIENT_EVIDENCE",
+}
+
+
+def _restore_unaggregated_reductions(
+    before: list[Any],
+    after: list[Any],
+    query: str,
+) -> list[Any]:
+    """
+    Invariant: a complete table is only reduced to a subset when an aggregate
+    covers its population. finalize_structured reduces every non-aggregated
+    document table once ANY aggregate exists; if the question names a numeric
+    column of a reduced table and no aggregate was derived for it, the
+    population (total / highest / share) would be unrecoverable downstream and
+    the answer model would rightly report it as missing. Restore such tables
+    in full (they are small by construction: complete tables under the read cap).
+    """
+    from planner.services.evidence import to_number
+    from retrieval.services.keys import is_id_column
+
+    originals: dict[str, Any] = {}
+    for item in before:
+        names = _evidence_table_names(item)
+        content = item.get("content") if isinstance(item, dict) else None
+        if (
+            len(names) == 1
+            and isinstance(content, dict)
+            and content.get("evidence_role") == "document_table"
+            and _is_complete_table_evidence(item)
+        ):
+            originals[next(iter(names))] = item
+
+    aggregated: set[str] = set()
+    for item in after:
+        content = item.get("content") if isinstance(item, dict) else None
+        if (
+            isinstance(content, dict)
+            and content.get("evidence_role") == "aggregate_result"
+        ):
+            for source in (item.get("sources") or [])[:1]:
+                if isinstance(source, dict) and source.get("table_name"):
+                    aggregated.add(str(source["table_name"]))
+
+    def tokens(text: Any) -> set[str]:
+        found = re.findall(
+            r"[a-z0-9]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", str(text)).lower()
+        )
+        return {t[:-1] if len(t) > 3 and t.endswith("s") else t for t in found}
+
+    query_tokens = tokens(query)
+
+    def merge_original(original: Any, content: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(original)
+        merged_content = dict(original["content"])
+        keys = list(
+            dict.fromkeys(
+                [str(k) for k in original["content"].get("matched_keys", []) or []]
+                + [str(k) for k in content.get("matched_keys", []) or []]
+            )
+        )
+        if keys:
+            merged_content["matched_keys"] = keys
+        merged_content["population_scope"] = "complete_population"
+        merged["content"] = merged_content
+        return merged
+
+    def reducible(item: Any) -> tuple[str, Any] | None:
+        content = item.get("content") if isinstance(item, dict) else None
+        names = _evidence_table_names(item)
+        if (
+            isinstance(content, dict)
+            and content.get("population_reduced")
+            and len(names) == 1
+            and next(iter(names)) in originals
+            and next(iter(names)) not in aggregated
+        ):
+            table = next(iter(names))
+            return table, originals[table]
+        return None
+
+    restored: list[Any] = []
+    for item in after:
+        found = reducible(item)
+        if found is not None:
+            table, original = found
+            rows = _evidence_rows(original)
+            columns = [
+                str(c)
+                for c in (
+                    original["content"].get("columns")
+                    or (list(rows[0]) if rows else [])
+                )
+            ]
+            population_column = any(
+                not is_id_column(column)
+                and tokens(column) & query_tokens
+                and sum(1 for r in rows if r.get(column) not in (None, "")) >= 2
+                and all(
+                    to_number(r.get(column)) is not None
+                    for r in rows
+                    if r.get(column) not in (None, "")
+                )
+                for column in columns
+            )
+            if population_column:
+                logger.info("population guard: restored complete table %s", table)
+                restored.append(merge_original(original, item["content"]))
+                continue
+        restored.append(item)
+
+    def norm(value: Any) -> str:
+        return str(value).strip().lower()
+
+    def complete_rows(item: Any) -> list[dict[str, Any]]:
+        content = item.get("content") if isinstance(item, dict) else None
+        if (
+            isinstance(content, dict)
+            and content.get("evidence_role") == "document_table"
+            and content.get("population_scope") == "complete_population"
+            and not content.get("population_reduced")
+            and _is_complete_table_evidence(item)
+        ):
+            return _evidence_rows(item)
+        return []
+
+    complete_tables = [
+        rows for rows in (complete_rows(i) for i in restored) if len(rows) >= 2
+    ]
+    final: list[Any] = []
+    for item in restored:
+        found = reducible(item)
+        if found is None:
+            final.append(item)
+            continue
+        table, original = found
+        original_rows = _evidence_rows(original)
+        kept_rows = _evidence_rows(item)
+        needs_lookup = False
+        if len(original_rows) > len(kept_rows) >= 0 and original_rows:
+            for column in original["content"].get("columns") or list(original_rows[0]):
+                column = str(column)
+                values = [
+                    norm(r.get(column))
+                    for r in original_rows
+                    if r.get(column) not in (None, "")
+                ]
+                if len(values) < 2 or len(set(values)) != len(values):
+                    continue
+                if all(
+                    to_number(r.get(column)) is not None
+                    for r in original_rows
+                    if r.get(column) not in (None, "")
+                ):
+                    continue
+                key_values = set(values)
+                kept_values = {
+                    norm(r.get(column))
+                    for r in kept_rows
+                    if r.get(column) not in (None, "")
+                }
+                for rows in complete_tables:
+                    for other in rows[0]:
+                        referenced = {
+                            norm(r.get(other))
+                            for r in rows
+                            if r.get(other) not in (None, "")
+                        }
+                        if (
+                            len(referenced) >= 2
+                            and referenced <= key_values
+                            and not referenced <= kept_values
+                        ):
+                            needs_lookup = True
+                            break
+                    if needs_lookup:
+                        break
+                if needs_lookup:
+                    break
+        if needs_lookup:
+            logger.info("population guard: restored referenced lookup table %s", table)
+            final.append(merge_original(original, item["content"]))
+        else:
+            final.append(item)
+    return final
+
+
+def _reconcile_source_notes(
+    notes: list[Any],
+    structured: list[Any],
+    workspace_id: Any,
+) -> list[Any]:
+    """
+    Retrieval/coverage/identifier-lookup notes describe the TEXT search
+    ("no passages", "mode=none included=0", "no row contains the identifier").
+    For a source whose rows were retrieved they contradict the evidence and
+    read as 'source unavailable'. Drop such notes for every source whose
+    structured rows are present, matching by title, catalog names and file
+    names (not only the table title).
+    """
+    if not notes:
+        return notes
+    present_ids: set[int] = set()
+    names: set[str] = set()
+    for item in structured:
+        if (
+            not isinstance(item, dict)
+            or str(item.get("result_status", "")).upper() != "SUCCESS"
+        ):
+            continue
+        content = item.get("content")
+        if not isinstance(content, dict) or not (
+            content.get("rows") or content.get("aggregates")
+        ):
+            continue
+        for source in item.get("sources") or []:
+            did = (
+                _coerce_int(source.get("document_id"))
+                if isinstance(source, dict)
+                else None
+            )
+            if did is not None:
+                present_ids.add(did)
+        if content.get("document_title"):
+            names.add(str(content["document_title"]))
+    if present_ids:
+        try:
+            for doc in get_workspace_catalog(int(workspace_id)):
+                if _coerce_int(doc.get("document_id")) in present_ids:
+                    for key in (
+                        "title",
+                        "document_name",
+                        "file_name",
+                        "filename",
+                        "name",
+                    ):
+                        if doc.get(key):
+                            names.add(str(doc[key]))
+        except Exception:
+            logger.exception("note reconciliation: catalog unavailable")
+    expanded: set[str] = set()
+    for name in names:
+        lowered = name.strip().lower()
+        expanded.add(lowered)
+        expanded.add(re.sub(r"\.[a-z0-9]{2,5}$", "", lowered))
+    expanded = {n for n in expanded if len(n) >= 3}
+    if not expanded:
+        return notes
+
+    kept: list[Any] = []
+    for note in notes:
+        if (
+            isinstance(note, dict)
+            and str(note.get("source_type") or "").lower() in _NOTE_KINDS
+            and str(note.get("result_status") or "").upper() in _NON_DATA_STATUSES
+        ):
+            blob = json.dumps(
+                note.get("content"), ensure_ascii=False, default=str
+            ).lower()
+            if any(name in blob for name in expanded):
+                logger.info("dropped note contradicted by retrieved rows: %.80s", blob)
+                continue
+        kept.append(note)
+    return kept
+
+
+def _evidence_manifest(evidence: list[Any]) -> list[dict[str, Any]]:
+    """Compact, log-only view of exactly what the answer stage will receive."""
+    manifest: list[dict[str, Any]] = []
+    for position, item in enumerate(evidence, start=1):
+        if not isinstance(item, dict):
+            manifest.append({"n": position, "type": type(item).__name__})
+            continue
+        content = item.get("content")
+        entry: dict[str, Any] = {
+            "n": position,
+            "type": item.get("source_type"),
+            "status": item.get("result_status"),
+        }
+        if isinstance(content, dict):
+            entry["role"] = content.get("evidence_role")
+            entry["scope"] = content.get("population_scope")
+            entry["doc"] = content.get("document_title")
+            rows = content.get("rows")
+            if isinstance(rows, list):
+                entry["rows"] = len(rows)
+            if content.get("aggregates"):
+                entry["aggregates"] = [
+                    a.get("column")
+                    for a in content["aggregates"]
+                    if isinstance(a, dict)
+                ]
+        else:
+            entry["text"] = str(content)[:60]
+        manifest.append(entry)
+    return manifest
+
+
+def _collapse_subsumed_table_items(items: list[Any]) -> list[Any]:
+    """
+    Final semantic pass over structured evidence: a table item whose rows are
+    all present, exactly, in another item of the same source(s) is a redundant
+    raw representation of the same facts. Fold it into the surviving item
+    (matched keys merged, so join provenance is kept) and drop it.
+
+    Items with their own query semantics (aggregate / ranking / positional /
+    grouped results) and aggregate_result items are never folded: they are
+    execution results, not duplicates.
+    """
+    candidates: list[tuple[int, frozenset[str], set[str], dict[str, Any]]] = []
+    for position, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        names = frozenset(_evidence_table_names(item))
+        rows = content.get("rows") if isinstance(content, dict) else None
+        if not names or not isinstance(rows, list) or not rows:
+            continue
+        if not all(isinstance(r, dict) for r in rows):
+            continue
+        candidates.append((position, names, {_row_signature(r) for r in rows}, item))
+
+    drop: set[int] = set()
+    replacements: dict[int, dict[str, Any]] = {}
+    for position, names, signatures, item in candidates:
+        content = item["content"]
+        if content.get("evidence_role") == "aggregate_result":
+            continue
+        semantics = content.get("query_semantics") or {}
+        if isinstance(semantics, dict) and semantics.get("type") not in (
+            None,
+            "table_result",
+        ):
+            continue
+
+        for other_pos, other_names, other_sigs, other in candidates:
+            if other_pos == position or other_pos in drop or other_names != names:
+                continue
+            if (other.get("content") or {}).get("evidence_role") == "aggregate_result":
+                continue
+            larger = len(other_sigs) > len(signatures)
+            equal_but_earlier = other_sigs == signatures and other_pos < position
+            if not (signatures <= other_sigs and (larger or equal_but_earlier)):
+                continue
+
+            keys = [
+                str(k) for k in content.get("matched_keys", []) or [] if str(k).strip()
+            ]
+            if keys:
+                survivor = replacements.get(other_pos) or dict(other)
+                survivor_content = dict(survivor.get("content") or {})
+                existing = [
+                    str(k)
+                    for k in survivor_content.get("matched_keys", []) or []
+                    if str(k).strip()
+                ]
+                survivor_content["matched_keys"] = list(dict.fromkeys(existing + keys))
+                survivor["content"] = survivor_content
+                replacements[other_pos] = survivor
+            drop.add(position)
+            break
+
+    return [
+        replacements.get(position, item)
+        for position, item in enumerate(items)
+        if position not in drop
+    ]
+
+
+def _ensure_citation_sync(evidence: list[Any]) -> list[Any]:
+    """
+    citation_index must equal the 1-based position in the stored final
+    evidence. Re-assign (once, on the exact list that will be stored and
+    sent) if anything upstream let them diverge.
+    """
+    in_sync = all(
+        isinstance(item, dict) and item.get("citation_index") == position
+        for position, item in enumerate(evidence, start=1)
+    )
+    if in_sync:
+        return evidence
+    logger.warning("citation indexes out of sync with evidence order; re-assigning")
+    return assign_citation_indexes(list(evidence))
 
 
 def dispatch_node(state: AgentState) -> dict[str, Any]:
@@ -350,8 +1251,21 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             "tool_failed": False,
         }
 
-    capabilities = plan.get("capabilities", [])
+    capabilities = list(plan.get("capabilities", []))
+
+    if (
+        "SOURCE_METADATA" in capabilities
+        and not _resolved_entity_values(state)
+        and not _resolved_document_ids(state)
+        and not _resolved_table_names(state)
+        and not _named_missing_source_references(state)
+    ):
+        capabilities = [
+            c for c in capabilities if c not in {"TABLE_QUERY", "DOCUMENT_SEARCH"}
+        ]
+
     budget = _RecoveryBudget(MAX_RECOVERY_ATTEMPTS)
+    state = _with_table_scope(state, capabilities)
 
     structured: list[Any] = []
     documents: list[Any] = []
@@ -361,6 +1275,9 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
     table_result: dict[str, Any] | None = None
     retrieval_confidence = 0.0
     document_search_error = False
+    coverage_notes: list[Any] = []
+    coverage_used = False
+    coverage_info: Any = None
 
     try:
         _check_deadline(state, "dispatch")
@@ -401,16 +1318,10 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
 
         table_not_found = table_status == "NOT_FOUND"
 
-        # Bug 4 (document side): references that explicitly name a file
-        # but did not resolve mean the source does not exist. Searching
-        # OTHER documents in its place would be a random source choice.
         resolved_doc_ids = _resolved_document_ids(state)
         missing_named_sources = _named_missing_source_references(state)
         named_source_missing = bool(missing_named_sources) and not resolved_doc_ids
 
-        # Honest status note whenever an explicitly named source is
-        # missing - including partial misses - so the answer never
-        # implies evidence was taken from a source that was not found.
         if missing_named_sources:
             structured.append(
                 {
@@ -435,12 +1346,6 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
                 else "named source(s) not found in workspace",
             )
 
-        # Cross-document evidence: a document the user deterministically
-        # resolved is evidence through every channel it has. Its text
-        # arrives via DOCUMENT_SEARCH (text chunks only); its tabular
-        # content lives only in SQLite and is otherwise reachable by
-        # neither evidence path. Generically: no query keywords, no
-        # table-name matching, no domain assumptions.
         if (
             "DOCUMENT_SEARCH" in capabilities
             and not skip_document_search
@@ -476,6 +1381,89 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
                 )
             else:
                 documents = docs["evidence"]
+                coverage_notes = list(docs.get("notes") or [])
+                coverage_used = bool(docs.get("coverage"))
+                coverage_info = docs.get("coverage")
+
+            if docs.get("degraded"):
+                logger.warning(
+                    "document_search ran DEGRADED (dense retrieval failed); "
+                    "results are lexical-only."
+                )
+
+        join_notes: list[Any] = []
+        join_keys: list[str] = []
+        if (
+            len(resolved_doc_ids) >= 2
+            and "DOCUMENT_SEARCH" in capabilities
+            and not skip_document_search
+        ):
+            try:
+                understanding = state.get("query_understanding", {}) or {}
+                join = run_cross_document_join(
+                    workspace_id=state["workspace_id"],
+                    query=str(state.get("query", "")),
+                    references=understanding.get("references", []),
+                    resolved_references=state.get("resolved_references", {}).get(
+                        "references", []
+                    ),
+                    document_ids=resolved_doc_ids,
+                    entities=_resolved_entity_values(state),
+                    structured=structured,
+                    documents=documents,
+                    skip_text_document_ids=_documents_without_text(coverage_info),
+                    allowed_table_names=_table_scope(state),
+                )
+            except Exception:
+                logger.exception("cross-document key join failed")
+                join = None
+
+            if join:
+                join_keys = [str(k) for k in join.get("keys", []) or []]
+                if join["tables"]:
+                    structured.extend(join["tables"])
+                    total_tool_calls += 1
+                if join["documents"]:
+                    documents = join["documents"] + list(documents)
+                join_notes = join["notes"]
+
+        operation = str(
+            (state.get("query_understanding", {}) or {}).get("operation") or ""
+        )
+        structured = _prioritize_focused_tables(
+            structured,
+            query=str(state.get("query", "")),
+            operation=operation,
+        )
+        structured = _canonicalize_evidence(structured)
+        documents = _canonicalize_evidence(list(documents))
+
+        pre_finalize = list(structured)
+        structured = finalize_structured(
+            structured,
+            workspace_id=state["workspace_id"],
+            query=str(state.get("query", "")),
+            needs_population=_query_requires_population_context(
+                str(state.get("query", "")), operation
+            ),
+            entity_values=[
+                str(e.get("value"))
+                for e in _resolved_entity_values(state)
+                if e.get("value")
+            ],
+            join_keys=join_keys,
+            run_query=query_tables,
+        )
+
+        structured = _restore_unaggregated_reductions(
+            pre_finalize, structured, str(state.get("query", ""))
+        )
+        structured = _collapse_subsumed_table_items(structured)
+        coverage_notes = reconcile_coverage_notes(
+            coverage_notes, coverage_info, structured
+        )
+
+        has_structured_document_evidence = _has_document_table_evidence(structured)
 
         assessment = assess_evidence(
             wants_table="TABLE_QUERY" in capabilities,
@@ -483,9 +1471,8 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             wants_documents=(
                 "DOCUMENT_SEARCH" in capabilities
                 and not skip_document_search
+                and not has_structured_document_evidence
             ),
-            # Resolved documents' tables ARE document evidence; count
-            # them so the sufficiency assessment reflects reality.
             document_chunk_count=len(documents) + len(document_tables),
             retrieval_confidence=retrieval_confidence,
             min_retrieval_confidence=MIN_RETRIEVAL_CONFIDENCE,
@@ -503,11 +1490,6 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         if note is not None and (structured or documents):
             notes.append(note)
 
-        # Bug 2: a mixed request explicitly depends on policy/rule
-        # evidence. When NEITHER document text NOR the resolved
-        # documents' tabular content was retrieved, say so in the
-        # evidence itself: the answer must not invent or re-derive
-        # the policy.
         if (
             "TABLE_QUERY" in capabilities
             and "DOCUMENT_SEARCH" in capabilities
@@ -515,6 +1497,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             and not document_search_error
             and not documents
             and not document_tables
+            and not has_structured_document_evidence
             and structured
         ):
             notes.append(
@@ -533,13 +1516,27 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
                 }
             )
 
-        room_for_documents = max(MAX_EVIDENCE - len(structured) - len(notes), 0)
-        evidence = (
-            structured
-            + documents[:room_for_documents]
-            + notes
-        )[:MAX_EVIDENCE]
+        notes.extend(coverage_notes)
+        notes.extend(join_notes)
+        notes = _canonicalize_evidence(notes)
+        notes = _reconcile_source_notes(notes, structured, state["workspace_id"])
 
+        if coverage_used:
+            evidence_limit = MAX_EVIDENCE_WITH_COVERAGE
+        elif len(resolved_doc_ids) >= 2:
+            evidence_limit = MAX_EVIDENCE_CROSS_DOCUMENT
+        else:
+            evidence_limit = MAX_EVIDENCE
+
+        room_for_documents = max(evidence_limit - len(structured) - len(notes), 0)
+        evidence = _ensure_citation_sync(
+            assign_citation_indexes(structured + documents[:room_for_documents] + notes)
+        )
+
+        logger.info(
+            "evidence_manifest: %s",
+            json.dumps(_evidence_manifest(evidence), ensure_ascii=False, default=str),
+        )
         return {
             "evidence": evidence,
             "final_evidence": evidence,
@@ -606,7 +1603,7 @@ def finish_node(state: AgentState) -> dict[str, Any]:
             "route": "ERROR",
         }
 
-    evidence = state.get("evidence", [])
+    evidence = list(state.get("final_evidence") or state.get("evidence") or [])
     if not evidence:
         return {
             "final_evidence": [],
@@ -673,19 +1670,17 @@ def finish_node(state: AgentState) -> dict[str, Any]:
             "route": "ERROR",
         }
 
+    evidence = _ensure_citation_sync(evidence)
+
     _emit_event(
         event="generating_answer",
         status="started",
         message="Generating the final answer.",
     )
     logger.info(
-        "FINAL ANSWER EVIDENCE:\n%s",
-        json.dumps(
-            evidence,
-            ensure_ascii=False,
-            indent=2,
-            default=str,
-        ),
+        "final_answer_evidence: items=%d chars=%d",
+        len(evidence),
+        len(json.dumps(evidence, ensure_ascii=False, default=str)),
     )
 
     try:
@@ -734,11 +1729,6 @@ def route_after_agent(state: AgentState) -> str:
     return "dispatch"
 
 
-# ---------------------------------------------------------------------------
-# Planning context
-# ---------------------------------------------------------------------------
-
-
 def _build_context(state: AgentState) -> str:
     workspace_id = state.get("workspace_id")
     catalog: list[dict[str, Any]] = []
@@ -746,9 +1736,21 @@ def _build_context(state: AgentState) -> str:
     if workspace_id:
         try:
             raw_catalog = get_workspace_catalog(int(workspace_id))
-            # The planner needs titles/types/table names for resolving phrases
-            # such as "the two PDFs". It must never receive table row data here.
-            for document in raw_catalog[:50]:
+            relevant_ids = {
+                _coerce_int(value)
+                for value in state.get("relevant_document_ids", [])
+                if _coerce_int(value) is not None
+            }
+            if relevant_ids:
+                raw_catalog = [
+                    doc
+                    for doc in raw_catalog
+                    if _coerce_int(doc.get("document_id")) in relevant_ids
+                ]
+            else:
+                raw_catalog = raw_catalog[:12]
+
+            for document in raw_catalog:
                 catalog.append(
                     {
                         "document_id": document.get("document_id"),
@@ -760,12 +1762,14 @@ def _build_context(state: AgentState) -> str:
                                 "table_name": table.get("table_name"),
                                 "row_count": table.get("row_count"),
                             }
-                            for table in document.get("tables", [])[:10]
+                            for table in document.get("tables", [])[:8]
                         ],
                     }
                 )
         except Exception:
-            logger.exception("Could not load planner workspace catalog; continuing without it")
+            logger.exception(
+                "Could not load planner workspace catalog; continuing without it"
+            )
 
     return json.dumps(
         {
@@ -799,11 +1803,6 @@ def _parse_understanding(response: Any) -> dict[str, Any]:
         )
 
     return data
-
-
-# ---------------------------------------------------------------------------
-# Source metadata
-# ---------------------------------------------------------------------------
 
 
 def _first_resolved_match(
@@ -868,18 +1867,65 @@ def _is_generic_catalog_reference(reference: str) -> bool:
     return normalized in _GENERIC_CATALOG_REFERENCES
 
 
+def _allowed_document_ids(state: AgentState) -> list[int] | None:
+    """
+    Conversation-level document allowlist supplied by the caller
+    (state["allowed_document_ids"]).
+
+    None = no conversation restriction (workspace scope still applies);
+    [] = no documents allowed.
+    """
+    raw = state.get("allowed_document_ids")
+    if raw is None:
+        return None
+    return [i for i in (_coerce_int(v) for v in raw) if i is not None]
+
+
+def _resolved_source_matches(state: AgentState) -> list[dict[str, Any]]:
+    """
+    Every resolved document/table match, one per distinct source
+    (a document and one of its tables count as the same source), in
+    resolution order.
+    """
+    matches: list[dict[str, Any]] = []
+    seen: set[Any] = set()
+    for item in state.get("resolved_references", {}).get("references", []):
+        match = item.get("match", {})
+        if item.get("status") != "RESOLVED" or not isinstance(match, dict):
+            continue
+        if match.get("type") not in {"document", "table"}:
+            continue
+        document_id = _coerce_int(match.get("document_id"))
+        key = (
+            document_id
+            if document_id is not None
+            else (
+                match.get("title")
+                or match.get("document_title")
+                or match.get("table_name")
+            )
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        matches.append(match)
+    return matches
+
+
 def _run_source_metadata(state: AgentState) -> dict[str, Any]:
     """
-    Preserve the tool's FOUND / NOT_FOUND state, pass the resolved
-    document_id when we have one, and never answer a question about a
-    specific missing source with the whole catalog.
+    Preserve the tool's FOUND / NOT_FOUND state, look up EVERY resolved
+    source (not just the first), never answer a question about a specific
+    missing source with the whole catalog, and never read outside the
+    conversation's allowed documents.
     """
 
     workspace_id = state["workspace_id"]
+    allowed = _allowed_document_ids(state)
     references = state.get("resolved_references", {}).get("references", [])
-    match = _first_resolved_match(state, "document", "table")
+    matches = _resolved_source_matches(state)
 
-    if match is not None:
+    def lookup(match: dict[str, Any]) -> dict[str, Any]:
         document_id = _coerce_int(match.get("document_id"))
         reference = None
         if document_id is None:
@@ -888,11 +1934,35 @@ def _run_source_metadata(state: AgentState) -> dict[str, Any]:
                 or match.get("document_title")
                 or match.get("table_name")
             )
-        metadata = source_metadata(
+        return source_metadata(
             workspace_id=workspace_id,
             reference=reference,
             document_id=document_id,
+            allowed_document_ids=allowed,
         )
+
+    if len(matches) == 1:
+        metadata = lookup(matches[0])
+
+    elif len(matches) > 1:
+        results = [lookup(match) for match in matches]
+        found = [r for r in results if r.get("status") != "NOT_FOUND"]
+        documents = [
+            doc for r in found for doc in r.get("content", {}).get("documents", [])
+        ]
+        metadata = {
+            "source_type": "workspace_metadata",
+            "workspace_id": workspace_id,
+            "status": "FOUND" if found else "NOT_FOUND",
+            "sources": [source for r in found for source in r.get("sources", [])],
+            "content": {
+                "evidence_role": "workspace_metadata",
+                "document_count": len(documents),
+                "document_names": [d.get("document_name") for d in documents],
+                "documents": documents,
+            },
+        }
+
     else:
         unresolved = [
             str(item.get("reference"))
@@ -907,7 +1977,10 @@ def _run_source_metadata(state: AgentState) -> dict[str, Any]:
         ]
 
         if unresolved_specific:
-            catalog = source_metadata(workspace_id=workspace_id)
+            catalog = source_metadata(
+                workspace_id=workspace_id,
+                allowed_document_ids=allowed,
+            )
             titles = [
                 str(doc.get("title"))
                 for doc in catalog.get("content", {}).get("documents", [])
@@ -927,7 +2000,10 @@ def _run_source_metadata(state: AgentState) -> dict[str, Any]:
                 },
             }
 
-        metadata = source_metadata(workspace_id=workspace_id)
+        metadata = source_metadata(
+            workspace_id=workspace_id,
+            allowed_document_ids=allowed,
+        )
 
     metadata = dict(metadata)
     metadata["result_status"] = (
@@ -936,16 +2012,19 @@ def _run_source_metadata(state: AgentState) -> dict[str, Any]:
     return metadata
 
 
-# ---------------------------------------------------------------------------
-# Deterministic contextual reference resolution (Bug 7) and
-# named-source-missing guards (Bug 4)
-# ---------------------------------------------------------------------------
-
 _TABLE_REFERENCE_WORDS = {"table", "sheet", "record"}
 _DOCUMENT_REFERENCE_WORDS = {"document", "file", "doc", "pdf"}
 _ORDINALS = {
-    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
-    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
 }
 _CONTEXTUAL_TOKENS = (
     set(_ORDINALS)
@@ -1001,15 +2080,12 @@ def _parse_contextual_reference(reference: str) -> dict[str, Any] | None:
     deictic = any(w in words for w in {"that", "this", "previous", "it", "next"})
 
     if thing is None:
-        # "the previous one" / "it" (deictic) AND "the second one" /
-        # "the last one" (positional) are contextual even without a
-        # thing word: the thing is whatever was established.
         if deictic or ordinal is not None:
             return {"thing": None, "ordinal": ordinal, "deictic": deictic}
         return None
 
     if ordinal is None and not deictic:
-        return None  # a bare thing word ("table") is not contextual
+        return None
 
     return {"thing": thing, "ordinal": ordinal, "deictic": deictic}
 
@@ -1087,8 +2163,7 @@ def _established_resource(
     current_resolved: list[dict[str, Any]],
     state: AgentState,
 ) -> dict[str, Any] | None:
-    # Current-turn named sources take priority as the base scope
-    # ("the second table of employee_leaves.xlsx").
+
     for item in current_resolved:
         if item["match"].get("type") == "table":
             return {"type": "table", "match": item["match"]}
@@ -1130,7 +2205,6 @@ def _resolve_one_contextual(
     thing = parsed["thing"]
     ordinal = parsed["ordinal"]
 
-    # --- deictic without ordinal: "that table" / "this document" ----
     if parsed["deictic"] and ordinal is None:
         if thing == "table":
             if established and established["type"] == "table":
@@ -1164,7 +2238,6 @@ def _resolve_one_contextual(
             }
         return None
 
-    # --- ordinal: "the second table" / "the last document" ----------
     if thing == "table":
         candidates = _contextual_table_candidates(catalog, established)
     elif thing == "document":
@@ -1186,7 +2259,7 @@ def _resolve_one_contextual(
 
     index = len(candidates) if ordinal == "last" else int(ordinal or 0)
     if index < 1 or index > len(candidates):
-        return None  # out of range: leave NOT_FOUND (honest)
+        return None
 
     candidate = candidates[index - 1]
     if thing == "table":
@@ -1299,9 +2372,7 @@ def _resolved_source_shapes(
     from the actual catalog only when a plan could depend on it. The
     LLM never supplies this.
     """
-    # Source shape is workspace truth, not a category hint. Cross-document
-    # planning needs it even when the LLM classified the request as mixed or
-    # document.
+
     document_ids: list[int] = []
     for item in resolution.get("references", []):
         if item.get("status") != "RESOLVED":
@@ -1319,14 +2390,8 @@ def _resolved_source_shapes(
         for doc in get_workspace_catalog(state["workspace_id"])
     }
     return {
-        document_id: bool(has_tables.get(document_id))
-        for document_id in document_ids
+        document_id: bool(has_tables.get(document_id)) for document_id in document_ids
     }
-
-
-# ---------------------------------------------------------------------------
-# Document search (with one broadened retry)
-# ---------------------------------------------------------------------------
 
 
 def _document_query(state: AgentState) -> str:
@@ -1363,9 +2428,7 @@ def _resolved_document_ids(state: AgentState) -> list[int]:
 
 
 def _document_ids_for_search(state: AgentState) -> list[int]:
-    return _resolved_document_ids(state) or list(
-        state.get("relevant_document_ids", [])
-    )
+    return _resolved_document_ids(state) or list(state.get("relevant_document_ids", []))
 
 
 def _mark_success(chunks: list[Any]) -> list[Any]:
@@ -1373,6 +2436,84 @@ def _mark_success(chunks: list[Any]) -> list[Any]:
         if isinstance(item, dict):
             item.setdefault("result_status", "SUCCESS")
     return chunks
+
+
+def _has_document_table_evidence(items: list[Any]) -> bool:
+    """
+    Return True when structured evidence already contains successful rows
+    read from a workspace table that belongs to an uploaded document.
+
+    Structured table results are document-derived evidence even when they
+    arrived through TABLE_QUERY rather than DOCUMENT_SEARCH. This keeps the
+    evidence-state logic independent of file format, table name, or domain.
+    """
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("source_type", "")).lower() != "table_query":
+            continue
+        if str(item.get("result_status", "")).upper() != "SUCCESS":
+            continue
+
+        sources = item.get("sources") or []
+        if any(
+            isinstance(source, dict)
+            and _coerce_int(source.get("document_id")) is not None
+            for source in sources
+        ):
+            return True
+
+    return False
+
+
+def _run_documents_with_coverage(
+    state: AgentState,
+    scope_ids: list[int],
+    primary_query: str,
+) -> dict[str, Any] | None:
+    """
+    Question-agnostic multi-document evidence: whole documents when they
+    fit the context budget, otherwise a fair per-document share filled with
+    the most relevant passages. Returns None if chunks cannot be loaded, so
+    the caller can fall back to ranked per-document search.
+    """
+    workspace_id = state["workspace_id"]
+
+    titles: dict[int, str] = {}
+    try:
+        for doc in get_workspace_catalog(workspace_id):
+            doc_id = _coerce_int(doc.get("document_id"))
+            if doc_id is not None:
+                titles[doc_id] = str(doc.get("title") or f"document {doc_id}")
+    except Exception:
+        logger.exception("document coverage: catalog unavailable")
+
+    def boost(document_id: int) -> tuple[set[int], bool]:
+        result = search_evidence(
+            query=primary_query,
+            workspace_id=workspace_id,
+            allowed_document_ids=[document_id],
+        )
+        if result.get("error_code"):
+            return set(), False
+        indexes = {
+            (item.get("metadata") or {}).get("chunk_index")
+            for item in result.get("evidence", [])
+        }
+        return (
+            {i for i in indexes if isinstance(i, int)},
+            bool(result.get("degraded")),
+        )
+
+    return build_document_evidence(
+        workspace_id=workspace_id,
+        document_ids=scope_ids,
+        question=str(state.get("query", "")),
+        understanding=state.get("query_understanding", {}) or {},
+        titles=titles,
+        fetch_chunks=fetch_document_chunks,
+        boost_lookup=boost,
+    )
 
 
 def _run_documents(
@@ -1383,15 +2524,30 @@ def _run_documents(
     primary_ids = _document_ids_for_search(state)
     cross_document = len(_resolved_document_ids(state)) >= 2
 
+    if len(set(primary_ids)) >= 2:
+        try:
+            covered = _run_documents_with_coverage(
+                state, sorted(set(primary_ids)), primary_query
+            )
+        except Exception:
+            logger.exception("document coverage failed; using ranked search")
+            covered = None
+        if covered is not None:
+            return {
+                "evidence": covered["evidence"],
+                "confidence": covered["confidence"],
+                "error": None,
+                "degraded": covered["degraded"],
+                "notes": covered["notes"],
+                "coverage": covered["coverage"],
+            }
+
     if cross_document:
-        # A single top-k retrieval over all documents can return every hit from
-        # one document and silently omit another source. Search each resolved
-        # document independently so cross-document reasoning has source
-        # coverage before ranking/answer generation.
         per_document = _resolved_document_ids(state)
         collected: list[Any] = []
         confidences: list[float] = []
         errors: list[tuple[str, str]] = []
+        degraded = False
 
         for document_id in per_document:
             if _past_deadline(state):
@@ -1420,18 +2576,18 @@ def _run_documents(
                 )
                 continue
 
+            degraded = degraded or bool(result.get("degraded"))
             chunks = _mark_success(list(result.get("evidence", [])))
             if chunks:
                 collected.extend(chunks[:4])
             confidences.append(float(result.get("confidence") or 0.0))
 
-        # Keep deterministic source coverage first, then enforce the normal
-        # evidence bound at the final assembly stage.
         if errors and not collected:
             return {
                 "evidence": [],
                 "confidence": 0.0,
                 "error": errors[0],
+                "degraded": degraded,
             }
 
         confidence = min(confidences) if confidences else 0.0
@@ -1439,6 +2595,7 @@ def _run_documents(
             "evidence": collected,
             "confidence": confidence,
             "error": errors[0] if errors and not collected else None,
+            "degraded": degraded,
         }
 
     result = search_evidence(
@@ -1460,6 +2617,7 @@ def _run_documents(
 
     chunks = _mark_success(list(result.get("evidence", [])))
     confidence = float(result.get("confidence") or 0.0)
+    degraded = bool(result.get("degraded"))
 
     if documents_insufficient(len(chunks), confidence, MIN_RETRIEVAL_CONFIDENCE):
         raw_query = str(state.get("query", "")).strip()
@@ -1478,8 +2636,7 @@ def _run_documents(
                 retry_ids = widened
 
         different = bool(raw_query) and (
-            raw_query != primary_query
-            or sorted(retry_ids) != sorted(primary_ids)
+            raw_query != primary_query or sorted(retry_ids) != sorted(primary_ids)
         )
 
         if different and not _past_deadline(state) and budget.try_consume():
@@ -1507,12 +2664,12 @@ def _run_documents(
                 ):
                     chunks, confidence = retry_chunks, retry_confidence
 
-    return {"evidence": chunks, "confidence": confidence, "error": None}
-
-
-# ---------------------------------------------------------------------------
-# Cross-document table evidence
-# ---------------------------------------------------------------------------
+    return {
+        "evidence": chunks,
+        "confidence": confidence,
+        "error": None,
+        "degraded": degraded,
+    }
 
 
 def _tables_used_by_table_query(table: dict[str, Any] | None) -> set[str]:
@@ -1556,7 +2713,8 @@ def _run_resolved_document_tables(
         for item in schema
         if _coerce_int(item.get("document_id")) in resolved_ids
         and str(item.get("table_name")) not in tables_used
-    ][:MAX_DOCUMENT_TABLES]
+    ]
+    candidates = _in_table_scope(state, candidates)
 
     evidence: list[dict[str, Any]] = []
     for item in candidates:
@@ -1602,9 +2760,16 @@ def _run_resolved_document_tables(
     return evidence
 
 
-# ---------------------------------------------------------------------------
-# Table query (with one SQL repair pass)
-# ---------------------------------------------------------------------------
+def _apply_table_scope(
+    state: AgentState,
+    schema: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    scope = _table_scope(state)
+    if not scope:
+        return schema
+    scoped = [item for item in schema if str(item.get("table_name")) in scope]
+
+    return scoped or schema
 
 
 def _resolved_table_names(state: AgentState) -> set[str]:
@@ -1724,6 +2889,25 @@ def _attempt_sql(
             previous_attempt=previous_attempt,
             sql_required=True,
             planner_notes=planner_notes or None,
+            query_semantics={
+                "operation": str(
+                    (state.get("query_understanding", {}) or {}).get("operation")
+                    or "answer"
+                ),
+                "population_required": _query_requires_population_context(
+                    str(state.get("query", "")),
+                    str(
+                        (state.get("query_understanding", {}) or {}).get("operation")
+                        or ""
+                    ),
+                ),
+                "requested_fields": list(
+                    (state.get("query_understanding", {}) or {}).get(
+                        "requested_fields", []
+                    )
+                    or []
+                )[:12],
+            },
         )
         if not isinstance(decision, dict):
             raise TypeError("SQL generator returned a non-object.")
@@ -1826,8 +3010,7 @@ def _describe_table_result(
         if size:
             text += f" The source data exists ({size})."
         text += (
-            " Report this as no matching records, not as missing or "
-            "inaccessible data."
+            " Report this as no matching records, not as missing or inaccessible data."
         )
         return text
 
@@ -1853,6 +3036,10 @@ def _query_semantics(
     """
     Describe what the executed SQL result means, using the actual SQL
     and planner operation rather than domain-specific assumptions.
+
+    Top-N (LIMIT N, N > 1) is recognised as a ranking, not as a plain table
+    result: the ordered rows ARE the answer and must not be treated as a
+    duplicate of the full table downstream.
     """
     normalized_sql = re.sub(r"\s+", " ", str(sql or "")).strip()
     upper_sql = normalized_sql.upper()
@@ -1888,17 +3075,58 @@ def _query_semantics(
             ),
         }
 
-    if re.search(r"\bORDER BY\b.+\bLIMIT\s+1\b", upper_sql):
-        direction = "DESC" if re.search(r"\bDESC\b\s+LIMIT\s+1\b", upper_sql) else "ASC"
+    order_limit = re.search(
+        r"\bORDER BY\b(.+?)\bLIMIT\s+(\d+|\?)(?:\s+OFFSET\s+(\d+))?",
+        upper_sql,
+    )
+    if order_limit:
+        order_clause = order_limit.group(1).strip()
+        limit_text = order_limit.group(2)
+        limit = int(limit_text) if limit_text.isdigit() else None
+        first_key = order_clause.split(",")[0].replace('"', "").strip()
+
+        if first_key in {"ROWID", "ROWID ASC", "ROWID DESC"}:
+            descending = first_key.endswith("DESC")
+            return {
+                "type": "positional",
+                "selection": f"{'last' if descending else 'first'} {limit if limit else 'N'}",
+                "basis": f"ORDER BY rowid LIMIT {limit_text}",
+                "meaning": (
+                    "The query deliberately selected rows by position from the "
+                    "whole source table; it is not evidence about the table size."
+                ),
+            }
+
+        direction = "DESC" if re.search(r"\bDESC\b", first_key) else "ASC"
+        if limit == 1:
+            meaning = (
+                "The query deliberately selected the single highest/lowest "
+                "ranked result according to its ORDER BY expression. The "
+                "returned row is the ranking result, not an arbitrary sample."
+            )
+        else:
+            meaning = (
+                "The query deliberately selected the top-ranked rows by its "
+                "ORDER BY expression. The returned rows, in the returned "
+                "order, ARE the ranking result. Do not re-rank them or "
+                "replace them with other rows of the source table."
+            )
         return {
             "type": "ranking",
             "direction": direction,
             "operation": normalized_operation,
-            "basis": "ORDER BY ... LIMIT 1",
+            "basis": f"ORDER BY ... LIMIT {limit_text}",
+            "limit": limit,
+            "meaning": meaning,
+        }
+
+    if re.search(r"\bGROUP BY\b", upper_sql):
+        return {
+            "type": "grouped",
+            "operation": normalized_operation,
+            "basis": "GROUP BY",
             "meaning": (
-                "The query deliberately selected the single highest/lowest "
-                "ranked result according to its ORDER BY expression. The "
-                "returned row is the ranking result, not an arbitrary sample."
+                "Each returned row is one group's aggregate, not a source row."
             ),
         }
 
@@ -2010,8 +3238,6 @@ def _cross_document_source_groups(
             groups.append(group)
             assigned_tables.update(str(item.get("table_name")) for item in group)
 
-    # Entity resolution is authoritative even when the entity's business
-    # table was not explicitly named as a document/table reference.
     entity_group = [
         item
         for item in schema
@@ -2046,7 +3272,7 @@ def _run_cross_document_tables(
     the SQL model incorrectly returns ``needs_sql=false`` for a request that
     the planner has already classified as requiring structured evidence.
     """
-    del budget  # Cross-document retrieval is deterministic; recovery is not needed here.
+    del budget
 
     groups = _cross_document_source_groups(state, schema)
     if len(groups) < 2:
@@ -2063,9 +3289,7 @@ def _run_cross_document_tables(
         if _past_deadline(state):
             break
 
-        # Keep each resolved document independent. MAX_DOCUMENT_TABLES is
-        # applied per document so one source cannot crowd out another.
-        for item in group[:MAX_DOCUMENT_TABLES]:
+        for item in _in_table_scope(state, group):
             if _past_deadline(state):
                 break
 
@@ -2200,23 +3424,20 @@ def _run_table(
     entities = _resolved_entity_values(state)
     is_mixed = _plan_is_mixed(state)
 
-    # Multiple resolved documents are always queried independently. This is
-    # the hard boundary that prevents cross-document SQL Cartesian products.
-    # The answer layer performs the actual cross-document reasoning later.
     if len(set(resolved_document_ids)) >= 2 or (
         resolved_table_names
-        and len({
-            _coerce_int(item.get("document_id"))
-            for item in schema
-            if str(item.get("table_name")) in resolved_table_names
-            and _coerce_int(item.get("document_id")) is not None
-        }) >= 2
+        and len(
+            {
+                _coerce_int(item.get("document_id"))
+                for item in schema
+                if str(item.get("table_name")) in resolved_table_names
+                and _coerce_int(item.get("document_id")) is not None
+            }
+        )
+        >= 2
     ):
         return _run_cross_document_tables(state, budget, schema)
 
-    # Tables that deterministic entity resolution PROVED contain the
-    # referenced entity. Workspace truth: must stay in scope regardless
-    # of which documents the user named.
     entity_location_tables = {
         str(location.get("table_name"))
         for entity in entities
@@ -2270,9 +3491,7 @@ def _run_table(
 
     if resolved_table_names:
         filtered_schema = [
-            item
-            for item in schema
-            if item.get("table_name") in resolved_table_names
+            item for item in schema if item.get("table_name") in resolved_table_names
         ]
 
         if not filtered_schema:
@@ -2302,9 +3521,6 @@ def _run_table(
 
         schema_for_sql = filtered_schema
     elif resolved_document_ids:
-        # A resolved document is the scope for its own structured evidence.
-        # Mixed requests are still kept source-scoped; cross-document requests
-        # were handled above and each source gets its own SQL call.
         filtered_schema = [
             item
             for item in schema
@@ -2338,6 +3554,7 @@ def _run_table(
     else:
         schema_for_sql = schema
 
+    schema_for_sql = _apply_table_scope(state, schema_for_sql)
     allowed = {item["table_name"] for item in schema_for_sql}
     schema_by_table = {item["table_name"]: item for item in schema_for_sql}
 
@@ -2365,8 +3582,7 @@ def _run_table(
     operation = str(
         state.get("query_understanding", {}).get("operation") or "answer"
     ).lower()
-    # Row-producing operations whose zero-row result contradicts a
-    # populated source mean the SQL is wrong, not the data.
+
     zero_rows_implies_bad_sql = (
         first["result"] is not None
         and first["result"].get("row_count", 0) == 0
@@ -2375,9 +3591,7 @@ def _run_table(
     )
 
     if (
-        failed
-        or zero_rows_for_known_entity
-        or zero_rows_implies_bad_sql
+        failed or zero_rows_for_known_entity or zero_rows_implies_bad_sql
     ) and not _past_deadline(state):
         if budget.try_consume():
             previous: dict[str, Any] = {
@@ -2412,18 +3626,12 @@ def _run_table(
                 logger.exception("table_query recovery failed")
                 second = None
 
-            if (
-                second is not None
-                and _outcome_rank(second) >= _outcome_rank(first)
-            ):
+            if second is not None and _outcome_rank(second) >= _outcome_rank(first):
                 chosen = second
 
     result = chosen["result"]
 
     if result is None:
-        # Both attempts failed. Degrade instead of failing the whole
-        # request. RETRIEVAL_ERROR matches the sufficiency module's
-        # known table statuses (TABLE_ERROR).
         logger.error("Table query failed after recovery: %s", chosen["error"])
         return {
             "evidence": [
@@ -2444,16 +3652,12 @@ def _run_table(
             "status": "RETRIEVAL_ERROR",
         }
 
-    status = (
-        "SUCCESS" if int(result.get("row_count", 0) or 0) > 0 else "NOT_FOUND"
-    )
+    status = "SUCCESS" if int(result.get("row_count", 0) or 0) > 0 else "NOT_FOUND"
     return {
         "evidence": [
             {
                 "source_type": "table_query",
                 "workspace_id": state["workspace_id"],
-                # document_id included so chat.services.sources can
-                # build citable source rows for business tables.
                 "sources": [
                     {
                         "table_name": name,
@@ -2465,12 +3669,15 @@ def _run_table(
                     }
                     for name in result.get("tables_used", [])
                 ],
-                "content": _table_content(
-                    result,
-                    schema_by_table,
-                    sql=chosen["sql"],
-                    operation=operation,
-                ),
+                "content": {
+                    **_table_content(
+                        result,
+                        schema_by_table,
+                        sql=chosen["sql"],
+                        operation=operation,
+                    ),
+                    "evidence_role": "query_result",
+                },
                 "result_status": status,
             }
         ],
@@ -2478,6 +3685,4 @@ def _run_table(
     }
 
 
-# Module-level compiled graph. chat.services.execution imports this
-# symbol, so it must exist at import time.
 agent_graph = build_agent_graph()

@@ -1,3 +1,3 @@
-from django.test import TestCase
+"""Tests module for QueryPilot."""
 
-# Create your tests here.
+from django.test import TestCase

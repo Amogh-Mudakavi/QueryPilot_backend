@@ -37,29 +37,24 @@ Flow:
 import logging
 import time
 
-from documents.ingestion.parser import (
-    LlamaParseService,
-    LlamaAdapter,
-)
-
 from documents.ingestion.chunker import (
     StructureAwareChunker,
 )
-
-from documents.ingestion.tables import (
-    TableProcessor,
+from documents.ingestion.document_profile import (
+    DocumentProfileBuilder,
 )
-
+from documents.ingestion.parser import (
+    LlamaAdapter,
+    LlamaParseService,
+)
 from documents.ingestion.sqlite import (
     SQLiteManager,
 )
-
+from documents.ingestion.tables import (
+    TableProcessor,
+)
 from documents.ingestion.vectors import (
     VectorStore,
-)
-
-from documents.ingestion.document_profile import (
-    DocumentProfileBuilder,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,10 +91,8 @@ class IngestionPipeline:
             )
 
         except Exception:
-
             logger.exception(
-                "Ingestion failed for document %s; cleaning up "
-                "partial writes.",
+                "Ingestion failed for document %s; cleaning up partial writes.",
                 document_id,
             )
 
@@ -124,7 +117,6 @@ class IngestionPipeline:
         document_id,
     ):
 
-        # Remove tables from a previous failed attempt.
         SQLiteManager.drop_document_tables(
             workspace_id=workspace_id,
             document_id=document_id,
@@ -135,16 +127,10 @@ class IngestionPipeline:
             file_hash=document.file_hash,
         )
 
-        text_nodes = LlamaAdapter.extract_text_nodes(
-            result
-        )
+        text_nodes = LlamaAdapter.extract_text_nodes(result)
 
-        table_nodes = LlamaAdapter.extract_table_nodes(
-            result
-        )
+        table_nodes = LlamaAdapter.extract_table_nodes(result)
 
-        # The raw LlamaParse result is no longer needed.
-        # Release it before chunking to reduce peak memory.
         del result
 
         logger.info(
@@ -156,11 +142,8 @@ class IngestionPipeline:
 
         chunker = StructureAwareChunker()
 
-        chunks = chunker.chunk(
-            text_nodes
-        )
+        chunks = chunker.chunk(text_nodes)
 
-        # Chunking is complete; raw per-page text is no longer needed.
         del text_nodes
 
         logger.info(
@@ -178,8 +161,7 @@ class IngestionPipeline:
         )
 
         logger.info(
-            "Document %s: chunk embedding + Chroma upsert completed "
-            "in %.2fs.",
+            "Document %s: chunk embedding + Chroma upsert completed in %.2fs.",
             document_id,
             time.monotonic() - stage_started,
         )
@@ -190,10 +172,6 @@ class IngestionPipeline:
             table_nodes,
             start=1,
         ):
-
-            # CHECKPOINT 3B: verify the exact table payload entering the
-            # structured-data stage. If values are already empty here, the
-            # problem is upstream of TableProcessor/SQLite.
             logger.info(
                 "[CHECKPOINT 3B] TABLE PROCESSOR INPUT #%d: page=%s "
                 "rows_count=%d headers=%r rows=%r.",
@@ -201,9 +179,11 @@ class IngestionPipeline:
                 table_node.get("page"),
                 len(table_node.get("rows") or []),
                 (table_node.get("rows") or [])[0]
-                if (table_node.get("rows") or []) else [],
+                if (table_node.get("rows") or [])
+                else [],
                 (table_node.get("rows") or [])[1:]
-                if len(table_node.get("rows") or []) > 1 else [],
+                if len(table_node.get("rows") or []) > 1
+                else [],
             )
 
             processed = TableProcessor.process(
@@ -214,29 +194,16 @@ class IngestionPipeline:
             if not processed:
                 continue
 
-            table_metadata.append(
-                processed["metadata"]
-            )
+            table_metadata.append(processed["metadata"])
 
-            table_name = (
-                f"ws_{workspace_id}"
-                f"_doc_{document_id}"
-                f"_table_{index}"
-            )
+            table_name = f"ws_{workspace_id}_doc_{document_id}_table_{index}"
 
-            sqlite_payload = processed[
-                "sqlite_payload"
-            ]
+            sqlite_payload = processed["sqlite_payload"]
 
-            headers = sqlite_payload[
-                "headers"
-            ]
+            headers = sqlite_payload["headers"]
 
-            rows = sqlite_payload[
-                "rows"
-            ]
+            rows = sqlite_payload["rows"]
 
-            # CHECKPOINT 4: exact payload immediately before SQLite insert.
             logger.info(
                 "[CHECKPOINT 4] SQLITE INPUT #%d: table=%s headers=%r "
                 "rows_count=%d rows=%r.",
@@ -305,29 +272,22 @@ class IngestionPipeline:
     ):
 
         try:
-
-            VectorStore.delete_document(
-                document_id=document_id
-            )
+            VectorStore.delete_document(document_id=document_id)
 
         except Exception:
-
             logger.exception(
                 "Cleanup: failed to delete vectors for document %s.",
                 document_id,
             )
 
         try:
-
             SQLiteManager.drop_document_tables(
                 workspace_id=workspace_id,
                 document_id=document_id,
             )
 
         except Exception:
-
             logger.exception(
-                "Cleanup: failed to drop SQLite tables for "
-                "document %s.",
+                "Cleanup: failed to drop SQLite tables for document %s.",
                 document_id,
-            )   
+            )

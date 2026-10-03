@@ -59,7 +59,6 @@ from typing import Any
 
 from planner.services.history import split_history
 
-
 RECENT_MESSAGES = 6
 MAX_RELEVANT_OLDER_MESSAGES = 4
 MAX_TOTAL_MESSAGES = 10
@@ -70,16 +69,45 @@ TOKEN_PATTERN = re.compile(
 )
 
 STOPWORDS = {
-    "the", "a", "an", "is", "are", "was", "were", "what", "why",
-    "how", "when", "where", "who", "which", "do", "does", "did",
-    "i", "me", "my", "you", "your", "it", "this", "that", "he",
-    "she", "they", "we", "to", "of", "in", "on", "for", "and",
-    "or", "with",
+    "the",
+    "a",
+    "an",
+    "is",
+    "are",
+    "was",
+    "were",
+    "what",
+    "why",
+    "how",
+    "when",
+    "where",
+    "who",
+    "which",
+    "do",
+    "does",
+    "did",
+    "i",
+    "me",
+    "my",
+    "you",
+    "your",
+    "it",
+    "this",
+    "that",
+    "he",
+    "she",
+    "they",
+    "we",
+    "to",
+    "of",
+    "in",
+    "on",
+    "for",
+    "and",
+    "or",
+    "with",
 }
 
-# --------------------------------------------------------------------
-# Fast path 1: "what did you say earlier?"
-# --------------------------------------------------------------------
 
 PREVIOUS_ANSWER_PATTERNS = [
     re.compile(p, re.IGNORECASE)
@@ -95,9 +123,7 @@ PREVIOUS_ANSWER_PATTERNS = [
     ]
 ]
 
-# "What did we discuss earlier?" / "Summarize what we talked about."
-# These need the whole recent conversation (+ rolling summary), not the
-# lexical/pronoun heuristics.
+
 RECAP_PATTERNS = [
     re.compile(p, re.IGNORECASE)
     for p in [
@@ -109,9 +135,6 @@ RECAP_PATTERNS = [
     ]
 ]
 
-# --------------------------------------------------------------------
-# Fast path 2 & 3: pronouns / ordinal references
-# --------------------------------------------------------------------
 
 PRONOUN_PATTERN = re.compile(
     r"\b(he|him|his|she|her|hers|they|them|their|it|its|that|this|"
@@ -127,42 +150,70 @@ ORDINAL_PATTERN = re.compile(
 )
 
 ORDINAL_WORD_TO_INDEX = {
-    "first": 0, "1st": 0,
-    "second": 1, "2nd": 1,
-    "third": 2, "3rd": 2,
-    "fourth": 3, "4th": 3,
-    "fifth": 4, "5th": 4,
+    "first": 0,
+    "1st": 0,
+    "second": 1,
+    "2nd": 1,
+    "third": 2,
+    "3rd": 2,
+    "fourth": 3,
+    "4th": 3,
+    "fifth": 4,
+    "5th": 4,
 }
 
-# Candidate entity patterns, checked in this order per message.
-# Kept deliberately simple: this is meant to catch "the thing being
-# talked about", not to be a real NER system.
+
 ENTITY_PATTERNS = [
-    # "Document A", "File 2", "Report B", quoted filenames, etc.
     re.compile(
         r"\b(document|file|doc|report|sheet|upload)s?\s*"
         r"([A-Za-z0-9]{1,3}|\"[^\"]{1,60}\"|'[^']{1,60}')",
         re.IGNORECASE,
     ),
-    # Filenames, quoted or bare: "salary_2025.xlsx", salary.xlsx
     re.compile(
         r"[\"']?([\w\-]{2,60}\.(?:xlsx|xls|csv|pdf|docx|doc|txt|md))[\"']?",
         re.IGNORECASE,
     ),
-    # Capitalized proper-noun-looking tokens (names). Sentence-initial
-    # position is excluded at extraction time (see _find_capitalized_
-    # entities) since a message's first word is almost always just a
-    # capitalized sentence-starter ("Refunds are...", "Support is...")
-    # rather than a name, and including it produced false-positive
-    # entities that outranked real ones in the trail.
 ]
 
 COMMON_CAPITALIZED_NON_ENTITIES = {
-    "What", "How", "Why", "When", "Where", "Who", "Which", "The",
-    "This", "That", "These", "Those", "Can", "Could", "Would",
-    "Should", "Please", "Thanks", "Hi", "Hello", "Okay", "Yes", "No",
-    "Sure", "Here", "There", "It", "If", "So", "But", "And", "Also",
-    "Note", "Currently", "Unfortunately", "Yes", "No", "Ok",
+    "What",
+    "How",
+    "Why",
+    "When",
+    "Where",
+    "Who",
+    "Which",
+    "The",
+    "This",
+    "That",
+    "These",
+    "Those",
+    "Can",
+    "Could",
+    "Would",
+    "Should",
+    "Please",
+    "Thanks",
+    "Hi",
+    "Hello",
+    "Okay",
+    "Yes",
+    "No",
+    "Sure",
+    "Here",
+    "There",
+    "It",
+    "If",
+    "So",
+    "But",
+    "And",
+    "Also",
+    "Note",
+    "Currently",
+    "Unfortunately",
+    "Yes",
+    "No",
+    "Ok",
 }
 
 CAPITALIZED_WORD_PATTERN = re.compile(r"\b([A-Z][a-z]{2,20})\b")
@@ -218,8 +269,7 @@ def conversation_memory(
         selected = normalized[-MAX_TOTAL_MESSAGES:]
         result: dict[str, Any] = {
             "messages": [
-                {"role": item["role"], "content": item["content"]}
-                for item in selected
+                {"role": item["role"], "content": item["content"]} for item in selected
             ],
             "message_count": len(selected),
             "used_recent_messages": len(selected),
@@ -237,9 +287,9 @@ def conversation_memory(
     if summary_message is not None:
         summary_text = str(summary_message.get("content", "")).strip()
         if summary_text:
-            result["messages"] = [
-                {"role": "system", "content": summary_text}
-            ] + list(result.get("messages", []))
+            result["messages"] = [{"role": "system", "content": summary_text}] + list(
+                result.get("messages", [])
+            )
             result["message_count"] = len(result["messages"])
             result["has_summary"] = True
 
@@ -281,10 +331,6 @@ def _select_messages(
     if not normalized:
         return _empty_result()
 
-    # --- Fast path 1: previous-answer lookup -----------------------
-    # Not evidence retrieval, not a scored search. If the user is
-    # asking what the assistant just said, just hand back the last
-    # assistant message and stop.
     if _matches_previous_answer_request(query):
         last_assistant = _last_assistant_message(normalized)
         if last_assistant is not None:
@@ -300,8 +346,6 @@ def _select_messages(
                 "used_relevant_older_messages": 0,
                 "resolution": "previous_answer",
             }
-        # No assistant message exists yet -- fall through to normal
-        # handling rather than returning nothing useful.
 
     recent = normalized[-RECENT_MESSAGES:]
     recent_indices = {item["index"] for item in recent}
@@ -310,10 +354,6 @@ def _select_messages(
     resolution_notes: list[str] = []
     anchor_indices: set[int] = set()
 
-    # --- Fast path 2: ordinal / positional reference ----------------
-    # "the second one", "the other file" -- resolved against an
-    # ordered trail of entity mentions across the WHOLE conversation,
-    # not just recent/older-by-lexical-overlap.
     if ORDINAL_PATTERN.search(query):
         trail = _build_entity_trail(normalized)
         ordinal_anchor = _resolve_ordinal(query, trail)
@@ -321,24 +361,12 @@ def _select_messages(
             anchor_indices.add(ordinal_anchor)
             resolution_notes.append("ordinal_reference")
 
-    # --- Fast path 3: pronoun / demonstrative reference --------------
-    # "he", "she", "it", "that" -- anchor on the turn where the most
-    # recently-mentioned entity (relative to the query, i.e. earlier
-    # in the conversation) was introduced. A pronoun's antecedent by
-    # definition doesn't share words with the pronoun, so lexical
-    # overlap can't find it; entity-trail recency can.
     if PRONOUN_PATTERN.search(query) and not anchor_indices:
         trail = _build_entity_trail(normalized)
         if trail:
             anchor_indices.add(trail[-1].index)
             resolution_notes.append("pronoun_reference")
 
-    # Expand each anchor to include the turn immediately before AND
-    # after it -- an entity might be named in the question ("What is
-    # Rahul's salary?") with the actual useful fact in the answer
-    # that follows, or named in the answer with the question that
-    # prompted it needed for context. Grabbing both neighbors covers
-    # either direction without needing to know which.
     expanded_anchor_indices: set[int] = set()
     normalized_by_index = {item["index"]: item for item in normalized}
     for idx in anchor_indices:
@@ -353,17 +381,10 @@ def _select_messages(
         if idx in normalized_by_index and idx not in recent_indices
     ]
 
-    # --- Fast path 4: lexical fallback -------------------------------
-    # Only used to fill remaining budget, and only for genuinely
-    # topical old-turn lookups -- not relied on for pronoun/ordinal
-    # resolution anymore.
     remaining_older = [
-        item for item in older
-        if item["index"] not in expanded_anchor_indices
+        item for item in older if item["index"] not in expanded_anchor_indices
     ]
-    lexical_budget = max(
-        0, MAX_RELEVANT_OLDER_MESSAGES - len(anchor_messages)
-    )
+    lexical_budget = max(0, MAX_RELEVANT_OLDER_MESSAGES - len(anchor_messages))
     selected_lexical = (
         _select_relevant_older_messages(
             query=query,
@@ -392,8 +413,7 @@ def _select_messages(
 
     return {
         "messages": [
-            {"role": item["role"], "content": item["content"]}
-            for item in selected
+            {"role": item["role"], "content": item["content"]} for item in selected
         ],
         "message_count": len(selected),
         "used_recent_messages": len(recent),
@@ -426,10 +446,6 @@ def _normalize_history(
         role = message.get("role")
         content = message.get("content")
 
-        # Content must genuinely be a string -- silently str()-coercing
-        # a non-string value (e.g. an int, None, a dict) would let
-        # malformed upstream data turn into a fake "message" the
-        # agent then treats as real conversation content.
         if not isinstance(role, str) or not isinstance(content, str):
             continue
 
@@ -513,7 +529,7 @@ def _find_capitalized_entities(content: str) -> list[str]:
 
     for sentence in sentences:
         words = sentence.split()
-        # Skip index 0 (sentence-initial) for this sentence.
+
         for word in words[1:]:
             match = CAPITALIZED_WORD_PATTERN.match(word.strip(".,!?;:\"'()"))
             if not match:
@@ -542,8 +558,6 @@ def _resolve_ordinal(
     lowered = query.lower()
 
     if "other" in lowered and "second" not in lowered:
-        # "the other one" with exactly two distinct entities so far
-        # -> the one that ISN'T the most recently mentioned.
         distinct = _distinct_entities_in_order(trail)
         if len(distinct) >= 2:
             return distinct[-2].index
@@ -672,17 +686,17 @@ def _cap_total_messages(
         return selected
 
     must_keep = [
-        item for item in selected
+        item
+        for item in selected
         if item["index"] in recent_indices or item["index"] in anchor_indices
     ]
     fallback_only = [
-        item for item in selected
+        item
+        for item in selected
         if item["index"] not in recent_indices and item["index"] not in anchor_indices
     ]
 
     if len(must_keep) >= limit:
-        # Even recent+anchors alone don't fit -- keep the most
-        # recent `limit` of those rather than an arbitrary cut.
         return sorted(must_keep, key=lambda i: i["index"])[-limit:]
 
     room_for_fallback = limit - len(must_keep)

@@ -60,10 +60,7 @@ def build_sources(
 
         metadata = item.get("metadata") or {}
 
-        document_id = (
-            item.get("document_id")
-            or metadata.get("document_id")
-        )
+        document_id = item.get("document_id") or metadata.get("document_id")
 
         if document_id is not None:
             try:
@@ -71,10 +68,7 @@ def build_sources(
             except (TypeError, ValueError):
                 pass
 
-        sources_list = (
-            item.get("sources")
-            or metadata.get("sources")
-        )
+        sources_list = item.get("sources") or metadata.get("sources")
 
         if isinstance(sources_list, list):
             for src in sources_list:
@@ -91,32 +85,20 @@ def build_sources(
                 except (TypeError, ValueError):
                     continue
 
-    # ---------------------------------------------------------
-    # Resolve only documents belonging to the active workspace.
-    # ---------------------------------------------------------
-
     document_names: dict[int, str] = {}
 
     if document_ids:
-        documents = (
-            Document.objects.filter(
-                id__in=document_ids,
-                workspace_id=workspace_id,
-            )
-            .only(
-                "id",
-                "title",
-            )
+        documents = Document.objects.filter(
+            id__in=document_ids,
+            workspace_id=workspace_id,
+        ).only(
+            "id",
+            "title",
         )
 
-        document_names = {
-            document.id: document.title
-            for document in documents
-        }
+        document_names = {document.id: document.title for document in documents}
 
-    valid_document_ids = set(
-        document_names.keys()
-    )
+    valid_document_ids = set(document_names.keys())
 
     sources: list[dict[str, Any]] = []
 
@@ -131,13 +113,6 @@ def build_sources(
 
         rows_for_item: list[dict[str, Any]] = []
 
-        # ---------------------------------------------------------
-        # Case 0:
-        # Product knowledge is a real, citable source even though it
-        # is not a workspace document. Without this row, every answer
-        # from PRODUCT_KNOWLEDGE carries an invalid citation marker
-        # (stripped downstream) and fails grounding.
-        # ---------------------------------------------------------
         if item.get("source_type") == "product_knowledge":
             rows_for_item.append(
                 {
@@ -147,15 +122,7 @@ def build_sources(
                 }
             )
 
-        # ---------------------------------------------------------
-        # Case A:
-        # Normal document evidence.
-        # ---------------------------------------------------------
-
-        document_id = (
-            item.get("document_id")
-            or metadata.get("document_id")
-        )
+        document_id = item.get("document_id") or metadata.get("document_id")
 
         if document_id is not None:
             try:
@@ -163,46 +130,24 @@ def build_sources(
             except (TypeError, ValueError):
                 document_id = None
 
-        if (
-            document_id is not None
-            and document_id in valid_document_ids
-        ):
+        if document_id is not None and document_id in valid_document_ids:
             row: dict[str, Any] = {
                 "document_id": document_id,
-                "document_name": document_names[
-                    document_id
-                ],
+                "document_name": document_names[document_id],
                 "source_type": (
-                    item.get("source_type")
-                    or metadata.get("type")
-                    or "document"
+                    item.get("source_type") or metadata.get("type") or "document"
                 ),
             }
 
-            chunk_index = (
-                item.get("chunk_index")
-                or metadata.get("chunk_index")
-            )
+            chunk_index = item.get("chunk_index") or metadata.get("chunk_index")
 
-            page_start = (
-                item.get("page_start")
-                or metadata.get("page_start")
-            )
+            page_start = item.get("page_start") or metadata.get("page_start")
 
-            page_end = (
-                item.get("page_end")
-                or metadata.get("page_end")
-            )
+            page_end = item.get("page_end") or metadata.get("page_end")
 
-            heading = (
-                item.get("heading")
-                or metadata.get("heading")
-            )
+            heading = item.get("heading") or metadata.get("heading")
 
-            table_name = (
-                item.get("table_name")
-                or metadata.get("table_name")
-            )
+            table_name = item.get("table_name") or metadata.get("table_name")
 
             if chunk_index is not None:
                 row["chunk_index"] = chunk_index
@@ -221,16 +166,7 @@ def build_sources(
 
             rows_for_item.append(row)
 
-        # ---------------------------------------------------------
-        # Case B:
-        # Table-query style evidence with an embedded `sources`
-        # list of per-table {document_id, table_name}.
-        # ---------------------------------------------------------
-
-        sources_list = (
-            item.get("sources")
-            or metadata.get("sources")
-        )
+        sources_list = item.get("sources") or metadata.get("sources")
 
         if isinstance(sources_list, list):
             for src in sources_list:
@@ -254,9 +190,7 @@ def build_sources(
 
                 table_row: dict[str, Any] = {
                     "document_id": doc_id,
-                    "document_name": document_names[
-                        doc_id
-                    ],
+                    "document_name": document_names[doc_id],
                     "source_type": "table",
                 }
 
@@ -264,10 +198,6 @@ def build_sources(
                     table_row["table_name"] = table_name
 
                 rows_for_item.append(table_row)
-
-        # ---------------------------------------------------------
-        # Dedupe rows produced within this one evidence item only.
-        # ---------------------------------------------------------
 
         seen_row_keys: set[tuple[Any, ...]] = set()
 

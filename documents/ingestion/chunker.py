@@ -16,37 +16,20 @@ inside a section when that section is too big to embed as one chunk.
 import re
 from dataclasses import dataclass, field
 
-
-# Rough chars-per-token ratio for English text. We deliberately do not
-# pull in tiktoken here - the project rule is no external chunking
-# frameworks, and this approximation is within ~10-15% of real GPT/Claude
-# tokenizers, which is accurate enough for sizing chunks. Being off by a
-# little just means a chunk is slightly bigger or smaller than the target;
-# it never breaks correctness.
 CHARS_PER_TOKEN = 4
 
-# Target and hard-limit chunk sizes, in estimated tokens.
+
 DEFAULT_MAX_TOKENS = 500
 DEFAULT_OVERLAP_SENTENCES = 2
 
-# Matches markdown headings LlamaParse emits, e.g. "# Revenue Growth",
-# "## Note 3. Income Taxes". Captures the heading level (number of #s)
-# and the heading text separately.
+
 MARKDOWN_HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
 
-# Fallback for text that reaches the chunker without markdown heading
-# markers - e.g. if the adapter ever passes through raw paragraph_title
-# text without prefixing it with '#'. Two patterns:
-#   1. Numbered section headings: "1.", "1.1", "3.2.1 Income Taxes"
-#   2. Short ALL-CAPS lines, which annual reports use heavily for
-#      section titles: "CONSOLIDATED STATEMENTS OF OPERATIONS"
+
 NUMBERED_HEADING_PATTERN = re.compile(r"^\d+(\.\d+)*\.?\s+\S.*$")
 ALL_CAPS_HEADING_PATTERN = re.compile(r"^[A-Z][A-Z0-9 ,&/\-()]{3,80}$")
 
-# Splits on sentence-ending punctuation followed by whitespace. Not
-# perfect (won't handle "Mr. Smith" correctly), but good enough for
-# chunk-boundary purposes where an occasional over-split sentence is
-# harmless - it only affects where we cut, not what gets lost.
+
 SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.!?])\s+")
 
 
@@ -186,20 +169,9 @@ class StructureAwareChunker:
 
                 if heading_text is not None:
                     if current is not None and current.content.strip():
-                        # Current section has real content under it -
-                        # close it out and start a fresh section for the
-                        # new heading.
                         sections.append(current)
                         current = Section(heading=heading_text, pages=[page])
                     elif current is not None:
-                        # Current section is still empty (e.g. we just
-                        # saw "# Apple Inc." and this line is the very
-                        # next heading, "## CONSOLIDATED STATEMENTS OF
-                        # OPERATIONS"). Two headings in a row with no
-                        # content between them are really one combined
-                        # heading, not an empty section followed by a
-                        # new one - so fold the old heading text into
-                        # the new heading instead of discarding it.
                         current = Section(
                             heading=f"{current.heading} - {heading_text}",
                             pages=current.pages,
@@ -409,9 +381,6 @@ class StructureAwareChunker:
         if len(pieces) <= 1 or self.overlap_sentences <= 0:
             return pieces
 
-        # Overlap should stay a minority of a chunk's budget - otherwise
-        # it stops being "a bit of shared context" and starts being most
-        # of the chunk. Capped at 25% of max_tokens.
         overlap_token_budget = self.max_tokens // 4
 
         overlapped = [pieces[0]]

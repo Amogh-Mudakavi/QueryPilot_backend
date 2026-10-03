@@ -22,10 +22,6 @@ from typing import Any
 
 from chat.services.sources import build_sources
 
-
-# Citation markers are always the exact form [n], where n is a positive
-# integer with at most three digits. Evidence is bounded upstream, so this
-# also keeps malformed/high-width markers out of the normal path.
 CITATION_MARKER_PATTERN = re.compile(r"\[(\d{1,3})\]")
 
 
@@ -39,10 +35,7 @@ def find_marker_numbers(answer: str) -> set[int]:
     if not answer:
         return set()
 
-    return {
-        int(match.group(1))
-        for match in CITATION_MARKER_PATTERN.finditer(answer)
-    }
+    return {int(match.group(1)) for match in CITATION_MARKER_PATTERN.finditer(answer)}
 
 
 def extract_citations(
@@ -84,32 +77,3 @@ def extract_citations(
     ]
 
     return sources, citations
-
-
-def citations_are_valid(
-    *,
-    answer: str,
-    evidence: list[Any],
-    workspace_id: int,
-) -> bool:
-    """
-    Return whether every citation marker in ``answer`` maps to a real source.
-
-    This checks citation-index validity only. It does not determine whether a
-    particular factual claim is semantically supported by that source.
-    """
-    markers = find_marker_numbers(answer)
-    if not markers:
-        return False
-
-    sources = build_sources(evidence, workspace_id=workspace_id)
-    if not sources:
-        return False
-
-    valid_indices = {
-        int(source["index"])
-        for source in sources
-        if isinstance(source, dict) and isinstance(source.get("index"), int)
-    }
-
-    return markers.issubset(valid_indices)

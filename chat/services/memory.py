@@ -37,20 +37,12 @@ from chat.models import (
 )
 from llm.router import router
 
-
-# ---------------------------------------------------------
-# Memory policy
-# ---------------------------------------------------------
-
-# The planner receives the latest 10 actual messages verbatim.
 RECENT_MESSAGE_LIMIT = 10
 
-# Keep the generated summary compact so it does not become a second
-# large conversation history.
+
 MAX_SUMMARY_CHARS = 6000
 
-# Bound the amount of existing summary and message content sent to the
-# summarization model in one call.
+
 MAX_EXISTING_SUMMARY_CHARS = 5000
 MAX_MESSAGE_CHARS = 3000
 
@@ -115,8 +107,7 @@ def get_recent_messages(
     messages = list(
         Message.objects.filter(
             conversation=conversation,
-        )
-        .order_by("-created_at", "-id")[:limit]
+        ).order_by("-created_at", "-id")[:limit]
     )
 
     messages.reverse()
@@ -145,10 +136,7 @@ def get_unsummarized_messages(
         limit=RECENT_MESSAGE_LIMIT,
     )
 
-    recent_ids = {
-        message.id
-        for message in recent_messages
-    }
+    recent_ids = {message.id for message in recent_messages}
 
     queryset = Message.objects.filter(
         conversation=conversation,
@@ -162,11 +150,7 @@ def get_unsummarized_messages(
             id__gt=memory.summarized_until_message_id,
         )
 
-    messages = [
-        message
-        for message in queryset
-        if message.id not in recent_ids
-    ]
+    messages = [message for message in queryset if message.id not in recent_ids]
 
     return messages
 
@@ -192,9 +176,7 @@ def _format_messages_for_summary(
 
         content = content[:MAX_MESSAGE_CHARS]
 
-        parts.append(
-            f"{message.role}: {content}"
-        )
+        parts.append(f"{message.role}: {content}")
 
     return "\n\n".join(parts)
 
@@ -212,16 +194,12 @@ def _generate_updated_summary(
     It exists only to compress conversational context.
     """
 
-    message_context = _format_messages_for_summary(
-        messages
-    )
+    message_context = _format_messages_for_summary(messages)
 
     if not message_context:
         return existing_summary.strip()
 
-    existing_summary = (
-        existing_summary or ""
-    ).strip()[:MAX_EXISTING_SUMMARY_CHARS]
+    existing_summary = (existing_summary or "").strip()[:MAX_EXISTING_SUMMARY_CHARS]
 
     prompt_parts = [
         "CURRENT ROLLING SUMMARY:",
@@ -253,23 +231,11 @@ def _generate_updated_summary(
     )
 
     try:
-        summary = (
-            response
-            .choices[0]
-            .message
-            .content
-            .strip()
-        )
+        summary = response.choices[0].message.content.strip()
     except (
         AttributeError,
         IndexError,
     ) as exc:
-        # Raise instead of returning the OLD summary: the caller advances
-        # the checkpoint on success, which would mark these messages as
-        # summarized even though nothing was incorporated (silent loss of
-        # context). update_rolling_summary() catches this, leaves the
-        # checkpoint alone and retries on the next turn. The chat request
-        # itself is unaffected.
         raise ValueError("Summarizer returned an invalid response.") from exc
 
     if not summary:
@@ -324,36 +290,24 @@ def update_rolling_summary(
             messages=messages,
         )
     except Exception:
-        # Memory is an optimization for context retention, not a reason
-        # to fail the user's actual chat request.
         return False
 
     last_summarized_message = messages[-1]
 
     with transaction.atomic():
-        memory = (
-            ConversationMemory.objects
-            .select_for_update()
-            .get(
-                pk=memory.pk,
-            )
+        memory = ConversationMemory.objects.select_for_update().get(
+            pk=memory.pk,
         )
 
-        # Re-check the checkpoint after acquiring the lock. Another
-        # request may have updated the same memory record concurrently.
         current_checkpoint = memory.summarized_until_message_id
         if (
             current_checkpoint is not None
             and current_checkpoint >= last_summarized_message.id
         ):
-            # Already at or past this point (a concurrent request got
-            # there first). Never move the checkpoint backwards.
             return False
 
         memory.summary = new_summary
-        memory.summarized_until_message = (
-            last_summarized_message
-        )
+        memory.summarized_until_message = last_summarized_message
         memory.save(
             update_fields=[
                 "summary",
@@ -395,11 +349,7 @@ def build_memory_context(
     )
 
     return {
-        "summary": (
-            memory.summary.strip()
-            if memory.summary
-            else ""
-        ),
+        "summary": (memory.summary.strip() if memory.summary else ""),
         "recent_messages": [
             {
                 "role": message.role.lower(),

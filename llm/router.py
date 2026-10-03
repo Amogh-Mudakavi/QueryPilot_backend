@@ -1,3 +1,6 @@
+"""Router module for QueryPilot."""
+
+import logging
 from collections.abc import Iterator
 from typing import Any
 
@@ -5,9 +8,11 @@ from .config import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
     TASK_MODELS,
+    TASK_TOKEN_BUDGETS,
 )
-
 from .providers import get_provider
+
+logger = logging.getLogger(__name__)
 
 
 class LLMRouter:
@@ -37,11 +42,33 @@ class LLMRouter:
         model = TASK_MODELS.get(task)
 
         if model is None:
-            raise ValueError(
-                f"Unknown LLM task: {task}"
-            )
+            raise ValueError(f"Unknown LLM task: {task}")
 
         return model
+
+    @staticmethod
+    def _resolve_max_tokens(task: str, max_tokens: int | None) -> int:
+        if max_tokens is not None:
+            return max_tokens
+        budget = TASK_TOKEN_BUDGETS.get(task, {})
+        return int(budget.get("completion", DEFAULT_MAX_TOKENS))
+
+    @staticmethod
+    def _check_input_budget(task: str, messages: list[dict[str, str]]) -> None:
+        """Log (never truncate) when a request exceeds its input target."""
+        target = TASK_TOKEN_BUDGETS.get(task, {}).get("input")
+        if not target:
+            return
+        chars = sum(len(str(m.get("content", ""))) for m in messages or [])
+        estimate = (chars + 3) // 4
+        if estimate > target:
+            logger.warning(
+                "[LLM_BUDGET] task=%s estimated_input_tokens=%d exceeds "
+                "target=%d; reduce evidence/history instead of raising limits",
+                task,
+                estimate,
+                target,
+            )
 
     def generate(
         self,
@@ -61,21 +88,14 @@ class LLMRouter:
         """
 
         model = self._get_model(task)
+        self._check_input_budget(task, messages)
 
         return self.provider.generate(
             task=task,
             model=model,
             messages=messages,
-            temperature=(
-                DEFAULT_TEMPERATURE
-                if temperature is None
-                else temperature
-            ),
-            max_tokens=(
-                DEFAULT_MAX_TOKENS
-                if max_tokens is None
-                else max_tokens
-            ),
+            temperature=(DEFAULT_TEMPERATURE if temperature is None else temperature),
+            max_tokens=self._resolve_max_tokens(task, max_tokens),
             response_format=response_format,
             stream=stream,
             include_reasoning=include_reasoning,
@@ -98,24 +118,16 @@ class LLMRouter:
         """
 
         model = self._get_model(task)
+        self._check_input_budget(task, messages)
 
         return self.provider.generate_text_stream(
             task=task,
             model=model,
             messages=messages,
-            temperature=(
-                DEFAULT_TEMPERATURE
-                if temperature is None
-                else temperature
-            ),
-            max_tokens=(
-                DEFAULT_MAX_TOKENS
-                if max_tokens is None
-                else max_tokens
-            ),
+            temperature=(DEFAULT_TEMPERATURE if temperature is None else temperature),
+            max_tokens=self._resolve_max_tokens(task, max_tokens),
             include_reasoning=include_reasoning,
         )
 
 
 router = LLMRouter()
-LLMRouter = LLMRouter

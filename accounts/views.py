@@ -1,3 +1,5 @@
+"""Views module for QueryPilot."""
+
 import logging
 from datetime import timedelta
 
@@ -12,13 +14,13 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from utils.auth_utils import (
+    clear_login_rate_limits,
     decode_token,
     generate_access_token,
     generate_refresh_token,
     hash_refresh_token,
-    refresh_token_expires_at,
     login_rate_limited,
-    clear_login_rate_limits,
+    refresh_token_expires_at,
 )
 from utils.email_utils import (
     can_send_otp,
@@ -39,13 +41,11 @@ from .serializers import (
     VerifyOTPSerializer,
 )
 
-
 logger = logging.getLogger(__name__)
 
 
 def _client_ip(request):
-    # REMOTE_ADDR is used intentionally. Do not trust a client-supplied
-    # X-Forwarded-For value for abuse controls until the proxy is trusted.
+
     return request.META.get("REMOTE_ADDR")
 
 
@@ -93,48 +93,35 @@ class RequestRegisterView(APIView):
 
         if not can_send_otp(email, ip_address):
             return Response(
-                {
-                    "error": "Please wait before requesting another OTP."
-                },
+                {"error": "Please wait before requesting another OTP."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         if not check_hourly_limit(email, ip_address):
             return Response(
-                {
-                    "error": (
-                        "Maximum OTP limit reached. "
-                        "Please try again later."
-                    )
-                },
+                {"error": ("Maximum OTP limit reached. Please try again later.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         otp = generate_otp()
 
-        hashed_password = make_password(
-            serializer.validated_data["password"]
-        )
+        hashed_password = make_password(serializer.validated_data["password"])
 
         hashed_otp = hash_otp(otp)
 
         now = timezone.now()
-        otp_expires_at = now + timedelta(
-            minutes=settings.OTP_LIFETIME_MINUTES
-        )
+        otp_expires_at = now + timedelta(minutes=settings.OTP_LIFETIME_MINUTES)
         pending_expires_at = _pending_registration_expires_at(now)
 
         try:
             with transaction.atomic():
-                PendingRegistration.objects.filter(
-                    email=email
-                ).delete()
+                PendingRegistration.objects.filter(email=email).delete()
 
                 EmailOTP.objects.filter(
                     email=email,
                     purpose="register",
                     is_used=False,
-                ).delete()
+                ).update(is_used=True)
 
                 PendingRegistration.objects.create(
                     username=serializer.validated_data["username"],
@@ -165,12 +152,7 @@ class RequestRegisterView(APIView):
 
         except IntegrityError:
             return Response(
-                {
-                    "error": (
-                        "Could not process registration. "
-                        "Please try again."
-                    )
-                },
+                {"error": ("Could not process registration. Please try again.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -178,12 +160,7 @@ class RequestRegisterView(APIView):
             logger.exception("Registration OTP flow failed")
 
             return Response(
-                {
-                    "error": (
-                        "Could not process registration. "
-                        "Please try again."
-                    )
-                },
+                {"error": ("Could not process registration. Please try again.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -205,20 +182,13 @@ class ResendRegistrationOTPView(APIView):
 
         if not can_send_otp(email, ip_address):
             return Response(
-                {
-                    "error": "Please wait before requesting another OTP."
-                },
+                {"error": "Please wait before requesting another OTP."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         if not check_hourly_limit(email, ip_address):
             return Response(
-                {
-                    "error": (
-                        "Maximum OTP limit reached. "
-                        "Please try again later."
-                    )
-                },
+                {"error": ("Maximum OTP limit reached. Please try again later.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -227,8 +197,7 @@ class ResendRegistrationOTPView(APIView):
         try:
             with transaction.atomic():
                 pending_user = (
-                    PendingRegistration.objects
-                    .select_for_update()
+                    PendingRegistration.objects.select_for_update()
                     .filter(email__iexact=email)
                     .first()
                 )
@@ -237,17 +206,14 @@ class ResendRegistrationOTPView(APIView):
                     return Response(
                         {
                             "error": (
-                                "No active registration found. "
-                                "Please register again."
+                                "No active registration found. Please register again."
                             )
                         },
                         status=status.HTTP_400_BAD_REQUEST,
                     )
 
                 if pending_user.expires_at <= now:
-                    PendingRegistration.objects.filter(
-                        pk=pending_user.pk
-                    ).delete()
+                    PendingRegistration.objects.filter(pk=pending_user.pk).delete()
 
                     EmailOTP.objects.filter(
                         email__iexact=email,
@@ -256,28 +222,20 @@ class ResendRegistrationOTPView(APIView):
                     ).delete()
 
                     return Response(
-                        {
-                            "error": (
-                                "Registration expired. "
-                                "Please register again."
-                            )
-                        },
+                        {"error": ("Registration expired. Please register again.")},
                         status=status.HTTP_400_BAD_REQUEST,
                     )
 
                 otp = generate_otp()
                 hashed_otp = hash_otp(otp)
 
-                otp_expires_at = now + timedelta(
-                    minutes=settings.OTP_LIFETIME_MINUTES
-                )
+                otp_expires_at = now + timedelta(minutes=settings.OTP_LIFETIME_MINUTES)
 
-                # Invalidate the previous challenge before creating the new one.
                 EmailOTP.objects.filter(
                     email__iexact=email,
                     purpose="register",
                     is_used=False,
-                ).delete()
+                ).update(is_used=True)
 
                 EmailOTP.objects.create(
                     email=email,
@@ -287,12 +245,8 @@ class ResendRegistrationOTPView(APIView):
                     last_sent_ip=ip_address,
                 )
 
-                # Extend the draft too, so the user has a fresh window to
-                # complete the registration after the resend.
                 pending_user.expires_at = _pending_registration_expires_at(now)
-                pending_user.save(
-                    update_fields=["expires_at"]
-                )
+                pending_user.save(update_fields=["expires_at"])
 
                 send_otp_email(email, otp)
 
@@ -310,12 +264,7 @@ class ResendRegistrationOTPView(APIView):
             logger.exception("Registration OTP resend flow failed")
 
             return Response(
-                {
-                    "error": (
-                        "Could not resend the OTP. "
-                        "Please try again."
-                    )
-                },
+                {"error": ("Could not resend the OTP. Please try again.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -338,8 +287,7 @@ class VerifyOTP(APIView):
         try:
             with transaction.atomic():
                 otp_record = (
-                    EmailOTP.objects
-                    .select_for_update()
+                    EmailOTP.objects.select_for_update()
                     .filter(
                         email=email,
                         purpose="register",
@@ -353,13 +301,8 @@ class VerifyOTP(APIView):
 
                 if otp_record.expires_at < timezone.now():
                     otp_record.is_used = True
-                    otp_record.save(
-                        update_fields=["is_used"]
-                    )
+                    otp_record.save(update_fields=["is_used"])
 
-                    # Keep the pending registration alive until its own TTL.
-                    # The user can now request a fresh OTP instead of being
-                    # forced to restart the entire registration flow.
                     return _invalid_otp_response()
 
                 if (
@@ -367,12 +310,7 @@ class VerifyOTP(APIView):
                     >= settings.OTP_MAX_VERIFICATION_ATTEMPTS
                 ):
                     return Response(
-                        {
-                            "error": (
-                                "Maximum verification attempts "
-                                "reached."
-                            )
-                        },
+                        {"error": ("Maximum verification attempts reached.")},
                         status=status.HTTP_403_FORBIDDEN,
                     )
 
@@ -380,12 +318,8 @@ class VerifyOTP(APIView):
                     otp,
                     otp_record.otp,
                 ):
-                    EmailOTP.objects.filter(
-                        pk=otp_record.pk
-                    ).update(
-                        verification_attempts=F(
-                            "verification_attempts"
-                        ) + 1
+                    EmailOTP.objects.filter(pk=otp_record.pk).update(
+                        verification_attempts=F("verification_attempts") + 1
                     )
 
                     otp_record.refresh_from_db()
@@ -405,24 +339,16 @@ class VerifyOTP(APIView):
                     )
 
                 pending_user = (
-                    PendingRegistration.objects
-                    .select_for_update()
+                    PendingRegistration.objects.select_for_update()
                     .filter(email=email)
                     .first()
                 )
 
-                if (
-                    pending_user is None
-                    or pending_user.expires_at < timezone.now()
-                ):
+                if pending_user is None or pending_user.expires_at < timezone.now():
                     otp_record.is_used = True
-                    otp_record.save(
-                        update_fields=["is_used"]
-                    )
+                    otp_record.save(update_fields=["is_used"])
 
-                    PendingRegistration.objects.filter(
-                        email=email
-                    ).delete()
+                    PendingRegistration.objects.filter(email=email).delete()
 
                     return _invalid_otp_response()
 
@@ -433,27 +359,18 @@ class VerifyOTP(APIView):
                 )
 
                 otp_record.is_used = True
-                otp_record.save(
-                    update_fields=["is_used"]
-                )
+                otp_record.save(update_fields=["is_used"])
 
                 pending_user.delete()
 
             return Response(
-                {
-                    "message": "Account created successfully."
-                },
+                {"message": "Account created successfully."},
                 status=status.HTTP_201_CREATED,
             )
 
         except IntegrityError:
             return Response(
-                {
-                    "error": (
-                        "Could not create account. "
-                        "Please try again."
-                    )
-                },
+                {"error": ("Could not create account. Please try again.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -461,12 +378,7 @@ class VerifyOTP(APIView):
             logger.exception("Account creation failed")
 
             return Response(
-                {
-                    "error": (
-                        "Could not create account. "
-                        "Please try again."
-                    )
-                },
+                {"error": ("Could not create account. Please try again.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -496,9 +408,7 @@ class ForgotPasswordRequestView(APIView):
             status=status.HTTP_200_OK,
         )
 
-        if not User.objects.filter(
-            email=email
-        ).exists():
+        if not User.objects.filter(email=email).exists():
             return generic_response
 
         if not can_send_otp(
@@ -517,9 +427,7 @@ class ForgotPasswordRequestView(APIView):
 
         hashed_otp = hash_otp(otp)
 
-        expires_at = timezone.now() + timedelta(
-            minutes=settings.OTP_LIFETIME_MINUTES
-        )
+        expires_at = timezone.now() + timedelta(minutes=settings.OTP_LIFETIME_MINUTES)
 
         try:
             with transaction.atomic():
@@ -527,7 +435,7 @@ class ForgotPasswordRequestView(APIView):
                     is_used=False,
                     purpose="reset_password",
                     email=email,
-                ).delete()
+                ).update(is_used=True)
 
                 EmailOTP.objects.create(
                     email=email,
@@ -540,9 +448,7 @@ class ForgotPasswordRequestView(APIView):
                 send_otp_email(email, otp)
 
         except Exception:
-            logger.exception(
-                "Password reset OTP flow failed"
-            )
+            logger.exception("Password reset OTP flow failed")
 
         return generic_response
 
@@ -551,9 +457,7 @@ class ResetPasswordView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        serializer = ResetPasswordSerializer(
-            data=request.data
-        )
+        serializer = ResetPasswordSerializer(data=request.data)
 
         if not serializer.is_valid():
             return Response(
@@ -568,8 +472,7 @@ class ResetPasswordView(APIView):
         try:
             with transaction.atomic():
                 otp_record = (
-                    EmailOTP.objects
-                    .select_for_update()
+                    EmailOTP.objects.select_for_update()
                     .filter(
                         email=email,
                         purpose="reset_password",
@@ -583,9 +486,7 @@ class ResetPasswordView(APIView):
 
                 if otp_record.expires_at < timezone.now():
                     otp_record.is_used = True
-                    otp_record.save(
-                        update_fields=["is_used"]
-                    )
+                    otp_record.save(update_fields=["is_used"])
 
                     return _invalid_otp_response()
 
@@ -593,97 +494,49 @@ class ResetPasswordView(APIView):
                     otp_record.verification_attempts
                     >= settings.OTP_MAX_VERIFICATION_ATTEMPTS
                 ):
-                    return Response(
-                        {
-                            "error": (
-                                "Maximum verification attempts "
-                                "exceeded."
-                            )
-                        },
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
+                    return _invalid_otp_response()
 
                 if not verify_otp(
                     otp,
                     otp_record.otp,
                 ):
-                    EmailOTP.objects.filter(
-                        pk=otp_record.pk
-                    ).update(
-                        verification_attempts=F(
-                            "verification_attempts"
-                        ) + 1
+                    EmailOTP.objects.filter(pk=otp_record.pk).update(
+                        verification_attempts=F("verification_attempts") + 1
                     )
 
-                    otp_record.refresh_from_db()
+                    return _invalid_otp_response()
 
-                    remaining = max(
-                        settings.OTP_MAX_VERIFICATION_ATTEMPTS
-                        - otp_record.verification_attempts,
-                        0,
-                    )
-
-                    return Response(
-                        {
-                            "error": "Invalid OTP.",
-                            "remaining_attempts": remaining,
-                        },
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-
-                user = (
-                    User.objects
-                    .select_for_update()
-                    .filter(email=email)
-                    .first()
-                )
+                user = User.objects.select_for_update().filter(email=email).first()
 
                 if user is None:
                     otp_record.is_used = True
-                    otp_record.save(
-                        update_fields=["is_used"]
-                    )
+                    otp_record.save(update_fields=["is_used"])
 
                     return _invalid_otp_response()
 
                 user.set_password(new_password)
 
-                user.save(
-                    update_fields=["password"]
-                )
+                user.save(update_fields=["password"])
 
                 otp_record.is_used = True
 
-                otp_record.save(
-                    update_fields=["is_used"]
-                )
+                otp_record.save(update_fields=["is_used"])
 
                 RefreshToken.objects.filter(
                     user=user,
                     is_revoked=False,
-                ).update(
-                    is_revoked=True
-                )
+                ).update(is_revoked=True)
 
             return Response(
-                {
-                    "message": "Password reset successfully."
-                },
+                {"message": "Password reset successfully."},
                 status=status.HTTP_200_OK,
             )
 
         except Exception:
-            logger.exception(
-                "Password reset failed"
-            )
+            logger.exception("Password reset failed")
 
             return Response(
-                {
-                    "error": (
-                        "Could not reset password. "
-                        "Please try again."
-                    )
-                },
+                {"error": ("Could not reset password. Please try again.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -692,42 +545,28 @@ class LoginView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        raw_email = request.data.get(
-            "email",
-            ""
-        )
+        data = request.data if isinstance(request.data, dict) else {}
 
-        email = (
-            raw_email.strip().lower()
-            if isinstance(raw_email, str)
-            else ""
-        )
+        raw_email = data.get("email", "")
+
+        email = raw_email.strip().lower() if isinstance(raw_email, str) else ""
 
         ip_address = _client_ip(request)
 
-        if email and login_rate_limited(
+        if login_rate_limited(
             email,
             ip_address,
         ):
             return Response(
-                {
-                    "error": (
-                        "Too many login attempts. "
-                        "Please try again later."
-                    )
-                },
+                {"error": ("Too many login attempts. Please try again later.")},
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
             )
 
-        serializer = LoginSerializer(
-            data=request.data
-        )
+        serializer = LoginSerializer(data=data)
 
         if not serializer.is_valid():
             return Response(
-                {
-                    "error": "Invalid credentials."
-                },
+                {"error": "Invalid credentials."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -738,19 +577,13 @@ class LoginView(APIView):
             ip_address,
         )
 
-        access_token = generate_access_token(
-            user
-        )
+        access_token = generate_access_token(user)
 
-        refresh_token = generate_refresh_token(
-            user
-        )
+        refresh_token = generate_refresh_token(user)
 
         RefreshToken.objects.create(
             user=user,
-            token=hash_refresh_token(
-                refresh_token
-            ),
+            token=hash_refresh_token(refresh_token),
             expires_at=refresh_token_expires_at(),
         )
 
@@ -784,9 +617,7 @@ class RefreshView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        serializer = RefreshSerializer(
-            data=request.data
-        )
+        serializer = RefreshSerializer(data=request.data)
 
         if not serializer.is_valid():
             return Response(
@@ -794,63 +625,42 @@ class RefreshView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        raw_refresh_token = (
-            serializer.validated_data["refresh_token"]
-        )
+        raw_refresh_token = serializer.validated_data["refresh_token"]
 
         try:
-            payload = decode_token(
-                raw_refresh_token
-            )
+            payload = decode_token(raw_refresh_token)
 
         except Exception:
             return Response(
-                {
-                    "error": (
-                        "Invalid or expired refresh token."
-                    )
-                },
+                {"error": ("Invalid or expired refresh token.")},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
         if payload.get("type") != "refresh":
             return Response(
-                {
-                    "error": "Invalid token type."
-                },
+                {"error": "Invalid token type."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        token_hash = hash_refresh_token(
-            raw_refresh_token
-        )
+        token_hash = hash_refresh_token(raw_refresh_token)
 
         with transaction.atomic():
             try:
                 token_obj = (
-                    RefreshToken.objects
-                    .select_for_update()
+                    RefreshToken.objects.select_for_update()
                     .select_related("user")
-                    .get(
-                        token=token_hash
-                    )
+                    .get(token=token_hash)
                 )
 
             except RefreshToken.DoesNotExist:
                 return Response(
-                    {
-                        "error": "Invalid refresh token."
-                    },
+                    {"error": "Invalid refresh token."},
                     status=status.HTTP_401_UNAUTHORIZED,
                 )
 
-            if token_obj.user_id != payload.get(
-                "user_id"
-            ):
+            if token_obj.user_id != payload.get("user_id"):
                 return Response(
-                    {
-                        "error": "Invalid refresh token."
-                    },
+                    {"error": "Invalid refresh token."},
                     status=status.HTTP_401_UNAUTHORIZED,
                 )
 
@@ -858,31 +668,20 @@ class RefreshView(APIView):
                 RefreshToken.objects.filter(
                     user_id=token_obj.user_id,
                     is_revoked=False,
-                ).update(
-                    is_revoked=True
-                )
+                ).update(is_revoked=True)
 
                 return Response(
-                    {
-                        "error": "Invalid refresh token."
-                    },
+                    {"error": "Invalid refresh token."},
                     status=status.HTTP_401_UNAUTHORIZED,
                 )
 
             if token_obj.expires_at < timezone.now():
                 token_obj.is_revoked = True
 
-                token_obj.save(
-                    update_fields=["is_revoked"]
-                )
+                token_obj.save(update_fields=["is_revoked"])
 
                 return Response(
-                    {
-                        "error": (
-                            "Refresh token expired. "
-                            "Please login again."
-                        )
-                    },
+                    {"error": ("Refresh token expired. Please login again.")},
                     status=status.HTTP_401_UNAUTHORIZED,
                 )
 
@@ -891,38 +690,26 @@ class RefreshView(APIView):
             if not user.is_active or user.is_blocked:
                 token_obj.is_revoked = True
 
-                token_obj.save(
-                    update_fields=["is_revoked"]
-                )
+                token_obj.save(update_fields=["is_revoked"])
 
                 return Response(
-                    {
-                        "error": "Invalid refresh token."
-                    },
+                    {"error": "Invalid refresh token."},
                     status=status.HTTP_401_UNAUTHORIZED,
                 )
 
             token_obj.is_revoked = True
 
-            token_obj.save(
-                update_fields=["is_revoked"]
-            )
+            token_obj.save(update_fields=["is_revoked"])
 
-            new_refresh_token = (
-                generate_refresh_token(user)
-            )
+            new_refresh_token = generate_refresh_token(user)
 
             RefreshToken.objects.create(
                 user=user,
-                token=hash_refresh_token(
-                    new_refresh_token
-                ),
+                token=hash_refresh_token(new_refresh_token),
                 expires_at=refresh_token_expires_at(),
             )
 
-        access_token = generate_access_token(
-            user
-        )
+        access_token = generate_access_token(user)
 
         return Response(
             {
@@ -937,9 +724,7 @@ class LogoutView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        serializer = RefreshSerializer(
-            data=request.data
-        )
+        serializer = RefreshSerializer(data=request.data)
 
         if not serializer.is_valid():
             return Response(
@@ -947,74 +732,51 @@ class LogoutView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        raw_refresh_token = (
-            serializer.validated_data["refresh_token"]
-        )
+        raw_refresh_token = serializer.validated_data["refresh_token"]
 
         try:
-            payload = decode_token(
-                raw_refresh_token
-            )
+            payload = decode_token(raw_refresh_token)
 
         except Exception:
             return Response(
-                {
-                    "error": "Refresh token not found."
-                },
+                {"error": "Refresh token not found."},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
         if payload.get("type") != "refresh":
             return Response(
-                {
-                    "error": "Refresh token not found."
-                },
+                {"error": "Refresh token not found."},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        token_hash = hash_refresh_token(
-            raw_refresh_token
-        )
+        token_hash = hash_refresh_token(raw_refresh_token)
 
         with transaction.atomic():
             try:
-                token_obj = (
-                    RefreshToken.objects
-                    .select_for_update()
-                    .get(
-                        token=token_hash
-                    )
+                token_obj = RefreshToken.objects.select_for_update().get(
+                    token=token_hash
                 )
 
             except RefreshToken.DoesNotExist:
                 return Response(
-                    {
-                        "error": "Refresh token not found."
-                    },
+                    {"error": "Refresh token not found."},
                     status=status.HTTP_404_NOT_FOUND,
                 )
 
-            if (
-                token_obj.user_id != request.user.id
-                or token_obj.user_id != payload.get("user_id")
+            if token_obj.user_id != request.user.id or token_obj.user_id != payload.get(
+                "user_id"
             ):
                 return Response(
-                    {
-                        "error": "Refresh token not found."
-                    },
+                    {"error": "Refresh token not found."},
                     status=status.HTTP_404_NOT_FOUND,
                 )
 
             if not token_obj.is_revoked:
                 token_obj.is_revoked = True
 
-                token_obj.save(
-                    update_fields=["is_revoked"]
-                )
+                token_obj.save(update_fields=["is_revoked"])
 
         return Response(
-            {
-                "message": "Logged out successfully."
-            },
+            {"message": "Logged out successfully."},
             status=status.HTTP_200_OK,
         )

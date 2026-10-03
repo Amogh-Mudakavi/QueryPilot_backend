@@ -1,13 +1,13 @@
+"""Email Utils module for QueryPilot."""
+
 from datetime import timedelta
 
 import resend
-
 from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
 from django.utils import timezone
 
 from accounts.models import EmailOTP
-
 
 resend.api_key = settings.RESEND_API_KEY
 
@@ -15,9 +15,7 @@ resend.api_key = settings.RESEND_API_KEY
 def generate_otp():
     import secrets
 
-    return str(
-        secrets.randbelow(900000) + 100000
-    )
+    return str(secrets.randbelow(900000) + 100000)
 
 
 def hash_otp(otp):
@@ -40,21 +38,14 @@ def can_send_otp(email, ip_address=None):
     check_hourly_limit().
     """
 
-    latest_otp = (
-        EmailOTP.objects
-        .filter(email=email)
-        .order_by("-created_at")
-        .first()
-    )
+    latest_otp = EmailOTP.objects.filter(email=email).order_by("-created_at").first()
 
     if latest_otp is None:
         return True
 
     elapsed = timezone.now() - latest_otp.created_at
 
-    return elapsed >= timedelta(
-        seconds=settings.OTP_RESEND_COOLDOWN_SECONDS
-    )
+    return elapsed >= timedelta(seconds=settings.OTP_RESEND_COOLDOWN_SECONDS)
 
 
 def check_hourly_limit(email, ip_address=None):
@@ -62,32 +53,21 @@ def check_hourly_limit(email, ip_address=None):
     Enforce both per-email and per-IP OTP limits over the last hour.
     """
 
-    one_hour_ago = (
-        timezone.now()
-        - timedelta(hours=1)
-    )
+    one_hour_ago = timezone.now() - timedelta(hours=1)
 
-    email_count = (
-        EmailOTP.objects
-        .filter(
-            created_at__gte=one_hour_ago,
-            email=email,
-        )
-        .count()
-    )
+    email_count = EmailOTP.objects.filter(
+        created_at__gte=one_hour_ago,
+        email=email,
+    ).count()
 
     if email_count >= settings.OTP_HOURLY_LIMIT:
         return False
 
     if ip_address:
-        ip_count = (
-            EmailOTP.objects
-            .filter(
-                created_at__gte=one_hour_ago,
-                last_sent_ip=ip_address,
-            )
-            .count()
-        )
+        ip_count = EmailOTP.objects.filter(
+            created_at__gte=one_hour_ago,
+            last_sent_ip=ip_address,
+        ).count()
 
         if ip_count >= settings.OTP_IP_HOURLY_LIMIT:
             return False

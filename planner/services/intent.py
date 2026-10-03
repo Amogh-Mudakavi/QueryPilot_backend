@@ -1,7 +1,8 @@
+"""Services Intent module for QueryPilot."""
+
 from __future__ import annotations
 
 from typing import Any
-
 
 CAPABILITIES = {
     "SOURCE_METADATA",
@@ -13,14 +14,94 @@ CAPABILITIES = {
 
 _STRUCTURE_FIELD_TOKENS = frozenset(
     {
-        "column", "columns", "column names", "column headers",
-        "field names", "fields", "schema", "structure", "format",
-        "row count", "number of rows", "how many rows",
-        "sheet names", "table names", "list of tables", "table list",
-        "tables", "file names", "list of files", "file list",
-        "file types", "uploaded files", "uploaded documents",
-        "document list", "list of documents", "metadata", "data sources",
+        "column",
+        "columns",
+        "column names",
+        "column headers",
+        "field names",
+        "fields",
+        "schema",
+        "structure",
+        "format",
+        "row count",
+        "number of rows",
+        "how many rows",
+        "sheet names",
+        "table names",
+        "list of tables",
+        "table list",
+        "tables",
+        "file names",
+        "list of files",
+        "file list",
+        "file types",
+        "uploaded files",
+        "uploaded documents",
+        "document list",
+        "list of documents",
+        "metadata",
+        "data sources",
     }
+)
+
+
+_STRUCTURE_CONTAINER_WORDS = frozenset(
+    {
+        "file",
+        "files",
+        "document",
+        "documents",
+        "doc",
+        "docs",
+        "sheet",
+        "sheets",
+        "table",
+        "tables",
+        "workspace",
+        "source",
+        "sources",
+        "column",
+        "columns",
+        "row",
+        "rows",
+        "field",
+        "fields",
+        "schema",
+        "schemas",
+        "dataset",
+        "datasets",
+        "pdf",
+        "pdfs",
+        "upload",
+        "uploads",
+        "uploaded",
+    }
+)
+_STRUCTURE_ATTRIBUTE_WORDS = frozenset(
+    {
+        "name",
+        "names",
+        "title",
+        "titles",
+        "type",
+        "types",
+        "format",
+        "formats",
+        "status",
+        "count",
+        "number",
+        "many",
+        "size",
+        "list",
+        "header",
+        "headers",
+        "structure",
+        "metadata",
+        "total",
+    }
+)
+_STRUCTURE_FILLER_WORDS = frozenset(
+    {"of", "the", "a", "an", "in", "and", "are", "is", "how", "what", "all"}
 )
 
 ROW_RESULT_OPERATIONS = frozenset(
@@ -50,7 +131,9 @@ def _documents_with_tables(
 ) -> bool:
     if resolved_tables:
         return True
-    return any(source_shapes.get(document_id, False) for document_id in resolved_document_ids)
+    return any(
+        source_shapes.get(document_id, False) for document_id in resolved_document_ids
+    )
 
 
 def build_execution_plan(
@@ -86,17 +169,20 @@ def build_execution_plan(
         return _plan("OK", ["PRODUCT_KNOWLEDGE"], ["product_knowledge"])
 
     resolved_documents = [
-        item for item in references
+        item
+        for item in references
         if item.get("status") == "RESOLVED"
         and item.get("match", {}).get("type") == "document"
     ]
     resolved_tables = [
-        item for item in references
+        item
+        for item in references
         if item.get("status") == "RESOLVED"
         and item.get("match", {}).get("type") == "table"
     ]
     resolved_entities = [
-        item for item in references
+        item
+        for item in references
         if item.get("status") == "RESOLVED"
         and item.get("match", {}).get("type") == "entity"
     ]
@@ -111,19 +197,16 @@ def build_execution_plan(
         shapes,
     )
 
-    # Explicitly resolved multiple sources always require evidence collection
-    # across all of those sources. This is deliberately before the category
-    # branches so a model label such as "structured" cannot collapse a
-    # multi-document request into a single evidence path.
+    if wants_structure and (has_resolved_source or not resolved_entities):
+        return _plan("OK", ["SOURCE_METADATA"], ["source_metadata"])
+
     if cross_document:
         capabilities: list[str] = []
         actions: list[str] = []
         if has_structured_sources:
             capabilities.append("TABLE_QUERY")
             actions.append("table_query")
-        # Keep document search for every resolved cross-document request. It
-        # is harmless for sources with no text chunks and guarantees that PDF,
-        # DOCX, XLSX, CSV, and mixed-source comparisons can contribute text.
+
         capabilities.append("DOCUMENT_SEARCH")
         actions.append("document_search")
         return _plan(
@@ -133,19 +216,14 @@ def build_execution_plan(
             cross_document=True,
         )
 
-    # 1) Structure questions -> metadata evidence only.
     if category in {"metadata", "workspace"} and not has_resolved_source:
         return _plan("OK", ["SOURCE_METADATA"], ["source_metadata"])
-    if wants_structure and has_resolved_source:
-        return _plan("OK", ["SOURCE_METADATA"], ["source_metadata"])
 
-    # 2) Content request mis-tagged as metadata.
     if category in {"metadata", "workspace"} and has_resolved_source:
         if has_structured_sources:
             return _plan("OK", ["TABLE_QUERY"], ["table_query"])
         return _plan("OK", ["DOCUMENT_SEARCH"], ["document_search"])
 
-    # 3) Structured tag, but the only resolved source is a text document.
     if (
         category == "structured"
         and not resolved_tables
@@ -155,7 +233,6 @@ def build_execution_plan(
     ):
         return _plan("OK", ["DOCUMENT_SEARCH"], ["document_search"])
 
-    # 4) Structured content.
     if category == "structured" or resolved_tables or resolved_entities:
         capabilities = ["TABLE_QUERY"]
         actions = ["table_query"]
@@ -164,7 +241,6 @@ def build_execution_plan(
             actions.append("document_search")
         return _plan("OK", capabilities, actions)
 
-    # 5) Mixed content: structured facts + document rules.
     if category == "mixed":
         return _plan(
             "OK",
@@ -172,16 +248,34 @@ def build_execution_plan(
             ["table_query", "document_search"],
         )
 
-    # 6) Document content.
     return _plan("OK", ["DOCUMENT_SEARCH"], ["document_search"])
 
 
+def _is_structure_field(field: Any) -> bool:
+    normalized = " ".join(str(field or "").lower().split())
+    if not normalized:
+        return False
+    if normalized in _STRUCTURE_FIELD_TOKENS:
+        return True
+
+    words = [word for word in normalized.replace("_", " ").split() if word.isalpha()]
+    if not words or len(words) != len(normalized.replace("_", " ").split()):
+        return False
+    known = (
+        _STRUCTURE_CONTAINER_WORDS
+        | _STRUCTURE_ATTRIBUTE_WORDS
+        | _STRUCTURE_FILLER_WORDS
+    )
+    return (
+        all(word in known for word in words)
+        and any(word in _STRUCTURE_CONTAINER_WORDS for word in words)
+        and any(word in _STRUCTURE_ATTRIBUTE_WORDS for word in words)
+    )
+
+
 def _requests_workspace_structure(understanding: dict[str, Any]) -> bool:
-    for field in understanding.get("requested_fields", []):
-        normalized = " ".join(str(field or "").lower().split())
-        if normalized in _STRUCTURE_FIELD_TOKENS:
-            return True
-    return False
+    fields = understanding.get("requested_fields", []) or []
+    return any(_is_structure_field(field) for field in fields)
 
 
 def _as_int(value: Any) -> int | None:

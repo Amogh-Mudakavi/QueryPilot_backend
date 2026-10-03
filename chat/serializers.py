@@ -1,9 +1,11 @@
+"""Serializers module for QueryPilot."""
+
 from rest_framework import serializers
 
 from chat.models import (
     Conversation,
-    Message,
     ConversationSettings,
+    Message,
 )
 
 

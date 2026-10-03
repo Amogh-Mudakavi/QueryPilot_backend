@@ -1,8 +1,10 @@
+"""Models module for QueryPilot."""
+
 from django.conf import settings
 from django.db import models
 
-from workspace.models import Workspace
 from documents.models import Document
+from workspace.models import Workspace
 
 
 class Conversation(models.Model):
@@ -68,6 +70,7 @@ class ConversationSettings(models.Model):
     def __str__(self) -> str:
         return f"Settings | Conversation={self.conversation_id}"
 
+
 class Message(models.Model):
     """
     Individual chat message.
@@ -90,7 +93,6 @@ class Message(models.Model):
     )
 
     content = models.TextField()
-
 
     metadata = models.JSONField(default=dict, blank=True)
 
@@ -163,7 +165,7 @@ class ConversationMemory(models.Model):
     def __str__(self) -> str:
         return f"Memory | Conversation={self.conversation_id}"
 
-    
+
 class ConversationDocument(models.Model):
     """
     Documents attached to a conversation.
@@ -189,7 +191,4 @@ class ConversationDocument(models.Model):
         unique_together = ("conversation", "document")
 
     def __str__(self) -> str:
-        return (
-            f"Conversation={self.conversation_id} "
-            f"Document={self.document_id}"
-        )
+        return f"Conversation={self.conversation_id} Document={self.document_id}"

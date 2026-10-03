@@ -1,3 +1,5 @@
+"""Services Entity Resolution module for QueryPilot."""
+
 from __future__ import annotations
 
 import re
@@ -5,7 +7,6 @@ import sqlite3
 from typing import Any
 
 from documents.ingestion.sqlite import SQLiteManager
-
 from planner.services.schema_registry import get_workspace_catalog, get_workspace_schema
 
 
@@ -43,12 +44,14 @@ def resolve_references(
             if "." in title:
                 aliases.add(normalize_text(title.rsplit(".", 1)[0]))
             if normalized in aliases:
-                candidates.append({
-                    "type": "document",
-                    "document_id": document["document_id"],
-                    "title": title,
-                    "source_type": document.get("source_type"),
-                })
+                candidates.append(
+                    {
+                        "type": "document",
+                        "document_id": document["document_id"],
+                        "title": title,
+                        "source_type": document.get("source_type"),
+                    }
+                )
 
         for table in schema:
             table_name = str(table.get("table_name") or "")
@@ -57,13 +60,15 @@ def resolve_references(
                 normalize_text(_human_table_name(table_name)),
             }
             if normalized in aliases:
-                candidates.append({
-                    "type": "table",
-                    "document_id": table.get("document_id"),
-                    "document_title": table.get("document_title"),
-                    "table_name": table_name,
-                    "columns": table.get("columns", []),
-                })
+                candidates.append(
+                    {
+                        "type": "table",
+                        "document_id": table.get("document_id"),
+                        "document_title": table.get("document_title"),
+                        "table_name": table_name,
+                        "columns": table.get("columns", []),
+                    }
+                )
 
         entity_matches: list[dict[str, Any]] = []
         if category_hint in {"structured", "mixed"} and not candidates:
@@ -77,23 +82,29 @@ def resolve_references(
         unique = _dedupe_candidates(candidates)
 
         if len(unique) == 1:
-            results.append({
-                "reference": ref,
-                "status": "RESOLVED",
-                "match": unique[0],
-            })
+            results.append(
+                {
+                    "reference": ref,
+                    "status": "RESOLVED",
+                    "match": unique[0],
+                }
+            )
         elif len(unique) > 1:
-            results.append({
-                "reference": ref,
-                "status": "AMBIGUOUS",
-                "matches": unique[:8],
-            })
+            results.append(
+                {
+                    "reference": ref,
+                    "status": "AMBIGUOUS",
+                    "matches": unique[:8],
+                }
+            )
         else:
-            results.append({
-                "reference": ref,
-                "status": "NOT_FOUND",
-                "matches": [],
-            })
+            results.append(
+                {
+                    "reference": ref,
+                    "status": "NOT_FOUND",
+                    "matches": [],
+                }
+            )
 
     return {
         "references": results,
@@ -112,6 +123,115 @@ def _human_table_name(table_name: str) -> str:
     return table_name
 
 
+def resolve_entities_from_query(
+    *,
+    workspace_id: int,
+    query: str,
+    schema: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Deterministically find entity values that are explicitly mentioned in
+    the CURRENT user query. This is a fallback for cases where the planner
+    fails to extract a person's/customer's name as a reference.
+
+    A candidate is accepted only when the candidate's normalized tokens are
+    all present in the query. The match is against real workspace values;
+    this function never invents or fuzzily guesses an entity.
+    """
+    normalized_query = normalize_text(query)
+    if not normalized_query:
+        return []
+
+    if schema is None:
+        schema = get_workspace_schema(workspace_id)
+    if not schema:
+        return []
+
+    query_tokens = set(normalized_query.split())
+    if not query_tokens:
+        return []
+
+    connection = sqlite3.connect(
+        f"file:{SQLiteManager.DB_PATH}?mode=ro",
+        uri=True,
+    )
+    grouped: dict[str, dict[str, Any]] = {}
+    try:
+        for table in schema:
+            table_name = str(table.get("table_name") or "")
+            if not table_name:
+                continue
+
+            for column in _entity_mention_columns(table.get("columns", [])):
+                sql = (
+                    f'SELECT DISTINCT "{column}" FROM "{table_name}" '
+                    f'WHERE "{column}" IS NOT NULL'
+                )
+                try:
+                    rows = connection.execute(sql).fetchall()
+                except sqlite3.Error:
+                    continue
+
+                for row in rows:
+                    value = str(row[0] or "").strip()
+                    normalized_value = normalize_text(value)
+                    if not normalized_value:
+                        continue
+
+                    value_tokens = set(normalized_value.split())
+                    if not value_tokens.issubset(query_tokens):
+                        continue
+
+                    if len(value_tokens) == 1 and not _is_strong_entity_column(column):
+                        continue
+
+                    key = normalized_value
+                    candidate = grouped.setdefault(
+                        key,
+                        {
+                            "type": "entity",
+                            "document_id": table.get("document_id"),
+                            "document_title": table.get("document_title"),
+                            "value": value,
+                            "locations": [],
+                        },
+                    )
+                    location = {
+                        "table_name": table_name,
+                        "column": column,
+                    }
+                    if location not in candidate["locations"]:
+                        candidate["locations"].append(location)
+    finally:
+        connection.close()
+
+    return list(grouped.values())
+
+
+def _entity_mention_columns(columns: list[str]) -> list[str]:
+    """Columns whose values are appropriate candidates for query mentions."""
+    markers = (
+        "name",
+        "employee",
+        "person",
+        "customer",
+        "client",
+        "user",
+        "product",
+        "title",
+    )
+    return [
+        str(column)
+        for column in columns
+        if any(marker in normalize_text(str(column)).split() for marker in markers)
+    ]
+
+
+def _is_strong_entity_column(column: str) -> bool:
+    tokens = set(normalize_text(column).split())
+    return bool(tokens & {"name", "employee", "person", "customer", "client", "user"})
+
+
 def _resolve_name_value(
     *,
     workspace_id: int,
@@ -127,9 +247,6 @@ def _resolve_name_value(
         uri=True,
     )
     try:
-        # Stage 1: exact normalized-value match. This is the safe,
-        # unambiguous case and always takes priority when it finds
-        # anything at all.
         grouped = _match_name_values(
             connection=connection,
             schema=schema,
@@ -138,16 +255,6 @@ def _resolve_name_value(
             mode="exact",
         )
 
-        # Stage 2: controlled partial match, only attempted when the
-        # exact pass found nothing. A candidate is accepted only if
-        # every token in the query appears as a WHOLE token in the
-        # candidate value (e.g. "rahul" matches "rahul sharma" via
-        # the token "rahul", but not "farahul" or "rahulika", since
-        # those don't contain "rahul" as a standalone token). This is
-        # still deterministic set-membership on real workspace data,
-        # not fuzzy/edit-distance matching, so it can't silently pick
-        # a wrong person -- it can only ever find 0, 1, or many exact
-        # token-level matches.
         if not grouped:
             grouped = _match_name_values(
                 connection=connection,
@@ -170,16 +277,6 @@ def _match_name_values(
     raw_query: str,
     mode: str,
 ) -> dict[str, dict[str, Any]]:
-    """
-    Search name-like columns for values matching the query.
-
-    mode="exact": value must equal the query after normalization.
-    mode="partial": every normalized query token must appear as a
-        whole token in the value (order-independent), and the value
-        must contain at least one token the query doesn't already
-        have (otherwise this degenerates back into the exact case).
-    """
-
     query_tokens = set(normalized_query.split())
     grouped: dict[str, dict[str, Any]] = {}
 
@@ -194,11 +291,6 @@ def _match_name_values(
                 )
                 params: tuple[Any, ...] = (raw_query,)
             else:
-                # A broad SQL LIKE narrows candidates cheaply; the
-                # authoritative accept/reject decision still happens
-                # in Python below via whole-token comparison, so a
-                # loose SQL filter here cannot by itself cause a wrong
-                # match.
                 sql = (
                     f'SELECT DISTINCT "{column}" FROM "{table_name}" '
                     f'WHERE "{column}" IS NOT NULL '
@@ -227,8 +319,6 @@ def _match_name_values(
                     if not query_tokens.issubset(value_tokens):
                         continue
                     if value_tokens == query_tokens:
-                        # Identical token set already belongs to the
-                        # exact stage; skip to avoid double-handling.
                         continue
 
                 candidate = grouped.setdefault(
@@ -250,10 +340,18 @@ def _match_name_values(
 
     return grouped
 
+
 def _name_like_columns(columns: list[str]) -> list[str]:
     markers = (
-        "name", "employee", "person", "customer", "client",
-        "user", "product", "title", "id",
+        "name",
+        "employee",
+        "person",
+        "customer",
+        "client",
+        "user",
+        "product",
+        "title",
+        "id",
     )
     return [
         str(column)
@@ -270,7 +368,7 @@ def _dedupe_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]
             candidate.get("type"),
             candidate.get("document_id"),
             candidate.get("table_name"),
-            candidate.get("column"),  
+            candidate.get("column"),
             candidate.get("value"),
         )
         if key in seen:

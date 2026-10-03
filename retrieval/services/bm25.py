@@ -19,7 +19,6 @@ import re
 from dataclasses import dataclass
 from typing import Sequence
 
-
 _TOKEN_PATTERN = re.compile(r"\b\w+\b", re.UNICODE)
 
 
@@ -34,10 +33,7 @@ def tokenize(text: str) -> list[str]:
     if not text:
         return []
 
-    return [
-        token.lower()
-        for token in _TOKEN_PATTERN.findall(text)
-    ]
+    return [token.lower() for token in _TOKEN_PATTERN.findall(text)]
 
 
 @dataclass(frozen=True)
@@ -92,31 +88,21 @@ class BM25Retriever:
         self.k1 = k1
         self.b = b
 
-        self._tokenized_documents = [
-            tokenize(document)
-            for document in self.documents
-        ]
+        self._tokenized_documents = [tokenize(document) for document in self.documents]
 
-        self._document_lengths = [
-            len(tokens)
-            for tokens in self._tokenized_documents
-        ]
+        self._document_lengths = [len(tokens) for tokens in self._tokenized_documents]
 
         self._avg_document_length = (
-            sum(self._document_lengths)
-            / len(self._document_lengths)
+            sum(self._document_lengths) / len(self._document_lengths)
             if self._document_lengths
             else 0.0
         )
 
         self._term_frequencies = [
-            self._build_term_frequency(tokens)
-            for tokens in self._tokenized_documents
+            self._build_term_frequency(tokens) for tokens in self._tokenized_documents
         ]
 
-        self._document_frequency = (
-            self._build_document_frequency()
-        )
+        self._document_frequency = self._build_document_frequency()
 
         self._idf = self._build_idf()
 
@@ -163,9 +149,8 @@ class BM25Retriever:
         idf: dict[str, float] = {}
 
         for term, document_frequency in self._document_frequency.items():
-            value = (
-                (document_count - document_frequency + 0.5)
-                / (document_frequency + 0.5)
+            value = (document_count - document_frequency + 0.5) / (
+                document_frequency + 0.5
             )
 
             idf[term] = math.log(1.0 + value)
@@ -189,9 +174,7 @@ class BM25Retriever:
 
         scores = [0.0] * len(self.documents)
 
-        for document_index, term_frequencies in enumerate(
-            self._term_frequencies
-        ):
+        for document_index, term_frequencies in enumerate(self._term_frequencies):
             document_length = self._document_lengths[document_index]
 
             for term in query_terms:
@@ -202,29 +185,20 @@ class BM25Retriever:
 
                 idf = self._idf.get(term, 0.0)
 
-                denominator = (
-                    term_frequency
-                    + self.k1
+                denominator = term_frequency + self.k1 * (
+                    1.0
+                    - self.b
+                    + self.b
                     * (
-                        1.0
-                        - self.b
-                        + self.b
-                        * (
-                            document_length
-                            / self._avg_document_length
-                            if self._avg_document_length > 0
-                            else 0.0
-                        )
+                        document_length / self._avg_document_length
+                        if self._avg_document_length > 0
+                        else 0.0
                     )
                 )
 
-                tf_component = (
-                    term_frequency * (self.k1 + 1.0)
-                ) / denominator
+                tf_component = (term_frequency * (self.k1 + 1.0)) / denominator
 
-                scores[document_index] += (
-                    idf * tf_component
-                )
+                scores[document_index] += idf * tf_component
 
         return scores
 

@@ -1,20 +1,20 @@
+"""Urls module for QueryPilot."""
+
 from django.urls import path
 
 from .views import (
+    ForgotPasswordRequestView,
+    LoginView,
+    LogoutView,
+    RefreshView,
     RequestRegisterView,
     ResendRegistrationOTPView,
-    VerifyOTP,
-    ForgotPasswordRequestView,
     ResetPasswordView,
-    LoginView,
+    VerifyOTP,
     getme,
-    RefreshView,
-    LogoutView,
 )
 
-
 urlpatterns = [
-    # Auth
     path(
         "register/",
         RequestRegisterView.as_view(),

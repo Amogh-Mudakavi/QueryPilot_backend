@@ -28,15 +28,15 @@ Important:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
+from dataclasses import dataclass
 from typing import Any, Iterable
 
 from documents.ingestion.vectors import VectorStore
 
 from .bm25 import BM25Retriever
 from .evidence import Evidence
-
+from .keys import key_pattern
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,24 @@ class RetrievalResult:
     confidence: float
     candidate_count: int
 
+    dense_failed: bool = False
+    dense_error_code: str | None = None
+
+
+@dataclass
+class KeyLookupResult:
+    """
+    Result of an exact stable-key lookup (see HybridRetriever.lookup_by_keys).
+
+    matched_keys:      key -> sorted document ids where it was found
+    non_identifying:   keys skipped because they matched too many chunks to
+                       identify a single record (e.g. a fiscal-year label)
+    """
+
+    evidence: list[Evidence]
+    matched_keys: dict[str, list[int]]
+    non_identifying: list[str]
+
 
 class HybridRetriever:
     """
@@ -110,6 +128,10 @@ class HybridRetriever:
     DEFAULT_TOP_K = 5
 
     RRF_K = 60
+
+    KEY_MAX_CHUNKS = 4
+
+    KEY_TAIL_CHARS = 400
 
     TEXT_SOURCE_TYPE = "text"
     TABLE_SOURCE_TYPE = "table"
@@ -157,9 +179,7 @@ class HybridRetriever:
         if workspace_id <= 0:
             raise ValueError("workspace_id must be greater than zero")
 
-        normalized_document_ids = self._normalize_document_ids(
-            allowed_document_ids
-        )
+        normalized_document_ids = self._normalize_document_ids(allowed_document_ids)
         normalized_source_types = self._normalize_source_types(source_types)
 
         logger.info(
@@ -207,9 +227,6 @@ class HybridRetriever:
                 workspace_id,
             )
 
-        # If either side returned anything, use the successful signal(s).
-        # This prevents a transient/broken dense index from turning an
-        # otherwise answerable exact-match query into a total failure.
         if dense_candidates or bm25_candidates:
             fused_candidates = self._rrf_fuse(
                 dense_candidates=dense_candidates,
@@ -217,10 +234,7 @@ class HybridRetriever:
             )
 
             final_candidates = fused_candidates[: self.top_k]
-            evidence = [
-                candidate["evidence"]
-                for candidate in final_candidates
-            ]
+            evidence = [candidate["evidence"] for candidate in final_candidates]
 
             confidence = self._calculate_confidence(
                 dense_candidates=dense_candidates,
@@ -237,14 +251,26 @@ class HybridRetriever:
                 len(bm25_candidates),
             )
 
+            if dense_error is not None:
+                logger.warning(
+                    "HybridRetriever.retrieve: DEGRADED result, dense "
+                    "retrieval failed (code=%s cause=%r); using lexical "
+                    "signal only. The Chroma vector index for the "
+                    "requested scope is probably inconsistent.",
+                    dense_error.code,
+                    dense_error.__cause__,
+                )
+
             return RetrievalResult(
                 evidence=evidence,
                 confidence=confidence,
                 candidate_count=len(fused_candidates),
+                dense_failed=dense_error is not None,
+                dense_error_code=(
+                    dense_error.code if dense_error is not None else None
+                ),
             )
 
-        # No candidates and at least one backend failed: surface the typed
-        # backend failure instead of pretending the workspace is empty.
         if dense_error is not None:
             raise dense_error
 
@@ -256,6 +282,234 @@ class HybridRetriever:
             confidence=0.0,
             candidate_count=0,
         )
+
+    def lookup_by_keys(
+        self,
+        *,
+        keys: Iterable[str],
+        workspace_id: int,
+        allowed_document_ids: Iterable[int] | None = None,
+        source_types: Iterable[str] | None = ("text",),
+    ) -> KeyLookupResult:
+        """
+        Deterministic exact lookup of stable keys (e.g. an Employee ID that
+        was resolved in another document).
+
+        Independent of embeddings: it reads chunk text + metadata with
+        collection.get (the same call the BM25 corpus uses), under the SAME
+        workspace / document / type predicate and the SAME fail-closed
+        validation as ranked retrieval. Matching is case- and
+        separator-insensitive ('EMP-1150' also finds 'EMP 1150').
+        """
+        if workspace_id <= 0:
+            raise ValueError("workspace_id must be greater than zero")
+
+        clean_keys: list[str] = []
+        for key in keys or []:
+            key = str(key or "").strip()
+            if key and key not in clean_keys:
+                clean_keys.append(key)
+        if not clean_keys:
+            return KeyLookupResult([], {}, [])
+
+        document_ids = self._normalize_document_ids(allowed_document_ids)
+        types = self._normalize_source_types(source_types)
+
+        try:
+            corpus = VectorStore.knowledge_collection().get(
+                where=self._build_chroma_where(
+                    workspace_id=workspace_id,
+                    allowed_document_ids=document_ids,
+                    source_types=types,
+                ),
+                include=["documents", "metadatas"],
+            )
+        except Exception as exc:
+            raise RetrievalError(
+                code="RETRIEVAL_ERROR",
+                message="Key lookup corpus could not be loaded.",
+            ) from exc
+
+        ids = corpus.get("ids", []) if isinstance(corpus, dict) else []
+        docs = corpus.get("documents", []) if isinstance(corpus, dict) else []
+        metas = corpus.get("metadatas", []) if isinstance(corpus, dict) else []
+
+        candidates = [
+            {
+                "id": ids[i] if i < len(ids) else None,
+                "text": str(docs[i] or ""),
+                "metadata": metas[i] if i < len(metas) else {},
+            }
+            for i in range(len(docs))
+        ]
+        entries = self._validate_candidates(
+            candidates=candidates,
+            workspace_id=workspace_id,
+            allowed_document_ids=document_ids,
+            source_types=types,
+        )
+
+        by_position: dict[tuple[int, Any], dict[str, Any]] = {}
+        for entry in entries:
+            by_position[
+                (entry["document_id"], entry["metadata"].get("chunk_index"))
+            ] = entry
+
+        selected: dict[str, dict[str, Any]] = {}
+        matched: dict[str, set[int]] = {}
+        non_identifying: list[str] = []
+
+        for key in clean_keys:
+            pattern = key_pattern(key)
+            hits = []
+            for entry in entries:
+                m = pattern.search(entry["text"])
+                if m:
+                    hits.append((entry, m))
+            if not hits:
+                continue
+            if len(hits) > self.KEY_MAX_CHUNKS:
+                non_identifying.append(key)
+                continue
+
+            for entry, m in hits:
+                matched.setdefault(key, set()).add(entry["document_id"])
+                self._select(selected, entry, key)
+
+                chunk_index = entry["metadata"].get("chunk_index")
+                near_end = len(entry["text"]) - m.end() <= self.KEY_TAIL_CHARS
+                if near_end and isinstance(chunk_index, int):
+                    neighbour = by_position.get((entry["document_id"], chunk_index + 1))
+                    if neighbour is not None:
+                        self._select(selected, neighbour, key)
+
+        evidence: list[Evidence] = []
+        ordered = sorted(
+            selected.values(),
+            key=lambda e: (
+                e["document_id"],
+                e["metadata"].get("chunk_index")
+                if isinstance(e["metadata"].get("chunk_index"), int)
+                else 0,
+            ),
+        )
+        for entry in ordered:
+            metadata = dict(entry["metadata"])
+            metadata["matched_keys"] = sorted(entry["_keys"])
+            metadata["retrieval_method"] = "stable_key_lookup"
+            try:
+                evidence.append(
+                    self._build_evidence(
+                        content=entry["text"],
+                        score=1.0,
+                        metadata=metadata,
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                logger.warning("Skipping malformed key-lookup chunk: %s", exc)
+
+        logger.info(
+            "HybridRetriever.lookup_by_keys: workspace_id=%s docs=%s "
+            "keys=%s matched=%s non_identifying=%s chunks=%d",
+            workspace_id,
+            document_ids,
+            clean_keys,
+            {k: sorted(v) for k, v in matched.items()},
+            non_identifying,
+            len(evidence),
+        )
+
+        return KeyLookupResult(
+            evidence=evidence,
+            matched_keys={k: sorted(v) for k, v in matched.items()},
+            non_identifying=non_identifying,
+        )
+
+    def fetch_document_chunks(
+        self,
+        *,
+        workspace_id: int,
+        document_ids: Iterable[int],
+        source_types: Iterable[str] | None = ("text",),
+    ) -> list[dict[str, Any]]:
+        """
+        Every text chunk of the given documents, in reading order.
+
+        Uses collection.get (metadata/text segment), NOT a vector query, so it
+        keeps working when the vector index is damaged. Same workspace /
+        document / type predicate and the same fail-closed validation as
+        ranked retrieval.
+        """
+        if workspace_id <= 0:
+            raise ValueError("workspace_id must be greater than zero")
+
+        ids = self._normalize_document_ids(document_ids)
+        if not ids:
+            return []
+        types = self._normalize_source_types(source_types)
+
+        try:
+            corpus = VectorStore.knowledge_collection().get(
+                where=self._build_chroma_where(
+                    workspace_id=workspace_id,
+                    allowed_document_ids=ids,
+                    source_types=types,
+                ),
+                include=["documents", "metadatas"],
+            )
+        except Exception as exc:
+            raise RetrievalError(
+                code="RETRIEVAL_ERROR",
+                message="Document chunks could not be loaded.",
+            ) from exc
+
+        cids = corpus.get("ids", []) if isinstance(corpus, dict) else []
+        docs = corpus.get("documents", []) if isinstance(corpus, dict) else []
+        metas = corpus.get("metadatas", []) if isinstance(corpus, dict) else []
+
+        entries = self._validate_candidates(
+            candidates=[
+                {
+                    "id": cids[i] if i < len(cids) else None,
+                    "text": str(docs[i] or ""),
+                    "metadata": metas[i] if i < len(metas) else {},
+                }
+                for i in range(len(docs))
+            ],
+            workspace_id=workspace_id,
+            allowed_document_ids=ids,
+            source_types=types,
+        )
+
+        chunks = []
+        for entry in entries:
+            if not entry["text"].strip():
+                continue
+            index = entry["metadata"].get("chunk_index")
+            chunks.append(
+                {
+                    "id": entry.get("id"),
+                    "document_id": entry["document_id"],
+                    "chunk_index": index if isinstance(index, int) else 0,
+                    "content": entry["text"],
+                    "metadata": entry["metadata"],
+                }
+            )
+        chunks.sort(key=lambda c: (c["document_id"], c["chunk_index"]))
+        return chunks
+
+    @staticmethod
+    def _select(
+        selected: dict[str, dict[str, Any]],
+        entry: dict[str, Any],
+        key: str,
+    ) -> None:
+        identity = str(
+            entry.get("id")
+            or (entry["document_id"], entry["metadata"].get("chunk_index"))
+        )
+        item = selected.setdefault(identity, {**entry, "_keys": set()})
+        item["_keys"].add(key)
 
     @staticmethod
     def _normalize_document_ids(
@@ -282,9 +536,7 @@ class HybridRetriever:
                 ) from exc
 
             if document_id <= 0:
-                raise ValueError(
-                    "allowed_document_ids must contain positive IDs."
-                )
+                raise ValueError("allowed_document_ids must contain positive IDs.")
 
             if document_id not in normalized:
                 normalized.append(document_id)
@@ -312,8 +564,7 @@ class HybridRetriever:
 
             if source_type not in allowed:
                 raise ValueError(
-                    f"Unsupported source_type {value!r}; "
-                    "expected 'text' or 'table'."
+                    f"Unsupported source_type {value!r}; expected 'text' or 'table'."
                 )
 
             if source_type not in normalized:
@@ -342,11 +593,7 @@ class HybridRetriever:
             clauses.append(
                 {
                     "document_id": {
-                        "$in": (
-                            allowed_document_ids
-                            if allowed_document_ids
-                            else [-1]
-                        )
+                        "$in": (allowed_document_ids if allowed_document_ids else [-1])
                     }
                 }
             )
@@ -408,25 +655,15 @@ class HybridRetriever:
             ) from exc
 
         documents = (
-            results.get("documents", [[]])[0]
-            if isinstance(results, dict)
-            else []
+            results.get("documents", [[]])[0] if isinstance(results, dict) else []
         )
         metadatas = (
-            results.get("metadatas", [[]])[0]
-            if isinstance(results, dict)
-            else []
+            results.get("metadatas", [[]])[0] if isinstance(results, dict) else []
         )
         distances = (
-            results.get("distances", [[]])[0]
-            if isinstance(results, dict)
-            else []
+            results.get("distances", [[]])[0] if isinstance(results, dict) else []
         )
-        ids = (
-            results.get("ids", [[]])[0]
-            if isinstance(results, dict)
-            else []
-        )
+        ids = results.get("ids", [[]])[0] if isinstance(results, dict) else []
 
         if not isinstance(documents, list):
             documents = []
@@ -442,8 +679,7 @@ class HybridRetriever:
         for index, document in enumerate(documents):
             metadata = (
                 metadatas[index]
-                if index < len(metadatas)
-                and isinstance(metadatas[index], dict)
+                if index < len(metadatas) and isinstance(metadatas[index], dict)
                 else {}
             )
 
@@ -453,9 +689,7 @@ class HybridRetriever:
                     "text": str(document or ""),
                     "metadata": metadata,
                     "dense_distance": (
-                        distances[index]
-                        if index < len(distances)
-                        else None
+                        distances[index] if index < len(distances) else None
                     ),
                 }
             )
@@ -500,21 +734,9 @@ class HybridRetriever:
                 message="Lexical retrieval corpus could not be loaded.",
             ) from exc
 
-        documents = (
-            corpus.get("documents", [])
-            if isinstance(corpus, dict)
-            else []
-        )
-        metadatas = (
-            corpus.get("metadatas", [])
-            if isinstance(corpus, dict)
-            else []
-        )
-        ids = (
-            corpus.get("ids", [])
-            if isinstance(corpus, dict)
-            else []
-        )
+        documents = corpus.get("documents", []) if isinstance(corpus, dict) else []
+        metadatas = corpus.get("metadatas", []) if isinstance(corpus, dict) else []
+        ids = corpus.get("ids", []) if isinstance(corpus, dict) else []
 
         if not isinstance(documents, list):
             documents = []
@@ -551,8 +773,7 @@ class HybridRetriever:
 
             metadata = (
                 metadatas[index]
-                if index < len(metadatas)
-                and isinstance(metadatas[index], dict)
+                if index < len(metadatas) and isinstance(metadatas[index], dict)
                 else {}
             )
 
@@ -588,15 +809,9 @@ class HybridRetriever:
         never retained as an unscoped fallback.
         """
         allowed_document_set = (
-            set(allowed_document_ids)
-            if allowed_document_ids is not None
-            else None
+            set(allowed_document_ids) if allowed_document_ids is not None else None
         )
-        source_type_set = (
-            set(source_types)
-            if source_types is not None
-            else None
-        )
+        source_type_set = set(source_types) if source_types is not None else None
 
         validated: list[dict[str, Any]] = []
 
@@ -607,12 +822,8 @@ class HybridRetriever:
                 continue
 
             try:
-                candidate_workspace_id = int(
-                    metadata.get("workspace_id")
-                )
-                document_id = int(
-                    metadata.get("document_id")
-                )
+                candidate_workspace_id = int(metadata.get("workspace_id"))
+                document_id = int(metadata.get("document_id"))
             except (TypeError, ValueError):
                 continue
 
@@ -627,10 +838,7 @@ class HybridRetriever:
 
             source_type = metadata.get("type")
 
-            if (
-                source_type_set is not None
-                and source_type not in source_type_set
-            ):
+            if source_type_set is not None and source_type not in source_type_set:
                 continue
 
             candidate["document_id"] = document_id
@@ -698,9 +906,7 @@ class HybridRetriever:
             )
 
             item["dense_rank"] = rank
-            item["dense_distance"] = candidate.get(
-                "dense_distance"
-            )
+            item["dense_distance"] = candidate.get("dense_distance")
             item["rrf_score"] += 1.0 / (self.RRF_K + rank)
 
         for rank, candidate in enumerate(
@@ -803,14 +1009,10 @@ class HybridRetriever:
         document_id = metadata.get("document_id")
 
         if workspace_id is None:
-            raise ValueError(
-                "Retrieved evidence is missing workspace_id"
-            )
+            raise ValueError("Retrieved evidence is missing workspace_id")
 
         if document_id is None:
-            raise ValueError(
-                "Retrieved evidence is missing document_id"
-            )
+            raise ValueError("Retrieved evidence is missing document_id")
 
         return Evidence(
             content=content,
@@ -870,9 +1072,7 @@ class HybridRetriever:
         agreement = min(overlap_count / 3.0, 1.0)
 
         confidence = (
-            0.60 * best_dense_similarity
-            + 0.25 * lexical_support
-            + 0.15 * agreement
+            0.60 * best_dense_similarity + 0.25 * lexical_support + 0.15 * agreement
         )
 
         return max(0.0, min(1.0, confidence))

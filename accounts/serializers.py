@@ -1,9 +1,10 @@
+"""Serializers module for QueryPilot."""
+
 from django.contrib.auth.password_validation import validate_password
 from django.utils import timezone
 from rest_framework import serializers
 
 from .models import EmailOTP, PendingRegistration, User
-
 
 GENERIC_REGISTRATION_ERROR = "Unable to register with these details."
 INVALID_CREDENTIALS_ERROR = "Invalid credentials."
@@ -15,24 +16,15 @@ class RegisterRequestSerializer(serializers.Serializer):
     password = serializers.CharField(write_only=True)
 
     def validate_email(self, value):
-        # Keep email identity consistent across register/login/resend flows.
         value = value.strip().lower()
 
         if User.objects.filter(email__iexact=value).exists():
-            raise serializers.ValidationError(
-                GENERIC_REGISTRATION_ERROR
-            )
+            raise serializers.ValidationError(GENERIC_REGISTRATION_ERROR)
 
-        # A registration draft is temporary state. Once it expires, it must
-        # not permanently block the user from registering again.
-        pending_qs = PendingRegistration.objects.filter(
-            email__iexact=value
-        )
+        pending_qs = PendingRegistration.objects.filter(email__iexact=value)
         now = timezone.now()
 
-        pending_qs.filter(
-            expires_at__lte=now
-        ).delete()
+        pending_qs.filter(expires_at__lte=now).delete()
 
         EmailOTP.objects.filter(
             email__iexact=value,
@@ -42,9 +34,7 @@ class RegisterRequestSerializer(serializers.Serializer):
         ).update(is_used=True)
 
         if pending_qs.filter(expires_at__gt=now).exists():
-            raise serializers.ValidationError(
-                GENERIC_REGISTRATION_ERROR
-            )
+            raise serializers.ValidationError(GENERIC_REGISTRATION_ERROR)
 
         return value
 
@@ -52,9 +42,7 @@ class RegisterRequestSerializer(serializers.Serializer):
         value = value.strip()
 
         if User.objects.filter(username=value).exists():
-            raise serializers.ValidationError(
-                GENERIC_REGISTRATION_ERROR
-            )
+            raise serializers.ValidationError(GENERIC_REGISTRATION_ERROR)
 
         return value
 
@@ -88,26 +76,18 @@ class LoginSerializer(serializers.Serializer):
             attrs["email"] = email
 
         try:
-            user = User.objects.filter(
-                email__iexact=email
-            ).first()
+            user = User.objects.filter(email__iexact=email).first()
 
             if user is None:
                 raise User.DoesNotExist
         except User.DoesNotExist:
-            raise serializers.ValidationError(
-                INVALID_CREDENTIALS_ERROR
-            )
+            raise serializers.ValidationError(INVALID_CREDENTIALS_ERROR)
 
         if not user.is_active or user.is_blocked:
-            raise serializers.ValidationError(
-                INVALID_CREDENTIALS_ERROR
-            )
+            raise serializers.ValidationError(INVALID_CREDENTIALS_ERROR)
 
         if not user.check_password(password):
-            raise serializers.ValidationError(
-                INVALID_CREDENTIALS_ERROR
-            )
+            raise serializers.ValidationError(INVALID_CREDENTIALS_ERROR)
 
         attrs["user"] = user
         return attrs
@@ -134,9 +114,7 @@ class ResetPasswordSerializer(serializers.Serializer):
         max_length=6,
         trim_whitespace=True,
     )
-    new_password = serializers.CharField(
-        write_only=True
-    )
+    new_password = serializers.CharField(write_only=True)
 
     def validate_email(self, value):
         return value.strip().lower()

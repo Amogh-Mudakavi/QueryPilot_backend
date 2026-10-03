@@ -1,5 +1,7 @@
-from pathlib import Path
+"""Settings module for QueryPilot."""
+
 import os
+from pathlib import Path
 
 from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
@@ -23,10 +25,6 @@ def _env_list(name, default=None):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-# =====================================================
-# SECURITY
-# =====================================================
-
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY")
 if not SECRET_KEY:
     raise ImproperlyConfigured(
@@ -45,21 +43,16 @@ if not DEBUG and not ALLOWED_HOSTS:
         "DJANGO_ALLOWED_HOSTS must be configured when DEBUG is False."
     )
 
-# =====================================================
-# APPLICATIONS
-# =====================================================
 
 INSTALLED_APPS = [
     "corsheaders",
     "rest_framework",
-
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-
     "accounts",
     "documents",
     "workspace",
@@ -68,9 +61,6 @@ INSTALLED_APPS = [
     "chat",
 ]
 
-# =====================================================
-# MIDDLEWARE
-# =====================================================
 
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
@@ -86,59 +76,40 @@ MIDDLEWARE = [
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
 
-# =====================================================
-# AUTH
-# =====================================================
 
 AUTH_USER_MODEL = "accounts.User"
 
-# JWT configuration has one owner: settings.py.
+
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 if not JWT_SECRET_KEY or len(JWT_SECRET_KEY) < 32:
     raise ImproperlyConfigured(
         "JWT_SECRET_KEY is missing or shorter than 32 characters. "
         "Generate one with: "
-        "python -c \"import secrets; print(secrets.token_urlsafe(48))\" "
+        'python -c "import secrets; print(secrets.token_urlsafe(48))" '
         "and put it in your .env file."
     )
 
 JWT_ALGORITHM = "HS256"
 
-ACCESS_TOKEN_LIFETIME_MINUTES = int(
-    os.getenv("ACCESS_TOKEN_LIFETIME_MINUTES", "15")
-)
+ACCESS_TOKEN_LIFETIME_MINUTES = int(os.getenv("ACCESS_TOKEN_LIFETIME_MINUTES", "15"))
 
-REFRESH_TOKEN_LIFETIME_DAYS = int(
-    os.getenv("REFRESH_TOKEN_LIFETIME_DAYS", "7")
-)
+REFRESH_TOKEN_LIFETIME_DAYS = int(os.getenv("REFRESH_TOKEN_LIFETIME_DAYS", "7"))
 
-OTP_LIFETIME_MINUTES = int(
-    os.getenv("OTP_LIFETIME_MINUTES", "10")
-)
+OTP_LIFETIME_MINUTES = int(os.getenv("OTP_LIFETIME_MINUTES", "10"))
 
-OTP_RESEND_COOLDOWN_SECONDS = int(
-    os.getenv("OTP_RESEND_COOLDOWN_SECONDS", "60")
-)
+OTP_RESEND_COOLDOWN_SECONDS = int(os.getenv("OTP_RESEND_COOLDOWN_SECONDS", "60"))
 
-OTP_HOURLY_LIMIT = int(
-    os.getenv("OTP_HOURLY_LIMIT", "3")
-)
+OTP_HOURLY_LIMIT = int(os.getenv("OTP_HOURLY_LIMIT", "3"))
 
-OTP_IP_HOURLY_LIMIT = int(
-    os.getenv("OTP_IP_HOURLY_LIMIT", "10")
-)
+OTP_IP_HOURLY_LIMIT = int(os.getenv("OTP_IP_HOURLY_LIMIT", "10"))
 
-OTP_MAX_VERIFICATION_ATTEMPTS = int(
-    os.getenv("OTP_MAX_VERIFICATION_ATTEMPTS", "5")
-)
+OTP_MAX_VERIFICATION_ATTEMPTS = int(os.getenv("OTP_MAX_VERIFICATION_ATTEMPTS", "5"))
 
 LOGIN_RATE_LIMIT_EMAIL_ATTEMPTS = int(
     os.getenv("LOGIN_RATE_LIMIT_EMAIL_ATTEMPTS", "10")
 )
 
-LOGIN_RATE_LIMIT_IP_ATTEMPTS = int(
-    os.getenv("LOGIN_RATE_LIMIT_IP_ATTEMPTS", "30")
-)
+LOGIN_RATE_LIMIT_IP_ATTEMPTS = int(os.getenv("LOGIN_RATE_LIMIT_IP_ATTEMPTS", "30"))
 
 LOGIN_RATE_LIMIT_WINDOW_SECONDS = int(
     os.getenv("LOGIN_RATE_LIMIT_WINDOW_SECONDS", "900")
@@ -150,24 +121,16 @@ if ACCESS_TOKEN_LIFETIME_MINUTES <= 0:
     )
 
 if REFRESH_TOKEN_LIFETIME_DAYS <= 0:
-    raise ImproperlyConfigured(
-        "REFRESH_TOKEN_LIFETIME_DAYS must be greater than zero."
-    )
+    raise ImproperlyConfigured("REFRESH_TOKEN_LIFETIME_DAYS must be greater than zero.")
 
 if OTP_LIFETIME_MINUTES <= 0:
-    raise ImproperlyConfigured(
-        "OTP_LIFETIME_MINUTES must be greater than zero."
-    )
+    raise ImproperlyConfigured("OTP_LIFETIME_MINUTES must be greater than zero.")
 
 if OTP_RESEND_COOLDOWN_SECONDS < 0:
-    raise ImproperlyConfigured(
-        "OTP_RESEND_COOLDOWN_SECONDS cannot be negative."
-    )
+    raise ImproperlyConfigured("OTP_RESEND_COOLDOWN_SECONDS cannot be negative.")
 
 if OTP_HOURLY_LIMIT <= 0 or OTP_IP_HOURLY_LIMIT <= 0:
-    raise ImproperlyConfigured(
-        "OTP hourly limits must be greater than zero."
-    )
+    raise ImproperlyConfigured("OTP hourly limits must be greater than zero.")
 
 if OTP_MAX_VERIFICATION_ATTEMPTS <= 0:
     raise ImproperlyConfigured(
@@ -179,13 +142,8 @@ if (
     or LOGIN_RATE_LIMIT_IP_ATTEMPTS <= 0
     or LOGIN_RATE_LIMIT_WINDOW_SECONDS <= 0
 ):
-    raise ImproperlyConfigured(
-        "Login rate-limit settings must be greater than zero."
-    )
+    raise ImproperlyConfigured("Login rate-limit settings must be greater than zero.")
 
-# =====================================================
-# CORS / HTTPS
-# =====================================================
 
 if DEBUG:
     CORS_ALLOW_ALL_ORIGINS = True
@@ -214,7 +172,6 @@ X_FRAME_OPTIONS = "DENY"
 SECURE_REFERRER_POLICY = "same-origin"
 
 if not DEBUG:
-    # Expected when Django is behind an HTTPS reverse proxy.
     SECURE_PROXY_SSL_HEADER = (
         "HTTP_X_FORWARDED_PROTO",
         "https",
@@ -226,9 +183,6 @@ if not DEBUG:
 else:
     SECURE_HSTS_SECONDS = 0
 
-# =====================================================
-# TEMPLATES
-# =====================================================
 
 TEMPLATES = [
     {
@@ -245,9 +199,6 @@ TEMPLATES = [
     },
 ]
 
-# =====================================================
-# DATABASE
-# =====================================================
 
 DATABASES = {
     "default": {
@@ -279,16 +230,12 @@ DATABASES = {
 }
 
 if not DEBUG and (
-    not DATABASES["default"]["USER"]
-    or not DATABASES["default"]["PASSWORD"]
+    not DATABASES["default"]["USER"] or not DATABASES["default"]["PASSWORD"]
 ):
     raise ImproperlyConfigured(
         "MYSQL_USER and MYSQL_PASSWORD must be configured when DEBUG is False."
     )
 
-# =====================================================
-# API KEYS / EXTERNAL SERVICES
-# =====================================================
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -301,49 +248,30 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
 UNSTRUCTURED_API_KEY = os.getenv("UNSTRUCTURED_API_KEY")
 
-# =====================================================
-# PASSWORD VALIDATION
-# =====================================================
 
 AUTH_PASSWORD_VALIDATORS = [
     {
         "NAME": (
-            "django.contrib.auth.password_validation."
-            "UserAttributeSimilarityValidator"
+            "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"
         ),
     },
     {
-        "NAME": (
-            "django.contrib.auth.password_validation."
-            "MinimumLengthValidator"
-        ),
+        "NAME": ("django.contrib.auth.password_validation.MinimumLengthValidator"),
     },
     {
-        "NAME": (
-            "django.contrib.auth.password_validation."
-            "CommonPasswordValidator"
-        ),
+        "NAME": ("django.contrib.auth.password_validation.CommonPasswordValidator"),
     },
     {
-        "NAME": (
-            "django.contrib.auth.password_validation."
-            "NumericPasswordValidator"
-        ),
+        "NAME": ("django.contrib.auth.password_validation.NumericPasswordValidator"),
     },
 ]
 
-# =====================================================
-# INTERNATIONALIZATION
-# =====================================================
 
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "Asia/Kolkata"
 USE_I18N = True
 USE_TZ = True
 
-# =====================================================
-# STATIC / MEDIA
-# =====================================================
 
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
@@ -351,18 +279,11 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
-# =====================================================
-# DEFAULT PK
-# =====================================================
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-# =====================================================
-# DRF
-# =====================================================
 
 REST_FRAMEWORK = {
-    # Protected by default. Public auth endpoints opt in with AllowAny.
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
     ],
@@ -371,26 +292,17 @@ REST_FRAMEWORK = {
     ],
 }
 
-# =====================================================
-# REDIS
-# =====================================================
 
 REDIS_HOST = os.getenv(
     "REDIS_HOST",
     "localhost",
 )
 
-REDIS_PORT = int(
-    os.getenv("REDIS_PORT", "6379")
-)
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
-REDIS_DB = int(
-    os.getenv("REDIS_DB", "0")
-)
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 
-REDIS_URL = (
-    f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
-)
+REDIS_URL = f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
 
 CACHES = {
     "default": {
@@ -402,9 +314,6 @@ CACHES = {
     }
 }
 
-# =====================================================
-# LOGGING
-# =====================================================
 
 LOGGING = {
     "version": 1,
@@ -420,9 +329,6 @@ LOGGING = {
     },
 }
 
-# =====================================================
-# FILE UPLOADS
-# =====================================================
 
 FILE_UPLOAD_MAX_MEMORY_SIZE = 50 * 1024 * 1024
 DATA_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024

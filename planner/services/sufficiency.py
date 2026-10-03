@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 TABLE_NO_RESULT = "TABLE_NO_RESULT"
 TABLE_ZERO_ROWS = "TABLE_ZERO_ROWS"
 TABLE_ERROR = "TABLE_ERROR"
@@ -38,10 +37,7 @@ def documents_insufficient(
     if chunk_count <= 0:
         return True
 
-    if (
-        min_retrieval_confidence is not None
-        and confidence < min_retrieval_confidence
-    ):
+    if min_retrieval_confidence is not None and confidence < min_retrieval_confidence:
         return True
 
     return False

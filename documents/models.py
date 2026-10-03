@@ -1,3 +1,5 @@
+"""Models module for QueryPilot."""
+
 from django.db import models
 
 from accounts.models import User
@@ -38,13 +40,9 @@ class Document(models.Model):
         related_name="uploaded_documents",
     )
 
-    title = models.CharField(
-        max_length=255
-    )
+    title = models.CharField(max_length=255)
 
-    file = models.FileField(
-        upload_to="documents/"
-    )
+    file = models.FileField(upload_to="documents/")
 
     source_type = models.CharField(
         max_length=10,
@@ -65,13 +63,9 @@ class Document(models.Model):
         default="pending",
     )
 
-    uploaded_at = models.DateTimeField(
-        auto_now_add=True
-    )
+    uploaded_at = models.DateTimeField(auto_now_add=True)
 
-    updated_at = models.DateTimeField(
-        auto_now=True
-    )
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         constraints = [
@@ -112,9 +106,7 @@ class IngestionJob(models.Model):
         default="pending",
     )
 
-    attempts = models.PositiveSmallIntegerField(
-        default=0
-    )
+    attempts = models.PositiveSmallIntegerField(default=0)
 
     error_message = models.TextField(
         blank=True,
@@ -131,13 +123,9 @@ class IngestionJob(models.Model):
         null=True,
     )
 
-    created_at = models.DateTimeField(
-        auto_now_add=True
-    )
+    created_at = models.DateTimeField(auto_now_add=True)
 
-    updated_at = models.DateTimeField(
-        auto_now=True
-    )
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -165,26 +153,18 @@ class WorkspaceTable(models.Model):
         related_name="tables",
     )
 
-    table_name = models.CharField(
-        max_length=255
-    )
+    table_name = models.CharField(max_length=255)
 
     sqlite_table_name = models.CharField(
         max_length=255,
         unique=True,
     )
 
-    columns = models.JSONField(
-        default=list
-    )
+    columns = models.JSONField(default=list)
 
-    row_count = models.PositiveIntegerField(
-        default=0
-    )
+    row_count = models.PositiveIntegerField(default=0)
 
-    created_at = models.DateTimeField(
-        auto_now_add=True
-    )
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ["table_name"]
@@ -204,17 +184,11 @@ class DocumentMetadata(models.Model):
         related_name="metadata",
     )
 
-    summary = models.TextField(
-        blank=True
-    )
+    summary = models.TextField(blank=True)
 
-    topics = models.JSONField(
-        default=list
-    )
+    topics = models.JSONField(default=list)
 
-    keywords = models.JSONField(
-        default=list
-    )
+    keywords = models.JSONField(default=list)
 
     language = models.CharField(
         max_length=50,
@@ -222,13 +196,9 @@ class DocumentMetadata(models.Model):
         null=True,
     )
 
-    created_at = models.DateTimeField(
-        auto_now_add=True
-    )
+    created_at = models.DateTimeField(auto_now_add=True)
 
-    updated_at = models.DateTimeField(
-        auto_now=True
-    )
+    updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
         return f"Metadata - {self.document.title}"

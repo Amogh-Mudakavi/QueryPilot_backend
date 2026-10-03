@@ -1,15 +1,20 @@
+"""Services Conversation module for QueryPilot."""
+
 import logging
 
 from django.db import transaction
 
 from chat.models import (
     Conversation,
-    Message,
     ConversationDocument,
     ConversationSettings,
+    Message,
 )
-
 from documents.models import Document
+
+logger = logging.getLogger(__name__)
+
+MAX_ATTACHED_DOCUMENTS = 3
 
 
 def create_conversation(
@@ -42,17 +47,13 @@ def create_conversation(
 def get_conversation(
     conversation_id: int,
 ) -> Conversation:
-    return Conversation.objects.get(
-        id=conversation_id
-    )
+    return Conversation.objects.get(id=conversation_id)
 
 
 def list_conversations(
     workspace,
 ):
-    return Conversation.objects.filter(
-        workspace=workspace
-    )
+    return Conversation.objects.filter(workspace=workspace)
 
 
 def add_message(
@@ -74,9 +75,6 @@ def add_message(
         metadata=metadata or {},
     )
 
-    # Message activity should update the parent conversation so list
-    # ordering and Today/Yesterday grouping remain correct after the
-    # conversation already has a title.
     conversation.save(update_fields=["updated_at"])
 
     return message
@@ -93,69 +91,71 @@ def attach_document(
     MVP rules:
         - Maximum 3 documents per conversation.
         - Document must belong to the same workspace.
-        - Duplicate attachments are ignored through get_or_create().
+        - Attaching an already-attached document is a no-op (it is
+          returned even when the conversation is already at the limit).
+
+    The count check and the insert run in one transaction, with the
+    conversation row locked, so concurrent attaches cannot exceed the limit.
     """
-    attached_count = (
-        ConversationDocument.objects.filter(
-            conversation=conversation
-        ).count()
-    )
 
-    if attached_count >= 3:
-        raise ValueError(
-            "Maximum of 3 documents allowed."
-        )
-
-    # Enforce that attached documents must belong to the same workspace.
     if getattr(document, "workspace_id", None) != conversation.workspace_id:
         raise ValueError(
             "Cannot attach a document from a different workspace to this conversation."
         )
 
-    logger = logging.getLogger(__name__)
-    logger.info(
-        "attach_document: conversation_id=%s document_id=%s workspace_id=%s",
-        conversation.id,
-        getattr(document, "id", None),
-        getattr(document, "workspace_id", None),
-    )
+    with transaction.atomic():
+        Conversation.objects.select_for_update().get(pk=conversation.pk)
 
-    link, _ = ConversationDocument.objects.get_or_create(
-        conversation=conversation,
-        document=document,
-    )
+        existing = ConversationDocument.objects.filter(
+            conversation=conversation,
+            document=document,
+        ).first()
+
+        if existing is not None:
+            return existing
+
+        attached_count = ConversationDocument.objects.filter(
+            conversation=conversation
+        ).count()
+
+        if attached_count >= MAX_ATTACHED_DOCUMENTS:
+            raise ValueError(f"Maximum of {MAX_ATTACHED_DOCUMENTS} documents allowed.")
+
+        logger.info(
+            "attach_document: conversation_id=%s document_id=%s workspace_id=%s",
+            conversation.id,
+            getattr(document, "id", None),
+            getattr(document, "workspace_id", None),
+        )
+
+        link = ConversationDocument.objects.create(
+            conversation=conversation,
+            document=document,
+        )
 
     return link
 
 
-def get_recent_history(
+def get_attached_document_ids(
     *,
     conversation: Conversation,
-    limit: int = 10,
-) -> list[dict]:
+) -> list[int]:
     """
-    Return the most recent messages in chronological order.
+    IDs of the documents explicitly attached to this conversation
+    (same-workspace only, stable order). Empty when nothing is attached.
+    """
+    attached = ConversationDocument.objects.filter(
+        conversation=conversation
+    ).values_list("document_id", flat=True)
 
-    This helper is retained for places that still need direct recent
-    history retrieval. Conversation memory uses the same 10-message
-    policy at runtime.
-    """
-    messages = (
-        Message.objects.filter(
-            conversation=conversation
+    return list(
+        Document.objects.filter(
+            id__in=list(attached),
+            workspace_id=conversation.workspace_id,
         )
-        .order_by("-created_at")[:limit]
+        .order_by("id")
+        .values_list("id", flat=True)
     )
-
-    messages = reversed(list(messages))
-
-    return [
-        {
-            "role": message.role.lower(),
-            "content": message.content,
-        }
-        for message in messages
-    ]
 
 
 def get_first_user_message(

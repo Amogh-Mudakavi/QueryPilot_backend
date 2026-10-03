@@ -11,7 +11,6 @@ from chat.views import (
     StreamMessageView,
 )
 
-
 urlpatterns = [
     path(
         "conversations/",

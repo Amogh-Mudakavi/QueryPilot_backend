@@ -1,3 +1,5 @@
+"""Tools Search Evidence module for QueryPilot."""
+
 from __future__ import annotations
 
 import logging
@@ -7,7 +9,6 @@ from retrieval.services.hybrid_retriever import (
     HybridRetriever,
     RetrievalError,
 )
-
 
 _retriever = HybridRetriever()
 logger = logging.getLogger(__name__)
@@ -42,10 +43,7 @@ def _bound_evidence(
             )
         )
 
-        remaining = (
-            MAX_TOTAL_EVIDENCE_CHARS
-            - total_chars
-        )
+        remaining = MAX_TOTAL_EVIDENCE_CHARS - total_chars
 
         if remaining <= 0:
             break
@@ -57,9 +55,7 @@ def _bound_evidence(
 
         bounded_item["content"] = content[:content_limit]
 
-        total_chars += len(
-            bounded_item["content"]
-        )
+        total_chars += len(bounded_item["content"])
 
         bounded.append(bounded_item)
 
@@ -108,14 +104,10 @@ def search_evidence(
     query = query.strip()
 
     if not query:
-        raise ValueError(
-            "search_evidence query cannot be empty."
-        )
+        raise ValueError("search_evidence query cannot be empty.")
 
     if workspace_id <= 0:
-        raise ValueError(
-            "workspace_id must be greater than zero."
-        )
+        raise ValueError("workspace_id must be greater than zero.")
 
     logger.info(
         "search_evidence: workspace_id=%s allowed_document_ids=%s source_types=%s",
@@ -139,14 +131,9 @@ def search_evidence(
         )
         return _error_result(error=exc)
 
-    raw_evidence = [
-        item.to_dict()
-        for item in result.evidence
-    ]
+    raw_evidence = [item.to_dict() for item in result.evidence]
 
-    evidence = _bound_evidence(
-        raw_evidence
-    )
+    evidence = _bound_evidence(raw_evidence)
 
     logger.info(
         "search_evidence: returning evidence=%d candidate_count=%s confidence=%.4f",
@@ -155,10 +142,103 @@ def search_evidence(
         result.confidence,
     )
 
+    if result.dense_failed:
+        logger.warning(
+            "search_evidence: dense retrieval unavailable for "
+            "allowed_document_ids=%s; result is lexical-only (degraded).",
+            allowed_document_ids,
+        )
+
     return {
         "error_code": None,
         "error": None,
         "evidence": evidence,
         "confidence": result.confidence,
         "candidate_count": result.candidate_count,
+        "degraded": bool(result.dense_failed),
+    }
+
+
+def search_evidence_by_keys(
+    *,
+    keys: list[str],
+    workspace_id: int,
+    allowed_document_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    """
+    Exact stable-key lookup in document text (embedding-independent).
+
+    Same workspace / document scoping and same structured error contract as
+    search_evidence. Used to fetch companion evidence with a key that was
+    resolved from another source (PDF, spreadsheet row, ...).
+    """
+    if workspace_id <= 0:
+        raise ValueError("workspace_id must be greater than zero.")
+
+    logger.info(
+        "search_evidence_by_keys: workspace_id=%s allowed_document_ids=%s keys=%s",
+        workspace_id,
+        allowed_document_ids,
+        keys,
+    )
+
+    try:
+        result = _retriever.lookup_by_keys(
+            keys=keys,
+            workspace_id=workspace_id,
+            allowed_document_ids=allowed_document_ids,
+            source_types=["text"],
+        )
+    except RetrievalError as exc:
+        logger.error(
+            "search_evidence_by_keys: lookup failed code=%s message=%s",
+            exc.code,
+            exc.message,
+        )
+        return {**_error_result(error=exc), "matched_keys": {}, "non_identifying": []}
+
+    evidence = _bound_evidence([item.to_dict() for item in result.evidence])
+
+    return {
+        "error_code": None,
+        "error": None,
+        "evidence": evidence,
+        "confidence": 1.0 if evidence else 0.0,
+        "candidate_count": len(evidence),
+        "matched_keys": result.matched_keys,
+        "non_identifying": result.non_identifying,
+    }
+
+
+def fetch_document_chunks(
+    *,
+    workspace_id: int,
+    document_ids: list[int],
+) -> dict[str, Any]:
+    """
+    All text chunks of the given documents, in reading order.
+
+    Workspace- and document-scoped like every other retrieval entry point;
+    failures come back as the same structured error contract.
+    """
+    if workspace_id <= 0:
+        raise ValueError("workspace_id must be greater than zero.")
+
+    try:
+        chunks = _retriever.fetch_document_chunks(
+            workspace_id=workspace_id,
+            document_ids=document_ids,
+        )
+    except RetrievalError as exc:
+        logger.error(
+            "fetch_document_chunks: failed code=%s message=%s",
+            exc.code,
+            exc.message,
+        )
+        return {**_error_result(error=exc), "chunks": []}
+
+    return {
+        "error_code": None,
+        "error": None,
+        "chunks": chunks,
     }

@@ -35,30 +35,18 @@ class Evidence:
         Official company refund policy...
     """
 
-    # Actual evidence content
     content: str
 
-    # Retrieval score after dense/BM25 fusion
     score: float
 
-    # Source type
-    # Examples:
-    # text_chunk
-    # table_metadata
-    # table_row
-    # web_result
     source_type: str
 
-    # Workspace ownership
     workspace_id: int
 
-    # Origin document
     document_id: int
 
-    # Optional document name for debugging/UI
     document_name: Optional[str] = None
 
-    # Additional metadata from Chroma / SQLite
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:

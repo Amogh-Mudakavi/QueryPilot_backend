@@ -1,5 +1,6 @@
-from django.shortcuts import get_object_or_404
+"""Views module for QueryPilot."""
 
+from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.generics import ListAPIView
 from rest_framework.permissions import IsAuthenticated
@@ -8,10 +9,10 @@ from rest_framework.views import APIView
 
 from .models import Workspace
 from .serializers import (
-    WorkspaceSerializer,
     WorkspaceCreateSerializer,
-    WorkspaceUpdateSerializer,
+    WorkspaceSerializer,
     WorkspaceSettingsSerializer,
+    WorkspaceUpdateSerializer,
 )
 
 
@@ -19,9 +20,7 @@ class WorkspaceCreateAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        serializer = WorkspaceCreateSerializer(
-            data=request.data
-        )
+        serializer = WorkspaceCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         workspace = Workspace.objects.create(
@@ -40,9 +39,7 @@ class WorkspaceListAPIView(ListAPIView):
     serializer_class = WorkspaceSerializer
 
     def get_queryset(self):
-        return Workspace.objects.filter(
-            owner=self.request.user
-        ).order_by("-updated_at")
+        return Workspace.objects.filter(owner=self.request.user).order_by("-updated_at")
 
 
 class WorkspaceDetailAPIView(APIView):
@@ -82,9 +79,7 @@ class WorkspaceDetailAPIView(APIView):
 
         workspace.delete()
 
-        return Response(
-            status=status.HTTP_204_NO_CONTENT
-        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class WorkspaceSettingsAPIView(APIView):

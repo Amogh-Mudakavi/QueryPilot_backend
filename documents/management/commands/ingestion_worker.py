@@ -24,42 +24,33 @@ import logging
 import os
 import threading
 import time
-
 from concurrent.futures import (
     ThreadPoolExecutor,
 )
-
 from datetime import timedelta
 
 import redis
-
 from django.core.management.base import BaseCommand
-from django.db import close_old_connections
-from django.db import transaction
+from django.db import close_old_connections, transaction
 from django.db.models import Q
 from django.utils import timezone
 
 from documents.ingestion.pipeline import (
     IngestionPipeline,
 )
-
 from documents.ingestion.sqlite import (
     SQLiteManager,
 )
-
 from documents.ingestion.vectors import (
     VectorStore,
 )
-
 from documents.models import (
     IngestionJob,
 )
-
 from utils.redis import (
     enqueue_job,
     get_next_job,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -108,30 +99,18 @@ def _claim_job(job_id: int):
 
     now = timezone.now()
 
-    stale_before = (
-        now
-        - timedelta(
-            seconds=JOB_STALE_SECONDS
-        )
-    )
+    stale_before = now - timedelta(seconds=JOB_STALE_SECONDS)
 
     with transaction.atomic():
-
         job = (
-            IngestionJob.objects
-            .select_for_update(
-                skip_locked=True
-            )
-            .select_related(
-                "document"
-            )
+            IngestionJob.objects.select_for_update(skip_locked=True)
+            .select_related("document")
             .filter(
                 Q(
                     id=job_id,
                     status="pending",
                 )
-                |
-                Q(
+                | Q(
                     id=job_id,
                     status="processing",
                     updated_at__lt=stale_before,
@@ -179,31 +158,19 @@ def _heartbeat(
 
     close_old_connections()
 
-    while not stop_event.wait(
-        HEARTBEAT_SECONDS
-    ):
-
+    while not stop_event.wait(HEARTBEAT_SECONDS):
         try:
-
-            updated = (
-                IngestionJob.objects
-                .filter(
-                    id=job_id,
-                    status="processing",
-                )
-                .update(
-                    updated_at=timezone.now()
-                )
-            )
+            updated = IngestionJob.objects.filter(
+                id=job_id,
+                status="processing",
+            ).update(updated_at=timezone.now())
 
             if updated == 0:
                 break
 
         except Exception:
-
             logger.exception(
-                "[INGESTION] Heartbeat failed "
-                "for job %s",
+                "[INGESTION] Heartbeat failed for job %s",
                 job_id,
             )
 
@@ -274,80 +241,54 @@ def _delete_failed_document(document):
     cleanup_errors = []
 
     try:
-
-        VectorStore.delete_document(
-            document_id=document_id
-        )
+        VectorStore.delete_document(document_id=document_id)
 
     except Exception:
-
         logger.exception(
-            "[INGESTION] Vector cleanup failed "
-            "for permanently failed document %s",
+            "[INGESTION] Vector cleanup failed for permanently failed document %s",
             document_id,
         )
 
-        cleanup_errors.append(
-            "vectors"
-        )
+        cleanup_errors.append("vectors")
 
     try:
-
         SQLiteManager.drop_document_tables(
             workspace_id=workspace_id,
             document_id=document_id,
         )
 
     except Exception:
-
         logger.exception(
-            "[INGESTION] SQLite cleanup failed "
-            "for permanently failed document %s",
+            "[INGESTION] SQLite cleanup failed for permanently failed document %s",
             document_id,
         )
 
-        cleanup_errors.append(
-            "tables"
-        )
+        cleanup_errors.append("tables")
 
     try:
-
         if document.file:
-
-            document.file.delete(
-                save=False
-            )
+            document.file.delete(save=False)
 
     except Exception:
-
         logger.exception(
-            "[INGESTION] File cleanup failed "
-            "for permanently failed document %s",
+            "[INGESTION] File cleanup failed for permanently failed document %s",
             document_id,
         )
 
-        cleanup_errors.append(
-            "file"
-        )
+        cleanup_errors.append("file")
 
     try:
-
         document.delete()
 
     except Exception:
-
         logger.exception(
-            "[INGESTION] Database cleanup failed "
-            "for permanently failed document %s",
+            "[INGESTION] Database cleanup failed for permanently failed document %s",
             document_id,
         )
 
-        cleanup_errors.append(
-            "database"
-        )
+        cleanup_errors.append("database")
 
     if cleanup_errors:
-
         logger.error(
             "[INGESTION] Permanently failed document %s "
             "was deleted, but cleanup may be incomplete: %s",
@@ -356,10 +297,8 @@ def _delete_failed_document(document):
         )
 
     else:
-
         logger.info(
-            "[INGESTION] Permanently failed document %s "
-            "deleted successfully.",
+            "[INGESTION] Permanently failed document %s deleted successfully.",
             document_id,
         )
 
@@ -391,14 +330,11 @@ def _mark_for_retry(
     )
 
     try:
-
         enqueue_job(job.id)
 
     except Exception:
-
         logger.exception(
-            "[INGESTION] Failed to requeue "
-            "job %s. Recovery sweep will retry it.",
+            "[INGESTION] Failed to requeue job %s. Recovery sweep will retry it.",
             job.id,
         )
 
@@ -409,12 +345,9 @@ def process_ingestion_job(
 
     close_old_connections()
 
-    job, document = _claim_job(
-        job_id
-    )
+    job, document = _claim_job(job_id)
 
     if job is None:
-
         close_old_connections()
         return
 
@@ -432,15 +365,12 @@ def process_ingestion_job(
     heartbeat_thread.start()
 
     try:
-
         logger.info(
             "[INGESTION] Processing job %s",
             job.id,
         )
 
-        IngestionPipeline.run(
-            document
-        )
+        IngestionPipeline.run(document)
 
         _mark_completed(
             job,
@@ -453,14 +383,12 @@ def process_ingestion_job(
         )
 
     except Exception as exc:
-
         logger.exception(
             "[INGESTION] Failed job %s",
             job.id,
         )
 
         if job.attempts < MAX_JOB_ATTEMPTS:
-
             _mark_for_retry(
                 job,
                 document,
@@ -468,15 +396,13 @@ def process_ingestion_job(
             )
 
             logger.warning(
-                "[INGESTION] Job %s requeued "
-                "(attempt %s/%s).",
+                "[INGESTION] Job %s requeued (attempt %s/%s).",
                 job.id,
                 job.attempts,
                 MAX_JOB_ATTEMPTS,
             )
 
         else:
-
             _mark_failed(
                 job,
                 document,
@@ -484,23 +410,17 @@ def process_ingestion_job(
             )
 
             logger.error(
-                "[INGESTION] Job %s permanently failed "
-                "after %s attempts.",
+                "[INGESTION] Job %s permanently failed after %s attempts.",
                 job.id,
                 job.attempts,
             )
 
-            _delete_failed_document(
-                document
-            )
+            _delete_failed_document(document)
 
     finally:
-
         stop_event.set()
 
-        heartbeat_thread.join(
-            timeout=2
-        )
+        heartbeat_thread.join(timeout=2)
 
         close_old_connections()
 
@@ -509,24 +429,16 @@ def recover_pending_jobs():
 
     now = timezone.now()
 
-    stale_before = (
-        now
-        - timedelta(
-            seconds=JOB_STALE_SECONDS
-        )
-    )
+    stale_before = now - timedelta(seconds=JOB_STALE_SECONDS)
 
     job_ids = list(
-        IngestionJob.objects
-        .filter(
+        IngestionJob.objects.filter(
             Q(status="pending")
-            |
-            Q(
+            | Q(
                 status="processing",
                 updated_at__lt=stale_before,
             )
-        )
-        .values_list(
+        ).values_list(
             "id",
             flat=True,
         )
@@ -541,18 +453,12 @@ def recover_pending_jobs():
     )
 
     for job_id in job_ids:
-
         try:
-
-            enqueue_job(
-                job_id
-            )
+            enqueue_job(job_id)
 
         except Exception:
-
             logger.exception(
-                "[INGESTION] Could not requeue "
-                "recovery job %s.",
+                "[INGESTION] Could not requeue recovery job %s.",
                 job_id,
             )
 
@@ -564,58 +470,37 @@ def _cleanup_finished_futures(
     finished = []
 
     for future in futures:
-
         if future.done():
-
             try:
                 future.result()
 
             except Exception:
-
                 logger.exception(
-                    "[INGESTION] Worker task crashed "
-                    "outside normal job handling."
+                    "[INGESTION] Worker task crashed outside normal job handling."
                 )
 
-            finished.append(
-                future
-            )
+            finished.append(future)
 
     for future in finished:
-
-        futures.remove(
-            future
-        )
+        futures.remove(future)
 
 
 def start_worker():
 
     logger.info(
-        "[INGESTION] Starting worker "
-        "with concurrency=%s.",
+        "[INGESTION] Starting worker with concurrency=%s.",
         WORKER_CONCURRENCY,
     )
 
-    logger.info(
-        "[INGESTION] Loading embedding model..."
-    )
+    logger.info("[INGESTION] Loading embedding model...")
 
     VectorStore.get_embedder()
 
-    logger.info(
-        "[INGESTION] Embedding model ready."
-    )
+    logger.info("[INGESTION] Embedding model ready.")
 
-    # Warm up the shared model with one short encode. This finishes
-    # lazy initialization and pages the model weights in BEFORE the
-    # first real job, and logs a timing baseline for this machine.
     warmup_started = time.monotonic()
 
-    VectorStore.embed(
-        [
-            "QueryPilot embedding model warm-up."
-        ]
-    )
+    VectorStore.embed(["QueryPilot embedding model warm-up."])
 
     logger.info(
         "[INGESTION] Embedding warm-up completed in %.2fs.",
@@ -625,54 +510,31 @@ def start_worker():
     recover_pending_jobs()
 
     futures = set()
-    executor = ThreadPoolExecutor(
-        max_workers=WORKER_CONCURRENCY
-    )
+    executor = ThreadPoolExecutor(max_workers=WORKER_CONCURRENCY)
 
-    logger.info(
-        "[INGESTION] Worker ready. "
-        "Waiting for ingestion jobs."
-    )
+    logger.info("[INGESTION] Worker ready. Waiting for ingestion jobs.")
 
     last_recovery = time.monotonic()
 
     try:
-
         while True:
-
-            _cleanup_finished_futures(
-                futures
-            )
+            _cleanup_finished_futures(futures)
 
             now = time.monotonic()
 
-            if (
-                now - last_recovery
-                >= RECOVERY_INTERVAL_SECONDS
-            ):
-
+            if now - last_recovery >= RECOVERY_INTERVAL_SECONDS:
                 recover_pending_jobs()
                 last_recovery = now
 
-            # Never submit more work than our
-            # configured concurrency.
             if len(futures) >= WORKER_CONCURRENCY:
-
                 time.sleep(0.25)
                 continue
 
             try:
-
-                job_id = get_next_job(
-                    timeout=5
-                )
+                job_id = get_next_job(timeout=5)
 
             except redis.exceptions.RedisError:
-
-                logger.exception(
-                    "[INGESTION] Redis connection "
-                    "error. Retrying."
-                )
+                logger.exception("[INGESTION] Redis connection error. Retrying.")
 
                 time.sleep(2)
                 continue
@@ -685,28 +547,17 @@ def start_worker():
                 job_id,
             )
 
-            futures.add(
-                future
-            )
+            futures.add(future)
 
     except KeyboardInterrupt:
-
-        logger.info(
-            "[INGESTION] Shutdown requested."
-        )
+        logger.info("[INGESTION] Shutdown requested.")
 
     finally:
-
-        executor.shutdown(
-            wait=True
-        )
+        executor.shutdown(wait=True)
 
 
 class Command(BaseCommand):
-
-    help = (
-        "Start the QueryPilot document ingestion worker."
-    )
+    help = "Start the QueryPilot document ingestion worker."
 
     def handle(
         self,
@@ -714,10 +565,6 @@ class Command(BaseCommand):
         **options,
     ):
 
-        self.stdout.write(
-            self.style.SUCCESS(
-                "Starting QueryPilot ingestion worker..."
-            )
-        )
+        self.stdout.write(self.style.SUCCESS("Starting QueryPilot ingestion worker..."))
 
         start_worker()

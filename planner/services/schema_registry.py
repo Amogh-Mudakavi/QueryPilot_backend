@@ -1,38 +1,44 @@
+"""Services Schema Registry module for QueryPilot."""
+
 from __future__ import annotations
 
 import sqlite3
 from typing import Any
 
-from django.db.models import QuerySet
-
-from documents.models import Document
 from documents.ingestion.sqlite import SQLiteManager
+from documents.models import Document
 
 
 def get_workspace_schema(
     workspace_id: int,
     allowed_document_ids: list[int] | None = None,
+    include_sample_rows: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return authoritative SQLite schemas for tables in a workspace."""
+    """Return authoritative SQLite schemas for tables in a workspace.
+
+    When ``include_sample_rows`` is True, expose the sample rows already
+    fetched for numeric-column detection so downstream table selection can
+    reuse them without issuing another SELECT against the same table.
+    """
     if workspace_id <= 0:
         raise ValueError("workspace_id must be greater than zero.")
 
-    document_ids = None if allowed_document_ids is None else {
-        int(value) for value in allowed_document_ids
-    }
+    document_ids = (
+        None
+        if allowed_document_ids is None
+        else {int(value) for value in allowed_document_ids}
+    )
     if document_ids == set():
         return []
 
     prefix = f"ws_{workspace_id}_"
     table_names = [
-        name for name in SQLiteManager.list_tables()
-        if name.startswith(prefix)
+        name for name in SQLiteManager.list_tables() if name.startswith(prefix)
     ]
 
     if document_ids is not None:
         table_names = [
-            name for name in table_names
-            if _get_document_id(name) in document_ids
+            name for name in table_names if _get_document_id(name) in document_ids
         ]
 
     if not table_names:
@@ -46,6 +52,12 @@ def get_workspace_schema(
             id__in=ids,
         ).only("id", "title", "source_type", "status")
     }
+    valid_document_ids = set(documents)
+    table_names = [
+        name for name in table_names if _get_document_id(name) in valid_document_ids
+    ]
+    if not table_names:
+        return []
 
     connection = sqlite3.connect(
         f"file:{SQLiteManager.DB_PATH}?mode=ro",
@@ -54,16 +66,15 @@ def get_workspace_schema(
     try:
         schema: list[dict[str, Any]] = []
         for table_name in sorted(table_names):
-            rows = connection.execute(
-                f'PRAGMA table_info("{table_name}")'
-            ).fetchall()
+            rows = connection.execute(f'PRAGMA table_info("{table_name}")').fetchall()
             columns = [row[1] for row in rows]
             sample_rows = connection.execute(
                 f'SELECT * FROM "{table_name}" LIMIT 5'
             ).fetchall()
             document_id = _get_document_id(table_name)
             document = documents.get(document_id)
-            schema.append({
+
+            item: dict[str, Any] = {
                 "document_id": document_id,
                 "document_title": getattr(document, "title", None),
                 "source_type": getattr(document, "source_type", None),
@@ -72,7 +83,14 @@ def get_workspace_schema(
                 "columns": columns,
                 "numeric_columns": _detect_numeric_columns(columns, sample_rows),
                 "row_count": _count_rows(connection, table_name),
-            })
+            }
+
+            if include_sample_rows:
+                item["sample_rows"] = [
+                    dict(zip(columns, row)) for row in sample_rows[:5]
+                ]
+
+            schema.append(item)
         return schema
     finally:
         connection.close()
@@ -105,27 +123,27 @@ def get_workspace_catalog(
     catalog: list[dict[str, Any]] = []
     for document in documents:
         tables = by_document.get(document.id, [])
-        catalog.append({
-            "document_id": document.id,
-            "title": document.title,
-            "source_type": document.source_type,
-            "status": document.status,
-            "tables": [
-                {
-                    "table_name": table["table_name"],
-                    "columns": table["columns"],
-                    "row_count": table["row_count"],
-                }
-                for table in tables
-            ],
-        })
+        catalog.append(
+            {
+                "document_id": document.id,
+                "title": document.title,
+                "source_type": document.source_type,
+                "status": document.status,
+                "tables": [
+                    {
+                        "table_name": table["table_name"],
+                        "columns": table["columns"],
+                        "row_count": table["row_count"],
+                    }
+                    for table in tables
+                ],
+            }
+        )
     return catalog
 
 
 def _count_rows(connection: sqlite3.Connection, table_name: str) -> int:
-    return int(connection.execute(
-        f'SELECT COUNT(*) FROM "{table_name}"'
-    ).fetchone()[0])
+    return int(connection.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0])
 
 
 def _detect_numeric_columns(
@@ -141,9 +159,7 @@ def _detect_numeric_columns(
 
 
 def _is_number(value: Any) -> bool:
-    # Values like "25,000" are numeric with a thousands separator:
-    # plain float("25,000") fails and the column then loses its CAST
-    # protection in SQL generation. Strip commas before testing.
+
     try:
         float(str(value).replace(",", ""))
         return True

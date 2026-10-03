@@ -1,12 +1,13 @@
+"""Urls module for QueryPilot."""
+
 from django.urls import path
 
 from .views import (
-    DocumentUploadAPIView,
+    DocumentDeleteAPIView,
     DocumentListAPIView,
     DocumentStatusAPIView,
-    DocumentDeleteAPIView,
+    DocumentUploadAPIView,
 )
-
 
 urlpatterns = [
     path(
@@ -14,19 +15,16 @@ urlpatterns = [
         DocumentUploadAPIView.as_view(),
         name="document-upload",
     ),
-
     path(
         "",
         DocumentListAPIView.as_view(),
         name="document-list",
     ),
-
     path(
         "<int:document_id>/status/",
         DocumentStatusAPIView.as_view(),
         name="document-status",
     ),
-
     path(
         "<int:document_id>/",
         DocumentDeleteAPIView.as_view(),

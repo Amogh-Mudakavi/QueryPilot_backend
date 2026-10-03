@@ -1,3 +1,5 @@
+"""Serializers module for QueryPilot."""
+
 from rest_framework import serializers
 
 from .models import Workspace
@@ -39,9 +41,7 @@ class WorkspaceUpdateSerializer(serializers.ModelSerializer):
         value = value.strip()
 
         if not value:
-            raise serializers.ValidationError(
-                "Workspace title cannot be empty."
-            )
+            raise serializers.ValidationError("Workspace title cannot be empty.")
 
         return value
 

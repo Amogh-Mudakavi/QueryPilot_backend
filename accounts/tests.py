@@ -1,12 +1,12 @@
+"""Tests module for QueryPilot."""
+
 from datetime import timedelta
 from unittest.mock import patch
 
 import jwt
-
 from django.contrib.auth.hashers import check_password
 from django.test import TestCase
 from django.utils import timezone
-
 from rest_framework.test import APIClient
 
 from utils.auth_utils import (
@@ -15,7 +15,6 @@ from utils.auth_utils import (
     generate_refresh_token,
     hash_refresh_token,
 )
-
 from utils.email_utils import (
     generate_otp,
     hash_otp,
@@ -26,7 +25,6 @@ from .models import EmailOTP, RefreshToken, User
 
 
 class AuthSecurityTests(TestCase):
-
     def setUp(self):
         self.client = APIClient()
 
@@ -36,9 +34,7 @@ class AuthSecurityTests(TestCase):
             name="Test User",
         )
 
-        self.user.set_password(
-            "StrongPassword123!"
-        )
+        self.user.set_password("StrongPassword123!")
 
         self.user.save()
 
@@ -66,19 +62,14 @@ class AuthSecurityTests(TestCase):
         )
 
     def test_refresh_token_is_stored_as_hash(self):
-        raw_token = generate_refresh_token(
-            self.user
-        )
+        raw_token = generate_refresh_token(self.user)
 
-        stored_hash = hash_refresh_token(
-            raw_token
-        )
+        stored_hash = hash_refresh_token(raw_token)
 
         refresh_record = RefreshToken.objects.create(
             user=self.user,
             token=stored_hash,
-            expires_at=timezone.now()
-            + timedelta(days=7),
+            expires_at=timezone.now() + timedelta(days=7),
         )
 
         self.assertNotEqual(
@@ -97,9 +88,7 @@ class AuthSecurityTests(TestCase):
         )
 
     def test_access_token_contains_access_type(self):
-        token = generate_access_token(
-            self.user
-        )
+        token = generate_access_token(self.user)
 
         payload = decode_token(token)
 
@@ -114,9 +103,7 @@ class AuthSecurityTests(TestCase):
         )
 
     def test_refresh_token_contains_refresh_type(self):
-        token = generate_refresh_token(
-            self.user
-        )
+        token = generate_refresh_token(self.user)
 
         payload = decode_token(token)
 
@@ -137,13 +124,9 @@ class AuthSecurityTests(TestCase):
 
     def test_inactive_user_cannot_authenticate(self):
         self.user.is_active = False
-        self.user.save(
-            update_fields=["is_active"]
-        )
+        self.user.save(update_fields=["is_active"])
 
-        token = generate_access_token(
-            self.user
-        )
+        token = generate_access_token(self.user)
 
         response = self.client.get(
             "/api/auth/me/",
@@ -157,13 +140,9 @@ class AuthSecurityTests(TestCase):
 
     def test_blocked_user_cannot_authenticate(self):
         self.user.is_blocked = True
-        self.user.save(
-            update_fields=["is_blocked"]
-        )
+        self.user.save(update_fields=["is_blocked"])
 
-        token = generate_access_token(
-            self.user
-        )
+        token = generate_access_token(self.user)
 
         response = self.client.get(
             "/api/auth/me/",
@@ -211,17 +190,9 @@ class AuthSecurityTests(TestCase):
             response.data,
         )
 
-        self.assertTrue(
-            RefreshToken.objects.filter(
-                user=self.user
-            ).exists()
-        )
+        self.assertTrue(RefreshToken.objects.filter(user=self.user).exists())
 
-        stored_token = (
-            RefreshToken.objects
-            .filter(user=self.user)
-            .latest("created_at")
-        )
+        stored_token = RefreshToken.objects.filter(user=self.user).latest("created_at")
 
         self.assertNotEqual(
             stored_token.token,
@@ -230,9 +201,7 @@ class AuthSecurityTests(TestCase):
 
         self.assertEqual(
             stored_token.token,
-            hash_refresh_token(
-                response.data["refresh_token"]
-            ),
+            hash_refresh_token(response.data["refresh_token"]),
         )
 
     @patch(
@@ -319,21 +288,13 @@ class AuthSecurityTests(TestCase):
         )
 
     def test_refresh_token_has_unique_jti(self):
-        token_one = generate_refresh_token(
-            self.user
-        )
+        token_one = generate_refresh_token(self.user)
 
-        token_two = generate_refresh_token(
-            self.user
-        )
+        token_two = generate_refresh_token(self.user)
 
-        payload_one = decode_token(
-            token_one
-        )
+        payload_one = decode_token(token_one)
 
-        payload_two = decode_token(
-            token_two
-        )
+        payload_two = decode_token(token_two)
 
         self.assertNotEqual(
             payload_one["jti"],
@@ -347,22 +308,15 @@ class AuthSecurityTests(TestCase):
             email=self.user.email,
             otp=hash_otp(otp),
             purpose="reset_password",
-            expires_at=timezone.now()
-            + timedelta(minutes=10),
+            expires_at=timezone.now() + timedelta(minutes=10),
         )
 
-        self.assertFalse(
-            record.is_used
-        )
+        self.assertFalse(record.is_used)
 
         record.is_used = True
 
-        record.save(
-            update_fields=["is_used"]
-        )
+        record.save(update_fields=["is_used"])
 
         record.refresh_from_db()
 
-        self.assertTrue(
-            record.is_used
-        )
+        self.assertTrue(record.is_used)

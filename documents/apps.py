@@ -1,7 +1,8 @@
+"""Apps module for QueryPilot."""
+
 import os
 
 from django.apps import AppConfig
-
 
 os.environ.setdefault(
     "HF_HUB_DISABLE_PROGRESS_BARS",
@@ -20,5 +21,4 @@ os.environ.setdefault(
 
 
 class DocumentsConfig(AppConfig):
-
-    name="documents"
+    name = "documents"

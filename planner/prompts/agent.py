@@ -1,3 +1,5 @@
+"""Prompts Agent module for QueryPilot."""
+
 from __future__ import annotations
 
 """Query understanding prompt for QueryPilot."""
@@ -56,6 +58,12 @@ OTHER SEMANTIC CUES
   a pronoun such as "he", "his", "it", "that", or "this".
 - A detailed view of table CONTENT/DATA is structured. Table METADATA/STRUCTURE
   remains metadata.
+- metadata covers questions about the workspace's files and tables
+  THEMSELVES: which or how many files exist, file names, file types, status,
+  which tables a file has, column names, row counts. For these, put the
+  attribute asked in requested_fields using plain catalog words such as
+  "document name", "file type", "number of documents", "table names",
+  "column names", "row count".
 
 RULES
 - Preserve user-supplied reference strings; do not invent canonical names.
@@ -76,6 +84,8 @@ Examples:
 "compare policy_a.pdf and policy_b.pdf and tell me the differences" -> document/compare, references policy_a.pdf and policy_b.pdf
 "use salary.xlsx and taxslabs.pdf to calculate the deduction" -> mixed/calculate, references salary.xlsx and taxslabs.pdf
 "which documents are uploaded?" -> metadata/list
+"how many documents are there?" -> metadata/list, field number of documents
+"what type is the second document?" -> metadata/describe, reference the second document, field file type
 "what is QueryPilot?" -> product/answer
 "tell me about the developer who built this" -> product/answer
 "what's his full name?" -> product/answer

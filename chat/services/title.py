@@ -76,12 +76,7 @@ def generate_conversation_title(
 
     profiles = document_profiles or []
 
-    # Bound the amount of profile information sent to the small LLM.
-    bounded_profiles = [
-        profile[:4000]
-        for profile in profiles[:3]
-        if profile
-    ]
+    bounded_profiles = [profile[:4000] for profile in profiles[:3] if profile]
 
     prompt_parts = [
         "USER REQUEST:",
@@ -103,13 +98,9 @@ def generate_conversation_title(
                 ]
             )
     else:
-        prompt_parts.append(
-            "No document profiles available."
-        )
+        prompt_parts.append("No document profiles available.")
 
-    prompt = "\n".join(
-        prompt_parts
-    )
+    prompt = "\n".join(prompt_parts)
 
     response = router.generate(
         task="chitchat",
@@ -124,39 +115,25 @@ def generate_conversation_title(
             },
         ],
         temperature=0.0,
-        max_tokens=300,  # gpt-oss spends completion tokens on hidden reasoning
+        max_tokens=300,
         include_reasoning=False,
     )
 
     try:
-        content = (
-            response
-            .choices[0]
-            .message
-            .content
-            .strip()
-        )
+        content = response.choices[0].message.content.strip()
     except (
         AttributeError,
         IndexError,
     ):
-        return _fallback_title(
-            user_query
-        )
+        return _fallback_title(user_query)
 
     if not content:
-        return _fallback_title(
-            user_query
-        )
+        return _fallback_title(user_query)
 
     title = _normalize_title(content)
 
     if not _is_valid_title(title):
-        # e.g. "Unable to answer without employee data." -- the model
-        # answered/refused the request instead of titling it.
-        logger.warning(
-            "Rejected non-title output from title model; using fallback."
-        )
+        logger.warning("Rejected non-title output from title model; using fallback.")
         return _fallback_title(user_query)
 
     return title
@@ -171,25 +148,18 @@ def _normalize_title(
 
     title = title.strip()
 
-    # Remove accidental surrounding quotes.
     if (
         len(title) >= 2
         and title[0] == title[-1]
-        and title[0] in {
+        and title[0]
+        in {
             '"',
             "'",
         }
     ):
         title = title[1:-1].strip()
 
-    # Remove markdown emphasis if the model adds it.
-    title = title.replace(
-        "**",
-        ""
-    ).replace(
-        "__",
-        ""
-    ).strip()
+    title = title.replace("**", "").replace("__", "").strip()
 
     if not title:
         return "New Chat"
@@ -209,9 +179,7 @@ def _fallback_title(
     if not words:
         return "New Chat"
 
-    title = " ".join(
-        words[:8]
-    ).strip()
+    title = " ".join(words[:8]).strip()
 
     if len(title) > MAX_TITLE_LENGTH:
         title = title[:MAX_TITLE_LENGTH].rsplit(
@@ -221,6 +189,7 @@ def _fallback_title(
 
     return title or "New Chat"
 
+
 _REFUSAL_START = re.compile(
     r"^(unable|cannot|can't|cant|sorry|i\b|i'm|as an ai|there (is|are) no|"
     r"no (data|information)|not enough|insufficient)",
@@ -228,8 +197,19 @@ _REFUSAL_START = re.compile(
 )
 
 _GREETINGS = {
-    "hi", "hello", "hey", "hii", "yo", "thanks", "thank you", "thx",
-    "ok", "okay", "good morning", "good afternoon", "good evening",
+    "hi",
+    "hello",
+    "hey",
+    "hii",
+    "yo",
+    "thanks",
+    "thank you",
+    "thx",
+    "ok",
+    "okay",
+    "good morning",
+    "good afternoon",
+    "good evening",
 }
 
 
