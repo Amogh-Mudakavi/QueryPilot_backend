@@ -1,0 +1,57 @@
+config.py	Central configuration. Stores the 3 Groq API keys, model names, per-model TPM limits, task profiles, fixed max_tokens, timeouts, reasoning effort, admission settings, retry/cooldown settings. It deliberately has no request-wide token budget.   
+
+router.py	The entry point used by the rest of QueryPilot. Code calls something like router.generate(task="planner", ...). It looks up the task profile and sends the call to the provider. It does not choose a key itself and does not reduce max_tokens based on earlier calls.
+
+providers.py	The Groq integration layer. Owns the Groq clients, performs normal/streaming calls, handles provider errors, retries, cooldowns, and talks to the scheduler to decide which key/model pool executes the request.   providers(20261003-184046)
+
+scheduler.py	The key/quota scheduler. Maintains the six independent pools: 3 keys × 2 models. Tracks rolling-window token reservations, actual usage settlement, cooldowns, disabled keys, fairness and admission. This is what decides which key handles a particular call. 
+
+usage.py	Observability only. Records actual input/completion/reasoning/total tokens, task, model, key, latency, status, etc. It does not enforce a user token budget and does not shrink generation limits.
+config(20261004-055024)
+exceptions.py	Defines the LLM/provider-specific exceptions such as rate-limit, timeout, request-too-large, authentication, invalid-response, provider-unavailable, etc. This lets providers.py distinguish failure types and retry appropriately.
+
+__init__.py	Package interface. Exposes the main router so the rest of the application can import the LLM layer cleanly.
+
+
+The flow between them
+QueryPilot task
+      │
+      ▼
+  router.py
+      │
+      │  task = "planner"
+      ▼
+  config.py
+      │
+      │  planner → 120B, max_tokens=400
+      ▼
+ providers.py
+      │
+      ▼
+ scheduler.py
+      │
+      ├── 120B / key 0
+      ├── 120B / key 1
+      └── 120B / key 2
+              │
+              ▼
+           Groq
+
+And alongside the call:
+providers.py ─────→ usage.py
+                      │
+                      └─ records actual usage
+
+While failures go through:
+providers.py → exceptions.py
+
+One-line mental model
+config.py     = WHAT is allowed
+router.py     = WHO asks for an LLM task
+providers.py  = HOW we call Groq
+scheduler.py  = WHICH key handles it
+usage.py      = WHAT actually happened
+exceptions.py = WHY a call failed
+__init__.py   = clean package interface
+
+So the key distinction is: router.py chooses the task/model, while scheduler.py chooses the API key within that model's pool.

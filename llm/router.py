@@ -1,74 +1,45 @@
-"""Router module for QueryPilot."""
+"""Router module for QueryPilot.
+
+Resolves a logical task to its profile (model, output cap, timeout, reasoning
+effort) and hands the call to the provider. The profile is the only source of
+generation settings: the router never looks at earlier calls in the same user
+message, so a late stage such as answer generation always gets its full,
+task-defined allowance.
+
+The router does NOT know about SSE, conversations or persistence, does not
+parse provider stream chunks, and does not schedule keys (the provider's quota
+scheduler does that, per key and model).
+"""
 
 import logging
 from collections.abc import Iterator
 from typing import Any
 
-from .config import (
-    DEFAULT_MAX_TOKENS,
-    DEFAULT_TEMPERATURE,
-    TASK_MODELS,
-    TASK_TOKEN_BUDGETS,
-)
+from .config import DEFAULT_TEMPERATURE, TASK_PROFILES, TaskProfile
 from .providers import get_provider
 
 logger = logging.getLogger(__name__)
 
 
 class LLMRouter:
-    """
-    Central routing layer for all LLM tasks.
-
-    Responsibilities:
-        - Resolve the model associated with a logical task.
-        - Apply shared defaults.
-        - Expose normal LLM generation.
-        - Expose provider-independent text streaming.
-
-    The router does NOT:
-        - know about SSE
-        - know about chat conversations
-        - persist application data
-        - parse provider-specific stream chunks
-    """
-
     def __init__(self):
         self.provider = get_provider()
 
-    def _get_model(
-        self,
-        task: str,
-    ) -> str:
-        model = TASK_MODELS.get(task)
-
-        if model is None:
+    @staticmethod
+    def _profile(task: str) -> TaskProfile:
+        profile = TASK_PROFILES.get(task)
+        if profile is None:
             raise ValueError(f"Unknown LLM task: {task}")
+        return profile
 
-        return model
-
-    @staticmethod
-    def _resolve_max_tokens(task: str, max_tokens: int | None) -> int:
-        if max_tokens is not None:
-            return max_tokens
-        budget = TASK_TOKEN_BUDGETS.get(task, {})
-        return int(budget.get("completion", DEFAULT_MAX_TOKENS))
+    def _get_model(self, task: str) -> str:
+        return self._profile(task).model
 
     @staticmethod
-    def _check_input_budget(task: str, messages: list[dict[str, str]]) -> None:
-        """Log (never truncate) when a request exceeds its input target."""
-        target = TASK_TOKEN_BUDGETS.get(task, {}).get("input")
-        if not target:
-            return
-        chars = sum(len(str(m.get("content", ""))) for m in messages or [])
-        estimate = (chars + 3) // 4
-        if estimate > target:
-            logger.warning(
-                "[LLM_BUDGET] task=%s estimated_input_tokens=%d exceeds "
-                "target=%d; reduce evidence/history instead of raising limits",
-                task,
-                estimate,
-                target,
-            )
+    def _reasoning_effort(profile: TaskProfile, include_reasoning: bool | None):
+        # Callers that pass include_reasoning=False ask for the cheapest
+        # reasoning; anything else uses the task's own setting.
+        return "low" if include_reasoning is False else profile.reasoning_effort
 
     def generate(
         self,
@@ -81,24 +52,23 @@ class LLMRouter:
         stream: bool = False,
         include_reasoning: bool | None = None,
     ):
+        """Execute a normal (or raw-streaming) LLM request.
+
+        `max_tokens` is an optional explicit override and is used verbatim;
+        otherwise the task profile's cap applies.
         """
-        Execute a normal LLM request.
-
-        Existing callers continue to use this method unchanged.
-        """
-
-        model = self._get_model(task)
-        self._check_input_budget(task, messages)
-
+        profile = self._profile(task)
         return self.provider.generate(
             task=task,
-            model=model,
+            model=profile.model,
             messages=messages,
-            temperature=(DEFAULT_TEMPERATURE if temperature is None else temperature),
-            max_tokens=self._resolve_max_tokens(task, max_tokens),
+            max_tokens=profile.max_tokens if max_tokens is None else max_tokens,
+            temperature=DEFAULT_TEMPERATURE if temperature is None else temperature,
             response_format=response_format,
             stream=stream,
-            include_reasoning=include_reasoning,
+            reasoning_effort=self._reasoning_effort(profile, include_reasoning),
+            timeout=profile.timeout,
+            input_hint=profile.input_hint,
         )
 
     def generate_stream(
@@ -110,23 +80,17 @@ class LLMRouter:
         max_tokens: int | None = None,
         include_reasoning: bool | None = None,
     ) -> Iterator[str]:
-        """
-        Start a true text streaming request.
-
-        The provider owns all provider-specific stream parsing.
-        The application receives only plain text deltas.
-        """
-
-        model = self._get_model(task)
-        self._check_input_budget(task, messages)
-
+        """Start a text stream; the application receives plain text deltas."""
+        profile = self._profile(task)
         return self.provider.generate_text_stream(
             task=task,
-            model=model,
+            model=profile.model,
             messages=messages,
-            temperature=(DEFAULT_TEMPERATURE if temperature is None else temperature),
-            max_tokens=self._resolve_max_tokens(task, max_tokens),
-            include_reasoning=include_reasoning,
+            max_tokens=profile.max_tokens if max_tokens is None else max_tokens,
+            temperature=DEFAULT_TEMPERATURE if temperature is None else temperature,
+            reasoning_effort=self._reasoning_effort(profile, include_reasoning),
+            timeout=profile.timeout,
+            input_hint=profile.input_hint,
         )
 
 

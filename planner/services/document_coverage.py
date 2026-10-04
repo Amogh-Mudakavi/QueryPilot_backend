@@ -149,12 +149,13 @@ def pack_segments(
     selected: list[dict[str, Any]],
     total: int,
     mode: str,
+    segment_char_limit: int = SEGMENT_CHAR_LIMIT,
 ) -> list[dict[str, Any]]:
     groups: list[list[dict[str, Any]]] = []
     size = 0
     for chunk in selected:
         length = len(chunk["content"])
-        if not groups or size + length > SEGMENT_CHAR_LIMIT:
+        if not groups or size + length > segment_char_limit:
             groups.append([])
             size = 0
         groups[-1].append(chunk)
@@ -207,6 +208,7 @@ def build_document_evidence(
     fetch_chunks: Callable[..., dict[str, Any]],
     boost_lookup: Callable[[int], tuple[set[int], bool]] | None = None,
     budget: int = DOCUMENT_CONTEXT_CHAR_BUDGET,
+    segment_char_limit: int = SEGMENT_CHAR_LIMIT,
 ) -> dict[str, Any] | None:
     """
     Returns {"evidence", "notes", "coverage", "confidence", "degraded"} or
@@ -272,6 +274,7 @@ def build_document_evidence(
                 selected=selected,
                 total=len(chunks),
                 mode=mode,
+                segment_char_limit=segment_char_limit,
             )
         )
         coverage.append(

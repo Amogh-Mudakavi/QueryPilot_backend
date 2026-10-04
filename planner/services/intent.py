@@ -108,6 +108,43 @@ ROW_RESULT_OPERATIONS = frozenset(
     {"calculate", "aggregate", "overview", "list", "compare"}
 )
 
+# Operations that read/describe a source as a whole. They are document-content
+# operations: they never need a table lookup, and over several sources they are
+# independent per-source retrievals, not a relationship between the sources.
+OVERVIEW_OPERATIONS = frozenset({"overview"})
+
+# Operations that, over several named sources, are just independent reads of
+# each source (what does each one say / list / describe). They only become
+# cross-source reasoning when an entity is involved or the planner marked the
+# request "mixed" (a value that depends on a rule in another source).
+INDEPENDENT_MULTI_SOURCE_OPERATIONS = frozenset(
+    {"overview", "describe", "list", "answer"}
+)
+
+# Operations whose natural result is rows computed from a structured source.
+# Only these can make a document-only request prefer TABLE_QUERY (and even then
+# DOCUMENT_SEARCH is kept as a fallback). A plain lookup/explanation about a
+# document is answered from the document's content.
+TABLE_ROW_OPERATIONS = frozenset({"calculate", "aggregate", "filter", "list", "lookup"})
+
+# Words in the extracted requested_fields that show the user is asking for the
+# content of tables/sheets themselves ("table rows", "column values"), as
+# opposed to something a document merely says. Source-agnostic structure words.
+_TABLE_CONTENT_WORDS = frozenset(
+    {
+        "table",
+        "tables",
+        "row",
+        "rows",
+        "column",
+        "columns",
+        "sheet",
+        "sheets",
+        "cell",
+        "cells",
+    }
+)
+
 
 def _resolved_document_ids(references: list[dict[str, Any]]) -> set[int]:
     """Return distinct document IDs represented by resolved source matches."""
@@ -136,15 +173,77 @@ def _documents_with_tables(
     )
 
 
+def normalized_operation(understanding: dict[str, Any] | None) -> str:
+    """Planner operation as a lowercase string ("" when absent)."""
+    return str((understanding or {}).get("operation") or "").strip().lower()
+
+
+def _requests_table_content(understanding: dict[str, Any]) -> bool:
+    """True when the extracted fields ask for table/sheet content itself."""
+    for field in understanding.get("requested_fields", []) or []:
+        words = {
+            word
+            for word in str(field or "").lower().replace("_", " ").split()
+            if word.isalpha()
+        }
+        if words & _TABLE_CONTENT_WORDS:
+            return True
+    return False
+
+
+def _decide_cross_document(
+    *,
+    source_ids: set[int],
+    operation: str,
+    category: str,
+    has_entities: bool,
+) -> tuple[bool, str]:
+    """
+    Cross-document REASONING is a property of the request, not of how many
+    sources are in scope. Several sources in scope only means several sources
+    to retrieve from; reasoning across them is needed when the task relates,
+    compares, joins or calculates across them.
+    """
+    if len(source_ids) < 2:
+        return False, "fewer than two resolved sources"
+    if (
+        operation in INDEPENDENT_MULTI_SOURCE_OPERATIONS
+        and category != "mixed"
+        and not has_entities
+    ):
+        return False, (
+            f"independent multi-source {operation}: each source is retrieved "
+            "on its own, no relationship between sources required"
+        )
+    return True, (
+        f"{len(source_ids)} resolved sources and operation="
+        f"{operation or 'unspecified'} requires combining sources"
+    )
+
+
 def build_execution_plan(
     understanding: dict[str, Any],
     resolution: dict[str, Any],
     source_shapes: dict[int, bool] | None = None,
+    pending_value_reference: bool = False,
 ) -> dict[str, Any]:
     """Convert language-level extraction + deterministic resolution into a plan.
 
-    Cross-document behavior is source-driven. The LLM's category_hint is only a
-    semantic hint; it cannot suppress evidence from another resolved source.
+    pending_value_reference: the caller found a non-source reference (a person,
+    id, value...) that is not resolved yet. It still has to be looked up in
+    structured data, so the request is not a pure document-content request.
+
+    Three separate questions are answered here, in this order:
+
+      1. SOURCE SCOPE   - which documents/tables were explicitly resolved.
+      2. RETRIEVAL      - the minimum evidence capabilities the request needs.
+      3. CROSS-DOCUMENT - whether answering needs a relationship/comparison/
+                          calculation ACROSS sources (not merely >1 source).
+
+    A source's physical shape (e.g. a PDF that has extracted tables) never
+    overrides the semantic intent: asking what a document says is a
+    DOCUMENT_SEARCH even when the document also owns tables. The LLM's
+    category_hint is a semantic hint; the resolved sources are deterministic.
     """
     if resolution.get("has_ambiguity"):
         matches = []
@@ -156,17 +255,31 @@ def build_execution_plan(
             "capabilities": [],
             "actions": [],
             "clarification_options": matches[:8],
+            "cross_document": False,
+            "fallback_capabilities": [],
+            "decision": {"reason": "ambiguous source reference"},
         }
 
     category = str(understanding.get("category_hint") or "document").lower()
+    operation = normalized_operation(understanding)
     references = resolution.get("references", [])
     shapes = source_shapes or {}
 
     if category == "conversation":
-        return _plan("OK", ["CONVERSATION_MEMORY"], ["conversation_memory"])
+        return _plan(
+            "OK",
+            ["CONVERSATION_MEMORY"],
+            ["conversation_memory"],
+            reason="question about this chat's history",
+        )
 
     if category == "product":
-        return _plan("OK", ["PRODUCT_KNOWLEDGE"], ["product_knowledge"])
+        return _plan(
+            "OK",
+            ["PRODUCT_KNOWLEDGE"],
+            ["product_knowledge"],
+            reason="question about QueryPilot itself",
+        )
 
     resolved_documents = [
         item
@@ -190,16 +303,46 @@ def build_execution_plan(
     has_resolved_source = bool(resolved_documents or resolved_tables)
     wants_structure = _requests_workspace_structure(understanding)
     resolved_source_ids = _resolved_document_ids(references)
-    cross_document = len(resolved_source_ids) >= 2
+    source_ids = sorted(resolved_source_ids)
     has_structured_sources = _documents_with_tables(
         resolved_source_ids,
         resolved_tables,
         shapes,
     )
+    cross_document, cross_reason = _decide_cross_document(
+        source_ids=resolved_source_ids,
+        operation=operation,
+        category=category,
+        has_entities=bool(resolved_entities),
+    )
+
+    def plan(
+        capabilities: list[str],
+        actions: list[str],
+        reason: str,
+        *,
+        fallback: list[str] | None = None,
+        cross: bool = False,
+    ) -> dict[str, Any]:
+        return _plan(
+            "OK",
+            capabilities,
+            actions,
+            cross_document=cross,
+            reason=reason,
+            category=category,
+            operation=operation,
+            source_ids=source_ids,
+            cross_reason=cross_reason,
+            fallback_capabilities=fallback,
+        )
 
     if wants_structure and (has_resolved_source or not resolved_entities):
-        return _plan("OK", ["SOURCE_METADATA"], ["source_metadata"])
+        return plan(
+            ["SOURCE_METADATA"], ["source_metadata"], "workspace structure question"
+        )
 
+    # Cross-document reasoning: only when the task relates the sources.
     if cross_document:
         capabilities: list[str] = []
         actions: list[str] = []
@@ -209,29 +352,63 @@ def build_execution_plan(
 
         capabilities.append("DOCUMENT_SEARCH")
         actions.append("document_search")
-        return _plan(
-            "OK",
+        return plan(
             capabilities,
             actions,
-            cross_document=True,
+            "relationship/comparison/calculation across resolved sources",
+            cross=True,
         )
 
     if category in {"metadata", "workspace"} and not has_resolved_source:
-        return _plan("OK", ["SOURCE_METADATA"], ["source_metadata"])
+        return plan(
+            ["SOURCE_METADATA"], ["source_metadata"], "workspace metadata question"
+        )
 
-    if category in {"metadata", "workspace"} and has_resolved_source:
-        if has_structured_sources:
-            return _plan("OK", ["TABLE_QUERY"], ["table_query"])
-        return _plan("OK", ["DOCUMENT_SEARCH"], ["document_search"])
-
-    if (
-        category == "structured"
+    # A request anchored only on named document(s): no entity value to look up
+    # and no table named. The document's own content is the evidence.
+    # DOCUMENT_SEARCH already reads the document's text AND its extracted
+    # tables, so nothing is lost by not starting from TABLE_QUERY.
+    document_only = (
+        bool(resolved_documents)
         and not resolved_tables
         and not resolved_entities
-        and resolved_documents
-        and not has_structured_sources
-    ):
-        return _plan("OK", ["DOCUMENT_SEARCH"], ["document_search"])
+        and not pending_value_reference
+    )
+    if document_only:
+        if len(source_ids) >= 2:
+            multi_note = " (independent sources, retrieved separately)"
+        else:
+            multi_note = ""
+
+        table_content_requested = _requests_table_content(understanding)
+        row_operation = (
+            category == "structured"
+            and operation in TABLE_ROW_OPERATIONS
+            and has_structured_sources
+        )
+        if operation not in OVERVIEW_OPERATIONS and (
+            table_content_requested or row_operation
+        ):
+            return plan(
+                ["TABLE_QUERY"],
+                ["table_query"],
+                "request targets the table/row content of the named document",
+                fallback=["DOCUMENT_SEARCH"],
+            )
+        return plan(
+            ["DOCUMENT_SEARCH"],
+            ["document_search"],
+            "document-content request on named document(s)" + multi_note,
+        )
+
+    if category in {"metadata", "workspace"} and has_resolved_source:
+        if has_structured_sources and (
+            resolved_tables or _requests_table_content(understanding)
+        ):
+            return plan(["TABLE_QUERY"], ["table_query"], "named table content request")
+        return plan(
+            ["DOCUMENT_SEARCH"], ["document_search"], "named source content request"
+        )
 
     if category == "structured" or resolved_tables or resolved_entities:
         capabilities = ["TABLE_QUERY"]
@@ -239,16 +416,35 @@ def build_execution_plan(
         if category == "mixed":
             capabilities.append("DOCUMENT_SEARCH")
             actions.append("document_search")
-        return _plan("OK", capabilities, actions)
-
-    if category == "mixed":
-        return _plan(
-            "OK",
-            ["TABLE_QUERY", "DOCUMENT_SEARCH"],
-            ["table_query", "document_search"],
+        # Only a document (no entity, no named table) anchors this request:
+        # if the table path finds nothing, the document's content is next.
+        document_anchored = (
+            bool(resolved_documents)
+            and not resolved_tables
+            and not resolved_entities
+            and "DOCUMENT_SEARCH" not in capabilities
+        )
+        return plan(
+            capabilities,
+            actions,
+            "structured lookup (named table or resolved entity)"
+            if resolved_tables or resolved_entities
+            else "structured request without a named document",
+            fallback=["DOCUMENT_SEARCH"] if document_anchored else None,
         )
 
-    return _plan("OK", ["DOCUMENT_SEARCH"], ["document_search"])
+    if category == "mixed":
+        return plan(
+            ["TABLE_QUERY", "DOCUMENT_SEARCH"],
+            ["table_query", "document_search"],
+            "structured data plus document rules both required",
+        )
+
+    return plan(
+        ["DOCUMENT_SEARCH"],
+        ["document_search"],
+        "document-content request (allowed corpus searched)",
+    )
 
 
 def _is_structure_field(field: Any) -> bool:
@@ -291,6 +487,12 @@ def _plan(
     actions: list[str],
     *,
     cross_document: bool = False,
+    reason: str = "",
+    category: str = "",
+    operation: str = "",
+    source_ids: list[int] | None = None,
+    cross_reason: str = "",
+    fallback_capabilities: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "status": status,
@@ -298,4 +500,19 @@ def _plan(
         "actions": actions,
         "clarification_options": [],
         "cross_document": cross_document,
+        # Capabilities to run ONLY if the primary evidence path finds nothing.
+        # Used when the plan started from a structured guess about a document.
+        "fallback_capabilities": [
+            item for item in (fallback_capabilities or []) if item in CAPABILITIES
+        ],
+        # Compact, log-friendly explanation of the decision. Never prompt text.
+        "decision": {
+            "category": category,
+            "operation": operation,
+            "resolved_document_ids": list(source_ids or []),
+            "reason": reason,
+            "cross_document_reason": cross_reason
+            if cross_document
+            else (cross_reason or "no cross-source reasoning required"),
+        },
     }

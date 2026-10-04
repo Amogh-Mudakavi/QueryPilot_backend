@@ -14,7 +14,12 @@ from langgraph.graph import END, START, StateGraph
 from llm.exceptions import InvalidResponseError
 from llm.router import router
 from planner.prompts.agent import ACTION_SCHEMA, SYSTEM_PROMPT
-from planner.services.answer import generate_answer
+from planner.services.answer import (
+    MAX_TEXT_CHARS_PER_ITEM,
+    _parse_answer_response,
+    _payload_char_budget,
+    generate_answer_stream,
+)
 from planner.services.cross_document_join import run_cross_document_join
 from planner.services.document_coverage import build_document_evidence
 from planner.services.entity_resolution import (
@@ -30,7 +35,12 @@ from planner.services.history import (
     bound_history_for_planner,
     resolve_replay,
 )
-from planner.services.intent import ROW_RESULT_OPERATIONS, build_execution_plan
+from planner.services.intent import (
+    OVERVIEW_OPERATIONS,
+    ROW_RESULT_OPERATIONS,
+    build_execution_plan,
+    normalized_operation,
+)
 from planner.services.product_knowledge import get_product_knowledge
 from planner.services.schema_registry import (
     get_workspace_catalog,
@@ -59,10 +69,19 @@ MAX_EVIDENCE_CROSS_DOCUMENT = 12
 
 MAX_EVIDENCE_WITH_COVERAGE = 24
 
-PLANNER_MAX_COMPLETION_TOKENS = 1000
+# Planner output is a tiny strict-schema JSON object (~100-200 tokens). The cap
+# leaves room for low-effort reasoning without reserving 1000 tokens.
+PLANNER_MAX_COMPLETION_TOKENS = 400
 
 
 MAX_RECOVERY_ATTEMPTS = 1
+
+# A summary/overview reads document coverage sized for what the answer step can
+# actually carry: segments that fit the per-item cap the answer applies, and a
+# text budget that is a share of its payload budget (tables/notes use the rest).
+# Reading more than that would cost time and be clipped away later.
+OVERVIEW_TEXT_SHARE = 0.6
+OVERVIEW_SEGMENT_HEADER_ALLOWANCE = 200
 
 
 MIN_RETRIEVAL_CONFIDENCE: float | None = None
@@ -300,6 +319,78 @@ def _merge_query_entity_fallback(
     return merged
 
 
+def _has_pending_value_reference(resolution: dict[str, Any] | None) -> bool:
+    """
+    True when the request carries a non-source reference (a person, id,
+    value...) that did not resolve yet. Such a value still has to be looked
+    up in structured data, so the request is not a pure document request.
+    File names and generic catalog phrases ("the document") do not count.
+    """
+    if not isinstance(resolution, dict):
+        return False
+    for item in resolution.get("references", []) or []:
+        if not isinstance(item, dict) or item.get("status") != "NOT_FOUND":
+            continue
+        reference = str(item.get("reference") or "").strip()
+        if not reference or _is_generic_catalog_reference(reference):
+            continue
+        if _parse_contextual_reference(reference) is not None:
+            continue
+        if _FILE_EXTENSION_RE.search(reference):
+            continue
+        return True
+    return False
+
+
+def _build_plan(
+    state: AgentState,
+    understanding: dict[str, Any],
+    resolution: dict[str, Any],
+) -> dict[str, Any]:
+    return build_execution_plan(
+        understanding,
+        resolution,
+        _resolved_source_shapes(state, understanding, resolution),
+        pending_value_reference=_has_pending_value_reference(resolution),
+    )
+
+
+def _needs_entity_lookup(
+    plan: dict[str, Any],
+    understanding: dict[str, Any],
+) -> bool:
+    """
+    Run the deterministic (local SQLite, no LLM) entity scan when a value may
+    have to be looked up: a table query is planned, or the planner called the
+    request structured/mixed. This keeps "Rahul's salary in salary.xlsx" working
+    even if the planner forgot to list "Rahul" as a reference.
+    """
+    if "TABLE_QUERY" in plan.get("capabilities", []):
+        return True
+    return str(understanding.get("category_hint") or "").lower() in {
+        "structured",
+        "mixed",
+    }
+
+
+def _log_planner_decision(plan: dict[str, Any]) -> None:
+    """One concise line: what was chosen and why. Never logs prompt text."""
+    decision = plan.get("decision") or {}
+    logger.info(
+        "planner decision: category=%s operation=%s resolved_document_ids=%s "
+        "capabilities=%s fallback_capabilities=%s cross_document=%s "
+        "reason=%s cross_document_reason=%s",
+        decision.get("category"),
+        decision.get("operation"),
+        decision.get("resolved_document_ids", []),
+        plan.get("capabilities", []),
+        plan.get("fallback_capabilities", []),
+        bool(plan.get("cross_document")),
+        decision.get("reason"),
+        decision.get("cross_document_reason"),
+    )
+
+
 def agent_node(state: AgentState) -> dict[str, Any]:
     original_query = str(state.get("query", "")).strip()
 
@@ -369,14 +460,10 @@ def agent_node(state: AgentState) -> dict[str, Any]:
         except Exception:
             logger.exception("Contextual reference resolution failed; continuing")
 
-        plan = build_execution_plan(
-            understanding,
-            resolution,
-            _resolved_source_shapes(state, understanding, resolution),
-        )
+        plan = _build_plan(state, understanding, resolution)
 
         if (
-            "TABLE_QUERY" in plan.get("capabilities", [])
+            _needs_entity_lookup(plan, understanding)
             and not _resolved_entity_values_from_resolution(resolution)
             and understanding.get("references")
         ):
@@ -386,15 +473,18 @@ def agent_node(state: AgentState) -> dict[str, Any]:
                     references=understanding.get("references", []),
                     category_hint="structured",
                 )
-                resolution = _merge_entity_fallback(
+                merged_resolution = _merge_entity_fallback(
                     resolution,
                     fallback_resolution,
                 )
+                if merged_resolution is not resolution:
+                    resolution = merged_resolution
+                    plan = _build_plan(state, understanding, resolution)
             except Exception:
                 logger.exception("Structured entity-resolution fallback failed")
 
-        if "TABLE_QUERY" in plan.get(
-            "capabilities", []
+        if _needs_entity_lookup(
+            plan, understanding
         ) and not _resolved_entity_values_from_resolution(resolution):
             try:
                 schema = get_workspace_schema(state["workspace_id"])
@@ -409,11 +499,7 @@ def agent_node(state: AgentState) -> dict[str, Any]:
                 )
                 if updated_resolution != resolution:
                     resolution = updated_resolution
-                    plan = build_execution_plan(
-                        understanding,
-                        resolution,
-                        _resolved_source_shapes(state, understanding, resolution),
-                    )
+                    plan = _build_plan(state, understanding, resolution)
                     logger.info(
                         "Current-query entity resolution activated: %s",
                         query_entities,
@@ -457,6 +543,8 @@ def agent_node(state: AgentState) -> dict[str, Any]:
             "error_code": "PLANNING_ERROR",
             "route": "ERROR",
         }
+
+    _log_planner_decision(plan)
 
     clarification = plan.get("status") == "NEEDS_CLARIFICATION"
     message = "Clarification required." if clarification else "Request understood."
@@ -1278,6 +1366,8 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
     coverage_notes: list[Any] = []
     coverage_used = False
     coverage_info: Any = None
+    document_fallback_used = False
+    cross_document_plan = bool(plan.get("cross_document"))
 
     try:
         _check_deadline(state, "dispatch")
@@ -1298,6 +1388,22 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             table_status = table_result["status"]
             total_tool_calls += 1
 
+            # The plan started from a structured guess about a named document
+            # (no entity, no named table). If that path found nothing, the
+            # document's own content is the evidence: run DOCUMENT_SEARCH.
+            if (
+                table_status in {"NOT_FOUND", "RETRIEVAL_ERROR"}
+                and "DOCUMENT_SEARCH" not in capabilities
+                and "DOCUMENT_SEARCH" in plan.get("fallback_capabilities", [])
+            ):
+                capabilities.append("DOCUMENT_SEARCH")
+                document_fallback_used = True
+                logger.info(
+                    "table_query returned %s; falling back to DOCUMENT_SEARCH "
+                    "(plan fallback)",
+                    table_status,
+                )
+
         if "CONVERSATION_MEMORY" in capabilities:
             result = conversation_memory(
                 query=state.get("query", ""),
@@ -1307,7 +1413,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             structured.append(
                 {
                     "source_type": "conversation_memory",
-                    "result_status": "SUCCESS" if memory_messages else "NOT_FOUND",
+                    "result_status": ("SUCCESS" if memory_messages else "NOT_FOUND"),
                     "content": memory_messages,
                     "metadata": {
                         "resolution": result.get("resolution", ""),
@@ -1336,20 +1442,35 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
                 }
             )
 
-        skip_document_search = table_not_found or named_source_missing
+        # Capabilities are independent unless the request makes one depend on
+        # another. A table lookup that matched nothing (e.g. a missing salary
+        # row) must not suppress the document evidence (e.g. the governing
+        # policy) the request also asked for. Only a named source that does
+        # not exist makes document search pointless.
+        skip_document_search = named_source_missing
 
         if "DOCUMENT_SEARCH" in capabilities and skip_document_search:
             logger.info(
-                "Skipping document search: %s",
-                "required table lookup matched no rows"
-                if table_not_found
-                else "named source(s) not found in workspace",
+                "Skipping document search: named source(s) not found in workspace"
+            )
+        elif "DOCUMENT_SEARCH" in capabilities and table_not_found:
+            logger.info(
+                "Table lookup matched no rows; document search still runs "
+                "(independent capability)"
             )
 
+        # IMPORTANT:
+        # A resolved document is evidence through every channel it has.
+        # Text documents are handled by DOCUMENT_SEARCH.
+        # Structured documents such as XLSX may have no text chunks, so their
+        # extracted SQLite tables must also be added as document evidence.
+        #
+        # Do this for every resolved document regardless of operation type.
+        # For PDFs/documents without extracted tables, this simply returns [].
         if (
             "DOCUMENT_SEARCH" in capabilities
             and not skip_document_search
-            and _resolved_document_ids(state)
+            and resolved_doc_ids
         ):
             document_tables = _run_resolved_document_tables(
                 state,
@@ -1369,6 +1490,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
                 code, message = docs["error"]
                 if not structured:
                     raise AgentRuntimeError(message, code=code)
+
                 structured.append(
                     {
                         "source_type": "document_search",
@@ -1393,8 +1515,13 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
 
         join_notes: list[Any] = []
         join_keys: list[str] = []
+
+        # The join is cross-document REASONING: it runs only when the plan
+        # decided the request relates sources, not merely because >1 document
+        # was retrieved (e.g. an independent multi-document summary).
         if (
-            len(resolved_doc_ids) >= 2
+            cross_document_plan
+            and len(resolved_doc_ids) >= 2
             and "DOCUMENT_SEARCH" in capabilities
             and not skip_document_search
         ):
@@ -1420,31 +1547,38 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
 
             if join:
                 join_keys = [str(k) for k in join.get("keys", []) or []]
+
                 if join["tables"]:
                     structured.extend(join["tables"])
                     total_tool_calls += 1
+
                 if join["documents"]:
                     documents = join["documents"] + list(documents)
+
                 join_notes = join["notes"]
 
         operation = str(
             (state.get("query_understanding", {}) or {}).get("operation") or ""
         )
+
         structured = _prioritize_focused_tables(
             structured,
             query=str(state.get("query", "")),
             operation=operation,
         )
+
         structured = _canonicalize_evidence(structured)
         documents = _canonicalize_evidence(list(documents))
 
         pre_finalize = list(structured)
+
         structured = finalize_structured(
             structured,
             workspace_id=state["workspace_id"],
             query=str(state.get("query", "")),
             needs_population=_query_requires_population_context(
-                str(state.get("query", "")), operation
+                str(state.get("query", "")),
+                operation,
             ),
             entity_values=[
                 str(e.get("value"))
@@ -1456,17 +1590,23 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         )
 
         structured = _restore_unaggregated_reductions(
-            pre_finalize, structured, str(state.get("query", ""))
+            pre_finalize,
+            structured,
+            str(state.get("query", "")),
         )
+
         structured = _collapse_subsumed_table_items(structured)
+
         coverage_notes = reconcile_coverage_notes(
-            coverage_notes, coverage_info, structured
+            coverage_notes,
+            coverage_info,
+            structured,
         )
 
         has_structured_document_evidence = _has_document_table_evidence(structured)
 
         assessment = assess_evidence(
-            wants_table="TABLE_QUERY" in capabilities,
+            wants_table=("TABLE_QUERY" in capabilities and not document_fallback_used),
             table_result_status=table_status,
             wants_documents=(
                 "DOCUMENT_SEARCH" in capabilities
@@ -1483,9 +1623,11 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             retrieval_confidence,
             MIN_RETRIEVAL_CONFIDENCE,
         )
+
         answerable = bool(structured) or documents_usable
 
         notes: list[Any] = []
+
         note = insufficiency_note(assessment["reasons"])
         if note is not None and (structured or documents):
             notes.append(note)
@@ -1493,6 +1635,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         if (
             "TABLE_QUERY" in capabilities
             and "DOCUMENT_SEARCH" in capabilities
+            and not document_fallback_used
             and not skip_document_search
             and not document_search_error
             and not documents
@@ -1519,7 +1662,11 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         notes.extend(coverage_notes)
         notes.extend(join_notes)
         notes = _canonicalize_evidence(notes)
-        notes = _reconcile_source_notes(notes, structured, state["workspace_id"])
+        notes = _reconcile_source_notes(
+            notes,
+            structured,
+            state["workspace_id"],
+        )
 
         if coverage_used:
             evidence_limit = MAX_EVIDENCE_WITH_COVERAGE
@@ -1528,15 +1675,24 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         else:
             evidence_limit = MAX_EVIDENCE
 
-        room_for_documents = max(evidence_limit - len(structured) - len(notes), 0)
+        room_for_documents = max(
+            evidence_limit - len(structured) - len(notes),
+            0,
+        )
+
         evidence = _ensure_citation_sync(
             assign_citation_indexes(structured + documents[:room_for_documents] + notes)
         )
 
         logger.info(
             "evidence_manifest: %s",
-            json.dumps(_evidence_manifest(evidence), ensure_ascii=False, default=str),
+            json.dumps(
+                _evidence_manifest(evidence),
+                ensure_ascii=False,
+                default=str,
+            ),
         )
+
         return {
             "evidence": evidence,
             "final_evidence": evidence,
@@ -1555,6 +1711,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
     except AgentRuntimeError as exc:
         logger.exception("Evidence execution failed")
         collected = structured + documents
+
         return {
             "evidence": collected,
             "final_evidence": collected,
@@ -1566,9 +1723,11 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             "error_code": exc.code,
             "route": "ERROR",
         }
+
     except Exception as exc:
         logger.exception("Evidence execution failed")
         collected = structured + documents
+
         return {
             "evidence": collected,
             "final_evidence": collected,
@@ -1684,10 +1843,22 @@ def finish_node(state: AgentState) -> dict[str, Any]:
     )
 
     try:
-        answer = generate_answer(
+        parts: list[str] = []
+        for delta in generate_answer_stream(
             query=state.get("query", ""),
             evidence=evidence,
             conversation_history=state.get("conversation_history", []),
+        ):
+            parts.append(delta)
+            _emit_event(
+                event="answer_delta",
+                status="streaming",
+                message="",
+                data={"delta": delta},
+            )
+        answer = _parse_answer_response(
+            "".join(parts),
+            evidence_count=len(evidence),
         )
     except Exception as exc:
         logger.exception("Answer generation failed")
@@ -1751,38 +1922,45 @@ def _build_context(state: AgentState) -> str:
                 raw_catalog = raw_catalog[:12]
 
             for document in raw_catalog:
-                catalog.append(
-                    {
-                        "document_id": document.get("document_id"),
-                        "title": document.get("title"),
-                        "source_type": document.get("source_type"),
-                        "status": document.get("status"),
-                        "tables": [
-                            {
-                                "table_name": table.get("table_name"),
-                                "row_count": table.get("row_count"),
-                            }
-                            for table in document.get("tables", [])[:8]
-                        ],
-                    }
-                )
+                # Planner needs titles/ids/types to copy exact reference
+                # strings. Table names, row counts and status are not needed
+                # for reference extraction (execution resolves them later).
+                entry: dict[str, Any] = {
+                    "document_id": document.get("document_id"),
+                    "title": document.get("title"),
+                    "source_type": document.get("source_type"),
+                }
+                table_count = len(document.get("tables", []) or [])
+                if table_count > 1:
+                    entry["table_count"] = table_count
+                catalog.append(entry)
         except Exception:
             logger.exception(
                 "Could not load planner workspace catalog; continuing without it"
             )
 
+    context: dict[str, Any] = {"user_query": state.get("query", "")}
+    if catalog:
+        # The catalog is already limited to the Scope Guard's relevant
+        # documents, so the id list is not repeated.
+        context["workspace_catalog"] = catalog
+    elif state.get("relevant_document_ids"):
+        context["relevant_document_ids"] = state.get("relevant_document_ids")
+    history = bound_history_for_planner(
+        state.get("conversation_history", []),
+        max_recent=2,
+        max_user_chars=140,
+        max_assistant_chars=120,
+        max_summary_chars=160,
+        max_total_chars=400,
+    )
+    if history:
+        context["conversation_history"] = history
     return json.dumps(
-        {
-            "user_query": state.get("query", ""),
-            "workspace_id": workspace_id,
-            "relevant_document_ids": state.get("relevant_document_ids", []),
-            "workspace_catalog": catalog,
-            "conversation_history": bound_history_for_planner(
-                state.get("conversation_history", []),
-            ),
-        },
+        context,
         ensure_ascii=False,
         default=str,
+        separators=(",", ":"),
     )
 
 
@@ -2408,11 +2586,26 @@ def _document_query(state: AgentState) -> str:
 
 def _resolved_document_ids(state: AgentState) -> list[int]:
     """
-    Documents the user EXPLICITLY pointed at (a named document or
-    table). Entity matches are deliberately excluded: an entity's
-    location says where a VALUE lives, not which text document the
-    question is about.
+    Documents the user explicitly pointed at.
+
+    Prefer the IDs already resolved by the planner. Fall back to the
+    resolved-reference list for compatibility with older states.
     """
+    decision_ids = (
+        state.get("execution_plan", {})
+        .get("decision", {})
+        .get("resolved_document_ids", [])
+    )
+
+    if decision_ids:
+        return sorted(
+            {
+                document_id
+                for document_id in (_coerce_int(value) for value in decision_ids)
+                if document_id is not None
+            }
+        )
+
     resolved_ids: list[int] = []
 
     for item in state.get("resolved_references", {}).get("references", []):
@@ -2470,6 +2663,8 @@ def _run_documents_with_coverage(
     state: AgentState,
     scope_ids: list[int],
     primary_query: str,
+    *,
+    answer_sized: bool = False,
 ) -> dict[str, Any] | None:
     """
     Question-agnostic multi-document evidence: whole documents when they
@@ -2505,6 +2700,15 @@ def _run_documents_with_coverage(
             bool(result.get("degraded")),
         )
 
+    sizing: dict[str, Any] = {}
+    if answer_sized:
+        sizing = {
+            "budget": max(int(_payload_char_budget() * OVERVIEW_TEXT_SHARE), 2000),
+            "segment_char_limit": max(
+                MAX_TEXT_CHARS_PER_ITEM - OVERVIEW_SEGMENT_HEADER_ALLOWANCE, 800
+            ),
+        }
+
     return build_document_evidence(
         workspace_id=workspace_id,
         document_ids=scope_ids,
@@ -2513,6 +2717,7 @@ def _run_documents_with_coverage(
         titles=titles,
         fetch_chunks=fetch_document_chunks,
         boost_lookup=boost,
+        **sizing,
     )
 
 
@@ -2522,12 +2727,39 @@ def _run_documents(
 ) -> dict[str, Any]:
     primary_query = _document_query(state)
     primary_ids = _document_ids_for_search(state)
-    cross_document = len(_resolved_document_ids(state)) >= 2
+    # Several explicitly named sources: retrieve from each one. This is
+    # RETRIEVAL scope only; whether the sources are also joined/compared is
+    # decided by the plan (plan["cross_document"]), not here.
+    multi_source = len(_resolved_document_ids(state)) >= 2
 
-    if len(set(primary_ids)) >= 2:
+    # A summary/overview must see the whole document, not only the top-k
+    # chunks most similar to the word "summarize". Use document coverage for
+    # it even when a single document is in scope.
+    wants_whole_document = (
+        normalized_operation(state.get("query_understanding")) in OVERVIEW_OPERATIONS
+    )
+
+    # Whole-document coverage is for: a summary/overview, several explicitly
+    # named sources, or a mixed table+document request (existing behaviour).
+    # A pointed question with no named source (e.g. "what is the standard
+    # deduction?") is NOT read positionally: ranked retrieval over the allowed
+    # corpus finds the passage that answers it.
+    plan_cross = bool(state.get("execution_plan", {}).get("cross_document"))
+    use_coverage = bool(primary_ids) and (
+        wants_whole_document
+        or (
+            len(set(primary_ids)) >= 2
+            and (multi_source or plan_cross or _plan_is_mixed(state))
+        )
+    )
+
+    if use_coverage:
         try:
             covered = _run_documents_with_coverage(
-                state, sorted(set(primary_ids)), primary_query
+                state,
+                sorted(set(primary_ids)),
+                primary_query,
+                answer_sized=wants_whole_document,
             )
         except Exception:
             logger.exception("document coverage failed; using ranked search")
@@ -2542,7 +2774,7 @@ def _run_documents(
                 "coverage": covered["coverage"],
             }
 
-    if cross_document:
+    if multi_source:
         per_document = _resolved_document_ids(state)
         collected: list[Any] = []
         confidences: list[float] = []
