@@ -59,6 +59,16 @@ from planner.services.intent import (
     build_execution_plan,
     normalized_operation,
 )
+from planner.services.source_scope import (
+    authorized_document_ids,
+    can_answer_from_evidence,
+    candidate_document_ids,
+    contextual_planning_query,
+    dependency_discovery_query,
+    effective_planning_query,
+    requires_dependency_discovery,
+    requires_document_evidence,
+)
 from planner.services.product_knowledge import get_product_knowledge
 from planner.services.schema_registry import (
     WorkspaceResources,
@@ -266,7 +276,7 @@ def _scope_document_ids(
     sampling/counting tables of unrelated documents; None (nothing resolved)
     means "no narrowing", exactly like the previous full-workspace read.
     """
-    ids: set[int] = set(_resolved_document_ids(state))
+    ids: set[int] = set(_candidate_document_ids(state, resources))
     for item in state.get("resolved_references", {}).get("references", []):
         if item.get("status") != "RESOLVED":
             continue
@@ -282,11 +292,21 @@ def _scope_document_ids(
             if location.get("table_name"):
                 table_names.add(str(location["table_name"]))
     if table_names:
-        for table in resources.table_index():
+        for table in resources.table_index(document_ids=_allowed_document_ids(state)):
             if str(table.get("table_name")) in table_names:
                 document_id = _coerce_int(table.get("document_id"))
                 if document_id is not None:
                     ids.add(document_id)
+    allowed_ids = _allowed_document_ids(state)
+    if allowed_ids is not None:
+        before_authorization = set(ids)
+        ids.intersection_update(allowed_ids)
+        # Do not turn an explicitly resolved but unauthorized source into a
+        # broad search over other documents. When nothing was resolved at all,
+        # the allow-list remains the safe discovery boundary.
+        if before_authorization and not ids:
+            return set()
+        return ids or set(allowed_ids)
     return ids or None
 
 
@@ -495,6 +515,7 @@ def _log_planner_decision(plan: dict[str, Any]) -> None:
 
 def agent_node(state: AgentState) -> dict[str, Any]:
     original_query = str(state.get("query", "")).strip()
+    planning_query = original_query
 
     carry: dict[str, Any] = {}
     replay = resolve_replay(original_query, state.get("conversation_history", []))
@@ -506,7 +527,24 @@ def agent_node(state: AgentState) -> dict[str, Any]:
             previous_task,
         )
         carry = {"query": effective_query, "conversation_history": []}
+        planning_query = effective_query
         state = {**state, **carry}
+    else:
+        # A short follow-up often lacks the entity/source names needed to
+        # rebuild a calculation plan (for example, "how is that explained?").
+        # Enrich planner interpretation only; the graph's original `query`
+        # remains unchanged for answer generation and API compatibility.
+        contextual_query = contextual_planning_query(
+            original_query,
+            state.get("conversation_history", []),
+        )
+        if contextual_query != original_query:
+            logger.info(
+                "Contextual follow-up planning activated: current=%r",
+                original_query,
+            )
+            planning_query = contextual_query
+            state = {**state, "query": contextual_query}
 
     reply = _chitchat_reply(state.get("query", ""))
     if reply is not None:
@@ -556,10 +594,27 @@ def agent_node(state: AgentState) -> dict[str, Any]:
         )
 
         understanding = _parse_understanding(response)
+        # Source/entity resolution must operate inside the same conversation
+        # allow-list enforced by retrieval. Scope Guard's relevance list is
+        # intentionally narrower, so use all authorized documents here and
+        # let the planner rank/select the required ones.
+        authorized_ids = _allowed_document_ids(state)
+        resolver_schema = resources.table_index(document_ids=authorized_ids)
+        resolver_catalog = resources.catalog()
+        if authorized_ids is not None:
+            authorized_set = set(authorized_ids)
+            resolver_catalog = [
+                document
+                for document in resolver_catalog
+                if _coerce_int(document.get("document_id")) in authorized_set
+            ]
+
         resolution = resolve_references(
             workspace_id=state["workspace_id"],
             references=understanding.get("references", []),
             category_hint=understanding.get("category_hint"),
+            schema=resolver_schema,
+            catalog=resolver_catalog,
         )
 
         try:
@@ -580,6 +635,8 @@ def agent_node(state: AgentState) -> dict[str, Any]:
                     workspace_id=state["workspace_id"],
                     references=understanding.get("references", []),
                     category_hint="structured",
+                    schema=resolver_schema,
+                    catalog=resolver_catalog,
                 )
                 merged_resolution = _merge_entity_fallback(
                     resolution,
@@ -595,7 +652,7 @@ def agent_node(state: AgentState) -> dict[str, Any]:
             plan, understanding
         ) and not _resolved_entity_values_from_resolution(resolution):
             try:
-                schema = resources.schema()
+                schema = resources.table_index(document_ids=authorized_ids)
                 query_entities = resolve_entities_from_query(
                     workspace_id=state["workspace_id"],
                     query=str(state.get("query", "")),
@@ -679,6 +736,7 @@ def agent_node(state: AgentState) -> dict[str, Any]:
     return {
         **carry,
         "resource_context": resources,
+        "planning_query": planning_query,
         "query_understanding": understanding,
         "resolved_references": resolution,
         "execution_plan": plan,
@@ -707,7 +765,10 @@ def _with_table_scope(
     metadata, which tables this question needs BEFORE anything is read.
     The result travels in state["table_scope"]; absent means "no narrowing".
     """
-    resolved_ids = set(_resolved_document_ids(state))
+    # Scope Guard's relevant IDs are candidates, not the final plan.  Keep
+    # them available while the selector evaluates schemas, together with any
+    # documents discovered through resolved entities/references.
+    resolved_ids = set(_candidate_document_ids(state, _resources(state)))
     if "TABLE_QUERY" not in capabilities:
         return state
 
@@ -719,27 +780,43 @@ def _with_table_scope(
             for location in entity.get("locations", [])
             if location.get("table_name")
         }
+        allowed_ids = _allowed_document_ids(state)
+        if allowed_ids is not None:
+            allowed_set = set(allowed_ids)
+            entity_tables = {
+                str(table.get("table_name"))
+                for table in resources.table_index(document_ids=allowed_ids)
+                if str(table.get("table_name")) in entity_tables
+                and _coerce_int(table.get("document_id")) in allowed_set
+            }
         # Candidates are only the resolved documents' tables (plus tables
-        # entities were found in), so only those tables need details. When
-        # nothing was resolved the previous full-workspace read still applies.
+        # found by entity resolution), plus request-scoped relevant documents.
+        # This does not make every workspace document part of the final answer.
         needed_documents = set(resolved_ids)
         if entity_tables:
             needed_documents |= {
                 doc_id
                 for doc_id in (
                     _coerce_int(table.get("document_id"))
-                    for table in resources.table_index()
+                    for table in resources.table_index(document_ids=allowed_ids)
                     if str(table.get("table_name")) in entity_tables
                 )
                 if doc_id is not None
             }
-        schema = resources.schema(
-            document_ids=needed_documents or None,
-            include_sample_rows=True,
-        )
         if not resolved_ids and not entity_tables:
+            # With no source hint, preserve prior behavior while honoring an
+            # explicit conversation allow-list.
+            schema_ids = set(allowed_ids) if allowed_ids is not None else None
+            schema = resources.schema(
+                document_ids=sorted(schema_ids) if schema_ids is not None else None,
+                include_sample_rows=True,
+            )
             candidates = list(schema)
         else:
+            schema = resources.schema(
+                document_ids=sorted(needed_documents),
+                include_sample_rows=True,
+            )
             candidates = [
                 item
                 for item in schema
@@ -748,7 +825,7 @@ def _with_table_scope(
             ]
         selected = select_tables(
             workspace_id=state["workspace_id"],
-            query=str(state.get("query", "")),
+            query=effective_planning_query(state),
             understanding=state.get("query_understanding", {}) or {},
             candidates=candidates,
             forced_table_names=entity_tables,
@@ -1564,6 +1641,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
     table_result: dict[str, Any] | None = None
     retrieval_confidence = 0.0
     document_search_error = False
+    dependency_evidence_found = False
     coverage_notes: list[Any] = []
     coverage_used = False
     coverage_info: Any = None
@@ -1626,6 +1704,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         table_not_found = table_status == "NOT_FOUND"
 
         resolved_doc_ids = _resolved_document_ids(state)
+        source_document_ids = _document_ids_for_search(state)
         missing_named_sources = _named_missing_source_references(state)
         named_source_missing = bool(missing_named_sources) and not resolved_doc_ids
 
@@ -1671,7 +1750,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         if (
             "DOCUMENT_SEARCH" in capabilities
             and not skip_document_search
-            and resolved_doc_ids
+            and source_document_ids
         ):
             document_tables = _run_resolved_document_tables(
                 state,
@@ -1683,6 +1762,11 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
 
         if "DOCUMENT_SEARCH" in capabilities and not skip_document_search:
             docs = _run_documents(state, budget)
+            if requires_dependency_discovery(state):
+                docs = _supplement_dependency_evidence(state, docs)
+                dependency_evidence_found = bool(
+                    docs.get("dependency_evidence_found")
+                )
             total_tool_calls += 1
             retrieval_confidence = docs["confidence"]
 
@@ -1727,10 +1811,10 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
                 structured,
                 documents,
                 coverage_info,
-                resolved_doc_ids,
+                source_document_ids,
             )
             if cross_document_plan
-            and len(resolved_doc_ids) >= 2
+            and len(source_document_ids) >= 2
             and "DOCUMENT_SEARCH" in capabilities
             and not skip_document_search
             else None
@@ -1740,7 +1824,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
 
         if (
             cross_document_plan
-            and len(resolved_doc_ids) >= 2
+            and len(source_document_ids) >= 2
             and "DOCUMENT_SEARCH" in capabilities
             and not skip_document_search
             and not join_skip_reason
@@ -1749,12 +1833,15 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
                 understanding = state.get("query_understanding", {}) or {}
                 join = run_cross_document_join(
                     workspace_id=state["workspace_id"],
-                    query=str(state.get("query", "")),
+                    query=effective_planning_query(state),
                     references=understanding.get("references", []),
                     resolved_references=state.get("resolved_references", {}).get(
                         "references", []
                     ),
-                    document_ids=resolved_doc_ids,
+                    document_ids=sorted(
+                        set(source_document_ids)
+                        | _document_ids_from_text_evidence(documents)
+                    ),
                     entities=_resolved_entity_values(state),
                     structured=structured,
                     documents=documents,
@@ -1783,7 +1870,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
 
         structured = _prioritize_focused_tables(
             structured,
-            query=str(state.get("query", "")),
+            query=effective_planning_query(state),
             operation=operation,
         )
 
@@ -1795,9 +1882,9 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         structured = finalize_structured(
             structured,
             workspace_id=state["workspace_id"],
-            query=str(state.get("query", "")),
+            query=effective_planning_query(state),
             needs_population=_query_requires_population_context(
-                str(state.get("query", "")),
+                effective_planning_query(state),
                 operation,
             ),
             entity_values=[
@@ -1812,7 +1899,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         structured = _restore_unaggregated_reductions(
             pre_finalize,
             structured,
-            str(state.get("query", "")),
+            effective_planning_query(state),
         )
 
         structured = _collapse_subsumed_table_items(structured)
@@ -1828,10 +1915,10 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         assessment = assess_evidence(
             wants_table=("TABLE_QUERY" in capabilities and not document_fallback_used),
             table_result_status=table_status,
-            wants_documents=(
-                "DOCUMENT_SEARCH" in capabilities
-                and not skip_document_search
-                and not has_structured_document_evidence
+            wants_documents=requires_document_evidence(
+                state,
+                skip_document_search=skip_document_search,
+                has_structured_document_evidence=has_structured_document_evidence,
             ),
             document_chunk_count=len(documents) + len(document_tables),
             retrieval_confidence=retrieval_confidence,
@@ -1844,13 +1931,39 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             MIN_RETRIEVAL_CONFIDENCE,
         )
 
-        answerable = bool(structured) or documents_usable
+        # A successful table query is not proof that applicable textual rules
+        # were found. Do not let partial structured evidence authorize a
+        # numerical mixed/calculation answer when its rule-evidence channel is
+        # missing or unusable.
+        answerable = can_answer_from_evidence(
+            state,
+            has_structured_evidence=bool(structured),
+            documents_usable=documents_usable,
+            skip_document_search=skip_document_search,
+            has_structured_document_evidence=has_structured_document_evidence,
+            dependency_evidence_found=dependency_evidence_found,
+        )
 
         notes: list[Any] = []
 
         note = insufficiency_note(assessment["reasons"])
         if note is not None and (structured or documents):
             notes.append(note)
+
+        if requires_dependency_discovery(state) and not dependency_evidence_found:
+            notes.append(
+                {
+                    "source_type": "evidence_note",
+                    "result_status": "NOT_FOUND",
+                    "content": (
+                        "This calculation requires applicable policy/rule evidence, "
+                        "but the rule-focused source search did not establish it. "
+                        "Do not provide a numerical result until the governing "
+                        "formula, eligibility conditions, deductions, caps and "
+                        "thresholds can be verified from authorized evidence."
+                    ),
+                }
+            )
 
         if (
             "TABLE_QUERY" in capabilities
@@ -1860,7 +1973,11 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             and not document_search_error
             and not documents
             and not document_tables
-            and not has_structured_document_evidence
+            and requires_document_evidence(
+                state,
+                skip_document_search=skip_document_search,
+                has_structured_document_evidence=has_structured_document_evidence,
+            )
             and structured
         ):
             notes.append(
@@ -1891,7 +2008,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
 
         if coverage_used:
             evidence_limit = MAX_EVIDENCE_WITH_COVERAGE
-        elif len(resolved_doc_ids) >= 2:
+        elif len(source_document_ids) >= 2:
             evidence_limit = MAX_EVIDENCE_CROSS_DOCUMENT
         else:
             evidence_limit = MAX_EVIDENCE
@@ -1919,6 +2036,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             "final_evidence": evidence,
             "evidence_sufficient": assessment["sufficient"],
             "answerable": answerable,
+            "dependency_evidence_found": dependency_evidence_found,
             "insufficient_reasons": assessment["reasons"],
             "retrieval_confidence": retrieval_confidence,
             "recovery_attempts": budget.used,
@@ -2068,7 +2186,11 @@ def finish_node(state: AgentState) -> dict[str, Any]:
         answer_started = time.perf_counter()
         first_token_seen = False
         for delta in generate_answer_stream(
-            query=state.get("query", ""),
+            # Use the same contextualized task that planning and retrieval used.
+            # A short follow-up like "please explain" is not self-contained;
+            # passing only the raw utterance here loses the subject/calculation
+            # and can cause the model to repeat the previous one-line result.
+            query=effective_planning_query(state),
             evidence=evidence,
             conversation_history=state.get("conversation_history", []),
         ):
@@ -2148,6 +2270,15 @@ def _build_context(state: AgentState) -> str:
                 for value in state.get("relevant_document_ids", [])
                 if _coerce_int(value) is not None
             }
+            authorized_ids = _allowed_document_ids(state)
+            if authorized_ids is not None:
+                authorized_set = set(authorized_ids)
+                raw_catalog = [
+                    doc
+                    for doc in raw_catalog
+                    if _coerce_int(doc.get("document_id")) in authorized_set
+                ]
+                relevant_ids.intersection_update(authorized_set)
             if relevant_ids:
                 raw_catalog = [
                     doc
@@ -2155,6 +2286,8 @@ def _build_context(state: AgentState) -> str:
                     if _coerce_int(doc.get("document_id")) in relevant_ids
                 ]
             else:
+                # Fallback catalog discovery remains bounded, and happens only
+                # after authorization filtering (including the empty allow-list).
                 raw_catalog = raw_catalog[:12]
 
             for document in raw_catalog:
@@ -2181,7 +2314,15 @@ def _build_context(state: AgentState) -> str:
         # documents, so the id list is not repeated.
         context["workspace_catalog"] = catalog
     elif state.get("relevant_document_ids"):
-        context["relevant_document_ids"] = state.get("relevant_document_ids")
+        relevant_ids = {
+            _coerce_int(value)
+            for value in state.get("relevant_document_ids", [])
+            if _coerce_int(value) is not None
+        }
+        authorized_ids = _allowed_document_ids(state)
+        if authorized_ids is not None:
+            relevant_ids.intersection_update(authorized_ids)
+        context["relevant_document_ids"] = sorted(relevant_ids)
     history = bound_history_for_planner(
         state.get("conversation_history", []),
         max_recent=2,
@@ -2702,6 +2843,14 @@ def _resolve_contextual_references(
         return resolution
 
     catalog = _resources(state).catalog()
+    allowed_ids = _allowed_document_ids(state)
+    if allowed_ids is not None:
+        allowed_set = set(allowed_ids)
+        catalog = [
+            item
+            for item in catalog
+            if _coerce_int(item.get("document_id")) in allowed_set
+        ]
 
     current_resolved = [
         item
@@ -2802,7 +2951,7 @@ def _document_query(state: AgentState) -> str:
             str(understanding.get("operation", "answer")),
             " ".join(str(x) for x in understanding.get("requested_fields", [])),
             " ".join(str(x) for x in understanding.get("references", [])),
-            state.get("query", ""),
+            effective_planning_query(state),
         ]
     ).strip()
 
@@ -2843,8 +2992,40 @@ def _resolved_document_ids(state: AgentState) -> list[int]:
     return sorted(set(resolved_ids))
 
 
+def _candidate_document_ids(
+    state: AgentState,
+    resources: WorkspaceResources | None = None,
+) -> list[int]:
+    """Relevant, resolved and entity-located sources inside the allow-list."""
+    table_index: list[dict[str, Any]] | None = None
+    resolution = state.get("resolved_references", {}) or {}
+    wants_table_index = any(
+        isinstance(item, dict)
+        and item.get("status") == "RESOLVED"
+        and isinstance(item.get("match"), dict)
+        and (
+            item.get("match", {}).get("type") == "table"
+            or any(
+                isinstance(location, dict) and location.get("table_name")
+                for location in item.get("match", {}).get("locations", []) or []
+            )
+        )
+        for item in resolution.get("references", []) or []
+    )
+    if wants_table_index:
+        try:
+            table_index = (resources or _resources(state)).table_index(
+                document_ids=_allowed_document_ids(state)
+            )
+        except Exception:
+            logger.exception("Could not map resolved entity tables to document IDs")
+    return candidate_document_ids(state, table_index)
+
+
 def _document_ids_for_search(state: AgentState) -> list[int]:
-    return _resolved_document_ids(state) or list(state.get("relevant_document_ids", []))
+    # Do not let a non-empty but incomplete plan hide Scope Guard's relevant
+    # source candidates or entity-located source documents.
+    return _candidate_document_ids(state)
 
 
 def _mark_success(chunks: list[Any]) -> list[Any]:
@@ -2935,7 +3116,7 @@ def _run_documents_with_coverage(
     return build_document_evidence(
         workspace_id=workspace_id,
         document_ids=scope_ids,
-        question=str(state.get("query", "")),
+        question=effective_planning_query(state),
         understanding=state.get("query_understanding", {}) or {},
         titles=titles,
         fetch_chunks=fetch_document_chunks,
@@ -2953,7 +3134,7 @@ def _run_documents(
     # Several explicitly named sources: retrieve from each one. This is
     # RETRIEVAL scope only; whether the sources are also joined/compared is
     # decided by the plan (plan["cross_document"]), not here.
-    multi_source = len(_resolved_document_ids(state)) >= 2
+    multi_source = len(primary_ids) >= 2
 
     # A summary/overview must see the whole document, not only the top-k
     # chunks most similar to the word "summarize". Use document coverage for
@@ -2998,7 +3179,7 @@ def _run_documents(
             }
 
     if multi_source:
-        per_document = _resolved_document_ids(state)
+        per_document = primary_ids
         collected: list[Any] = []
         confidences: list[float] = []
         errors: list[tuple[str, str]] = []
@@ -3075,10 +3256,10 @@ def _run_documents(
     degraded = bool(result.get("degraded"))
 
     if documents_insufficient(len(chunks), confidence, MIN_RETRIEVAL_CONFIDENCE):
-        raw_query = str(state.get("query", "")).strip()
+        raw_query = effective_planning_query(state)
 
-        scoped_to_resolved = bool(_resolved_document_ids(state))
-        all_ids = list(state.get("relevant_document_ids", []))
+        scoped_to_resolved = bool(primary_ids)
+        all_ids = _document_ids_for_search(state)
         retry_ids = primary_ids if scoped_to_resolved else (all_ids or primary_ids)
 
         if scoped_to_resolved and not chunks and _plan_is_mixed(state):
@@ -3127,6 +3308,85 @@ def _run_documents(
     }
 
 
+def _document_ids_from_text_evidence(items: list[Any]) -> set[int]:
+    """Extract source document IDs from retrieved text chunks."""
+    result: set[int] = set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        for value in (item.get("document_id"), metadata.get("document_id")):
+            document_id = _coerce_int(value)
+            if document_id is not None:
+                result.add(document_id)
+    return result
+
+
+def _supplement_dependency_evidence(
+    state: AgentState,
+    document_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Search the authorized corpus for governing rules omitted by initial scope.
+
+    Scope Guard and source resolution give high-value candidates, but they can
+    miss a companion policy that is not explicitly named by the user. For
+    mixed calculations, run one bounded ranked search over the conversation's
+    authorized document set and merge the most relevant text evidence. This is
+    retrieval-only: it does not widen authorization or select every workspace
+    document for the answer.
+    """
+    if not requires_dependency_discovery(state):
+        return document_result
+
+    query = dependency_discovery_query(state)
+    if not query.strip():
+        return {**document_result, "dependency_evidence_found": False}
+
+    allowed_ids = authorized_document_ids(state)
+    try:
+        discovered = search_evidence(
+            query=query,
+            workspace_id=int(state["workspace_id"]),
+            allowed_document_ids=allowed_ids,
+        )
+    except Exception:
+        logger.exception("Supplemental dependency-evidence search failed")
+        return {**document_result, "dependency_evidence_found": False}
+
+    if discovered.get("error_code"):
+        logger.warning(
+            "Supplemental dependency-evidence search failed: code=%s",
+            discovered.get("error_code"),
+        )
+        return {**document_result, "dependency_evidence_found": False}
+
+    supplemental = _mark_success(list(discovered.get("evidence", []) or []))
+    primary = list(document_result.get("evidence", []) or [])
+    if not supplemental:
+        return {**document_result, "dependency_evidence_found": False}
+
+    # Put the dependency-targeted hits first so they are not crowded out by
+    # whole-document coverage when the final answer payload is budgeted.
+    combined = _canonicalize_evidence(supplemental + primary)
+    old_confidence = float(document_result.get("confidence") or 0.0)
+    new_confidence = float(discovered.get("confidence") or 0.0)
+    found_ids = sorted(_document_ids_from_text_evidence(supplemental))
+    logger.info(
+        "Supplemental dependency evidence: chunks=%d document_ids=%s",
+        len(supplemental),
+        found_ids,
+    )
+    return {
+        **document_result,
+        "evidence": combined,
+        "confidence": max(old_confidence, new_confidence),
+        "error": None if combined else document_result.get("error"),
+        "degraded": bool(document_result.get("degraded"))
+        or bool(discovered.get("degraded")),
+        "dependency_evidence_found": True,
+    }
+
+
 def _tables_used_by_table_query(table: dict[str, Any] | None) -> set[str]:
     """Table names the executed business SQL actually read."""
     if not table:
@@ -3158,7 +3418,7 @@ def _run_resolved_document_tables(
     source_type stays "table_query" so downstream consumers are
     unchanged; evidence_role marks the semantic difference.
     """
-    resolved_ids = set(_resolved_document_ids(state))
+    resolved_ids = set(_document_ids_for_search(state))
     if not resolved_ids:
         return []
 
@@ -3340,7 +3600,7 @@ def _attempt_sql(
 
     try:
         decision = generate_sql(
-            query=state.get("query", ""),
+            query=effective_planning_query(state),
             schema=schema_for_sql,
             resolved_entities=entities,
             previous_attempt=previous_attempt,
@@ -3352,7 +3612,7 @@ def _attempt_sql(
                     or "answer"
                 ),
                 "population_required": _query_requires_population_context(
-                    str(state.get("query", "")),
+                    effective_planning_query(state),
                     str(
                         (state.get("query_understanding", {}) or {}).get("operation")
                         or ""
@@ -3650,7 +3910,9 @@ def _cross_document_source_groups(
     Cartesian product across different documents.
     """
     references = state.get("resolved_references", {}).get("references", [])
-    resolved_document_ids: list[int] = []
+    # Do not let an incomplete plan source list hide request-scoped relevant
+    # documents or a source found through entity resolution.
+    resolved_document_ids: list[int] = list(_candidate_document_ids(state))
     resolved_table_names: set[str] = set()
 
     for item in references:
@@ -3851,7 +4113,8 @@ def _run_table(
     # Cheap existence/shape check first (no sampling, no COUNT(*)). Table
     # details are loaded below only for the documents this request needs, and
     # reuse anything an earlier stage already loaded.
-    table_index = resources.table_index()
+    allowed_document_ids = _allowed_document_ids(state)
+    table_index = resources.table_index(document_ids=allowed_document_ids)
     if not table_index:
         logger.info(
             "table_query: no structured tables exist in workspace %s; "
@@ -3878,7 +4141,7 @@ def _run_table(
         }
 
     resolved_table_names = _resolved_table_names(state)
-    resolved_document_ids = _resolved_document_ids(state)
+    resolved_document_ids = _document_ids_for_search(state)
     entities = _resolved_entity_values(state)
     is_mixed = _plan_is_mixed(state)
 

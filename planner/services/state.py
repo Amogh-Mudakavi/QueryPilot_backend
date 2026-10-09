@@ -7,10 +7,16 @@ from typing import Any, Optional, TypedDict
 
 class AgentState(TypedDict, total=False):
     query: str
+    # Planner/retrieval context for referential follow-ups; `query` remains
+    # the user's current utterance for final answer generation.
+    planning_query: str
     workspace_id: int
 
     conversation_history: list[dict[str, Any]]
     relevant_document_ids: list[int]
+    # Conversation-level authorization boundary. None means the containing
+    # workspace access policy is authoritative; [] means no documents allowed.
+    allowed_document_ids: list[int] | None
 
     query_understanding: dict[str, Any]
     resolved_references: dict[str, Any]
@@ -32,6 +38,7 @@ class AgentState(TypedDict, total=False):
 
     evidence_sufficient: bool
     answerable: bool
+    dependency_evidence_found: bool
     insufficient_reasons: list[str]
     recovery_attempts: int
     deadline_monotonic: float
