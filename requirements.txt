@@ -11,6 +11,8 @@ attrs==26.1.0
 banks==2.5.0
 bcrypt==5.0.0
 beautifulsoup4==4.15.0
+boto3==1.43.107
+botocore==1.43.108
 build==1.5.0
 certifi==2026.7.22
 cffi==2.1.1
@@ -31,6 +33,7 @@ Django==6.0.6
 django-cors-headers==4.9.0
 django-extensions==4.1
 django-redis==7.0.0
+django-storages==1.14.6
 djangorestframework==3.17.1
 durationpy==0.10
 et_xmlfile==2.0.0
@@ -57,9 +60,10 @@ huggingface_hub==0.36.2
 idna==3.18
 importlib_resources==7.1.0
 Jinja2==3.1.6
+jmespath==1.1.0
 joblib==1.5.3
 jsonpatch==1.33
-jsonpointer==3.1.1
+jsonpointer==1.33
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 kubernetes==36.0.3
@@ -158,6 +162,7 @@ requests-toolbelt==1.0.0
 resend==2.35.0
 rich==15.0.0
 rpds-py==2026.6.3
+s3transfer==0.19.2
 safetensors==0.8.0
 scikit-learn==1.9.0
 scipy==1.17.1

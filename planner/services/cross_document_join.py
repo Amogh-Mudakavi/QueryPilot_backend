@@ -50,8 +50,10 @@ MAX_ROWS_PER_KEY = 10
 MAX_ANCHORS = 3
 MAX_COLUMNS_PER_LOOKUP = 45
 
+# CAST ... AS CHAR is valid on MySQL (CAST AS TEXT is not) and is also
+# accepted by SQLite (CHAR has TEXT affinity), so one expression serves both.
 _NORMALIZED_CELL = (
-    "REPLACE(REPLACE(REPLACE(UPPER(TRIM(CAST({col} AS TEXT))),'-',''),'_',''),' ','')"
+    "REPLACE(REPLACE(REPLACE(UPPER(TRIM(CAST({col} AS CHAR))),'-',''),'_',''),' ','')"
 )
 
 
@@ -69,19 +71,6 @@ def _as_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
 
-
-def _anchors_from_query(query: str) -> list[str]:
-    anchors: list[str] = []
-    for m in re.finditer(
-        r"[A-Z][a-z]+(?:['’]s)?(?:\s+[A-Z][a-z]+(?:['’]s)?)*", query or ""
-    ):
-        text = m.group(0)
-        if m.start() == 0:
-            text = " ".join(text.split()[1:])
-        text = re.sub(r"['’]s\b", "", text).strip()
-        if text:
-            anchors.append(text)
-    return anchors
 
 
 def derive_anchors(
@@ -309,6 +298,47 @@ def _table_evidence(
     }
 
 
+def _light_schema_and_titles(
+    workspace_id: int,
+) -> tuple[list[dict[str, Any]], dict[int, str]]:
+    """Table metadata for the join WITHOUT sampling or counting any table.
+
+    The join only needs, per table: document id/title, table name, columns.
+    ``get_workspace_catalog(include_row_counts=False)`` yields exactly that
+    from the table-index tier (documents query + column metadata only) and
+    applies the same workspace-prefix / document-ownership checks as the
+    full schema build. Previously the join built the FULL schema (a sample
+    SELECT and a COUNT per table across the whole workspace) first.
+    """
+    from planner.services.schema_registry import get_workspace_catalog
+
+    catalog = get_workspace_catalog(workspace_id, include_row_counts=False)
+
+    schema: list[dict[str, Any]] = []
+    titles: dict[int, str] = {}
+    for doc in catalog:
+        did = _as_int(doc.get("document_id"))
+        if did is None:
+            continue
+        title = str(doc.get("title") or f"document {did}")
+        titles[did] = title
+        for table in doc.get("tables") or []:
+            name = table.get("table_name")
+            if not name:
+                continue
+            schema.append(
+                {
+                    "document_id": did,
+                    "document_title": title,
+                    "source_type": doc.get("source_type"),
+                    "table_name": str(name),
+                    "columns": [str(c) for c in table.get("columns") or []],
+                }
+            )
+    schema.sort(key=lambda t: t["table_name"])
+    return schema, titles
+
+
 def run_cross_document_join(
     *,
     workspace_id: int,
@@ -333,12 +363,19 @@ def run_cross_document_join(
     `structured` / `documents` passed in. Never raises for retrieval
     problems: they are logged and reported through `notes`.
     """
-    if get_schema is None:
-        from planner.services.schema_registry import get_workspace_schema as get_schema
-    if get_catalog is None:
-        from planner.services.schema_registry import (
-            get_workspace_catalog as get_catalog,
-        )
+    # When the caller injects neither loader (the production call site) use
+    # the light metadata path. Injected loaders keep their original contract.
+    use_light_metadata = get_schema is None and get_catalog is None
+
+    if not use_light_metadata:
+        if get_schema is None:
+            from planner.services.schema_registry import (
+                get_workspace_schema as get_schema,
+            )
+        if get_catalog is None:
+            from planner.services.schema_registry import (
+                get_workspace_catalog as get_catalog,
+            )
     if run_query is None:
         from planner.tools.query_tables import query_tables as run_query
     if text_lookup is None:
@@ -365,11 +402,34 @@ def run_cross_document_join(
     )
     outcome["anchors"] = anchors
 
-    try:
-        schema = list(get_schema(workspace_id, allowed_document_ids=None))
-    except Exception:
-        logger.exception("cross-document join: schema unavailable")
-        schema = []
+    titles: dict[int, str] = {}
+    schema: list[dict[str, Any]] = []
+    metadata_loaded = False
+
+    if use_light_metadata:
+        try:
+            schema, titles = _light_schema_and_titles(workspace_id)
+            metadata_loaded = True
+        except Exception:
+            logger.exception("cross-document join: light metadata unavailable")
+            schema, titles = [], {}
+
+    if not metadata_loaded:
+        if get_schema is None or get_catalog is None:
+            # Light path failed: fall back to the original full loaders.
+            from planner.services.schema_registry import (
+                get_workspace_catalog as _default_catalog,
+                get_workspace_schema as _default_schema,
+            )
+
+            get_schema = get_schema or _default_schema
+            get_catalog = get_catalog or _default_catalog
+        try:
+            schema = list(get_schema(workspace_id, allowed_document_ids=None))
+        except Exception:
+            logger.exception("cross-document join: schema unavailable")
+            schema = []
+
     entity_tables = {
         str(loc.get("table_name"))
         for e in entities
@@ -387,14 +447,14 @@ def run_cross_document_join(
         relevant = [t for t in relevant if str(t.get("table_name")) in allowed]
     doc_tables = [t for t in relevant if _as_int(t.get("document_id")) in doc_ids]
 
-    titles: dict[int, str] = {}
-    try:
-        for d in get_catalog(workspace_id, schema=schema):
-            did = _as_int(d.get("document_id"))
-            if did is not None:
-                titles[did] = str(d.get("title") or f"document {did}")
-    except Exception:
-        logger.exception("cross-document join: catalog unavailable")
+    if not metadata_loaded:
+        try:
+            for d in get_catalog(workspace_id, schema=schema):
+                did = _as_int(d.get("document_id"))
+                if did is not None:
+                    titles[did] = str(d.get("title") or f"document {did}")
+        except Exception:
+            logger.exception("cross-document join: catalog unavailable")
 
     seen_rows = _index_seen_rows(structured)
     new_tables: list[dict[str, Any]] = []
@@ -543,7 +603,9 @@ def run_cross_document_join(
             ev["evidence_role"] = "key_joined"
             new_docs.append(ev)
 
-    loaded_tables = _loaded_full_tables(structured)
+    # `structured` is not mutated by the entity pass above (only new_tables
+    # grows), so the tables computed earlier are still current.
+    loaded_tables = already_loaded
     for table in doc_tables:
         tname = str(table["table_name"])
         columns = [str(c) for c in table.get("columns", [])][:MAX_COLUMNS_PER_LOOKUP]

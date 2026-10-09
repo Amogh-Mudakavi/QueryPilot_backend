@@ -142,11 +142,7 @@ def resolve_replay(
     return previous, effective
 
 
-def build_replay_query(
-    current_query: str, history: list[dict[str, Any]] | None
-) -> str | None:
-    replay = resolve_replay(current_query, history)
-    return replay[1] if replay else None
+
 
 
 def bound_history_for_planner(

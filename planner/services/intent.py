@@ -127,9 +127,6 @@ INDEPENDENT_MULTI_SOURCE_OPERATIONS = frozenset(
 # document is answered from the document's content.
 TABLE_ROW_OPERATIONS = frozenset({"calculate", "aggregate", "filter", "list", "lookup"})
 
-# Words in the extracted requested_fields that show the user is asking for the
-# content of tables/sheets themselves ("table rows", "column values"), as
-# opposed to something a document merely says. Source-agnostic structure words.
 _TABLE_CONTENT_WORDS = frozenset(
     {
         "table",

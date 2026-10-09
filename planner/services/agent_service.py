@@ -1,7 +1,25 @@
-"""Services Agent Service module for QueryPilot."""
+"""Services Agent Service module for QueryPilot.
+
+This module implements the agent runtime used by QueryPilot. It contains
+the StateGraph nodes and helpers used during planning and dispatch.
+
+Timing helpers
+---------------
+The module provides lightweight timing helpers used for diagnostics:
+
+`_timed_call(stage, fn)` -- a decorator factory that wraps a function and
+measures its execution time using the `timed(stage)` context manager. It
+preserves the wrapped function's metadata with `functools.wraps`.
+
+`_timed_node(name, fn)` -- a wrapper generator for StateGraph node
+functions. The returned wrapper accepts a single `state` argument and
+measures duration with `timed(f"node.{name}")` so node-level timing is
+consistently labeled in diagnostics.
+"""
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import re
@@ -43,6 +61,7 @@ from planner.services.intent import (
 )
 from planner.services.product_knowledge import get_product_knowledge
 from planner.services.schema_registry import (
+    WorkspaceResources,
     get_workspace_catalog,
     get_workspace_schema,
 )
@@ -58,8 +77,43 @@ from planner.tools.conversation_memory import conversation_memory
 from planner.tools.query_tables import query_tables
 from planner.tools.search_evidence import fetch_document_chunks, search_evidence
 from planner.tools.source_metadata import source_metadata
+from utils.timing import timed
 
 logger = logging.getLogger(__name__)
+
+
+def _timed_call(stage, fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with timed(stage):
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def _timed_node(name, fn):
+    @functools.wraps(fn)
+    def wrapper(state):
+        with timed(f"node.{name}"):
+            return fn(state)
+
+    return wrapper
+
+resolve_references = _timed_call("resolve_references", resolve_references)
+resolve_entities_from_query = _timed_call(
+    "resolve_entities", resolve_entities_from_query
+)
+get_workspace_schema = _timed_call("get_workspace_schema", get_workspace_schema)
+get_workspace_catalog = _timed_call("get_workspace_catalog", get_workspace_catalog)
+select_tables = _timed_call("select_tables", select_tables)
+generate_sql = _timed_call("generate_sql", generate_sql)
+query_tables = _timed_call("query_tables", query_tables)
+search_evidence = _timed_call("search_evidence", search_evidence)
+fetch_document_chunks = _timed_call("fetch_document_chunks", fetch_document_chunks)
+build_document_evidence = _timed_call("build_document_evidence", build_document_evidence)
+run_cross_document_join = _timed_call("cross_document_join", run_cross_document_join)
+finalize_structured = _timed_call("finalize_structured", finalize_structured)
+
 
 MAX_EVIDENCE = 8
 
@@ -69,17 +123,11 @@ MAX_EVIDENCE_CROSS_DOCUMENT = 12
 
 MAX_EVIDENCE_WITH_COVERAGE = 24
 
-# Planner output is a tiny strict-schema JSON object (~100-200 tokens). The cap
-# leaves room for low-effort reasoning without reserving 1000 tokens.
 PLANNER_MAX_COMPLETION_TOKENS = 400
 
 
 MAX_RECOVERY_ATTEMPTS = 1
 
-# A summary/overview reads document coverage sized for what the answer step can
-# actually carry: segments that fit the per-item cap the answer applies, and a
-# text budget that is a share of its payload budget (tables/notes use the rest).
-# Reading more than that would cost time and be clipped away later.
 OVERVIEW_TEXT_SHARE = 0.6
 OVERVIEW_SEGMENT_HEADER_ALLOWANCE = 200
 
@@ -136,9 +184,9 @@ class _RecoveryBudget:
 
 def build_agent_graph():
     graph = StateGraph(AgentState)
-    graph.add_node("agent", agent_node)
-    graph.add_node("dispatch", dispatch_node)
-    graph.add_node("finish", finish_node)
+    graph.add_node("agent", _timed_node("agent", agent_node))
+    graph.add_node("dispatch", _timed_node("dispatch", dispatch_node))
+    graph.add_node("finish", _timed_node("finish", finish_node))
     graph.add_edge(START, "agent")
     graph.add_conditional_edges(
         "agent",
@@ -186,6 +234,60 @@ def _coerce_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _resources(state: AgentState) -> WorkspaceResources:
+    """Request-scoped structured-resource metadata for this request's workspace.
+
+    agent_node / dispatch_node put one WorkspaceResources on the state they
+    hand to every helper, so catalog / schema / table-index work happens at
+    most once per request and is reused by every later stage. An instance is
+    only ever reused for the workspace it was built for; anything else gets a
+    fresh, un-shared instance. Nothing here is module-level state.
+    """
+    workspace_id = int(state["workspace_id"])
+    resources = state.get("resource_context")
+    if isinstance(resources, WorkspaceResources) and (
+        resources.workspace_id == workspace_id
+    ):
+        return resources
+    return WorkspaceResources(workspace_id)
+
+
+def _scope_document_ids(
+    state: AgentState,
+    resources: WorkspaceResources,
+) -> set[int] | None:
+    """Documents whose table details this request can need, or None for all.
+
+    Union of everything the request already established: the planner's
+    resolved documents, documents/tables matched by reference resolution, and
+    the tables entity resolution located values in. Callers use it to avoid
+    sampling/counting tables of unrelated documents; None (nothing resolved)
+    means "no narrowing", exactly like the previous full-workspace read.
+    """
+    ids: set[int] = set(_resolved_document_ids(state))
+    for item in state.get("resolved_references", {}).get("references", []):
+        if item.get("status") != "RESOLVED":
+            continue
+        match = item.get("match", {})
+        if isinstance(match, dict) and match.get("type") in {"document", "table"}:
+            document_id = _coerce_int(match.get("document_id"))
+            if document_id is not None:
+                ids.add(document_id)
+
+    table_names = set(_resolved_table_names(state))
+    for entity in _resolved_entity_values(state):
+        for location in entity.get("locations", []):
+            if location.get("table_name"):
+                table_names.add(str(location["table_name"]))
+    if table_names:
+        for table in resources.table_index():
+            if str(table.get("table_name")) in table_names:
+                document_id = _coerce_int(table.get("document_id"))
+                if document_id is not None:
+                    ids.add(document_id)
+    return ids or None
 
 
 def _chitchat_reply(query: str) -> str | None:
@@ -429,6 +531,11 @@ def agent_node(state: AgentState) -> dict[str, Any]:
             "route": "CHITCHAT",
         }
 
+    # One request-scoped metadata holder for the whole request. It rides on
+    # the state returned below, so dispatch_node reuses what planning loaded.
+    resources = _resources(state)
+    state = {**state, "resource_context": resources}
+
     _emit_event(
         event="planning",
         status="started",
@@ -465,6 +572,7 @@ def agent_node(state: AgentState) -> dict[str, Any]:
         if (
             _needs_entity_lookup(plan, understanding)
             and not _resolved_entity_values_from_resolution(resolution)
+            and _has_pending_value_reference(resolution)
             and understanding.get("references")
         ):
             try:
@@ -487,7 +595,7 @@ def agent_node(state: AgentState) -> dict[str, Any]:
             plan, understanding
         ) and not _resolved_entity_values_from_resolution(resolution):
             try:
-                schema = get_workspace_schema(state["workspace_id"])
+                schema = resources.schema()
                 query_entities = resolve_entities_from_query(
                     workspace_id=state["workspace_id"],
                     query=str(state.get("query", "")),
@@ -543,7 +651,14 @@ def agent_node(state: AgentState) -> dict[str, Any]:
             "error_code": "PLANNING_ERROR",
             "route": "ERROR",
         }
-
+    logger.info(
+    "resolution: relevant_document_ids=%s refs=%s",
+    state.get("relevant_document_ids"),
+        [
+            (r.get("reference"), r.get("status"), (r.get("match") or {}).get("document_id"))
+            for r in resolution.get("references", [])
+        ],
+    )
     _log_planner_decision(plan)
 
     clarification = plan.get("status") == "NEEDS_CLARIFICATION"
@@ -563,6 +678,7 @@ def agent_node(state: AgentState) -> dict[str, Any]:
 
     return {
         **carry,
+        "resource_context": resources,
         "query_understanding": understanding,
         "resolved_references": resolution,
         "execution_plan": plan,
@@ -596,16 +712,31 @@ def _with_table_scope(
         return state
 
     try:
-        schema = get_workspace_schema(
-            state["workspace_id"],
-            include_sample_rows=True,
-        )
+        resources = _resources(state)
         entity_tables = {
             str(location.get("table_name"))
             for entity in _resolved_entity_values(state)
             for location in entity.get("locations", [])
             if location.get("table_name")
         }
+        # Candidates are only the resolved documents' tables (plus tables
+        # entities were found in), so only those tables need details. When
+        # nothing was resolved the previous full-workspace read still applies.
+        needed_documents = set(resolved_ids)
+        if entity_tables:
+            needed_documents |= {
+                doc_id
+                for doc_id in (
+                    _coerce_int(table.get("document_id"))
+                    for table in resources.table_index()
+                    if str(table.get("table_name")) in entity_tables
+                )
+                if doc_id is not None
+            }
+        schema = resources.schema(
+            document_ids=needed_documents or None,
+            include_sample_rows=True,
+        )
         if not resolved_ids and not entity_tables:
             candidates = list(schema)
         else:
@@ -1108,6 +1239,7 @@ def _reconcile_source_notes(
     notes: list[Any],
     structured: list[Any],
     workspace_id: Any,
+    resources: WorkspaceResources | None = None,
 ) -> list[Any]:
     """
     Retrieval/coverage/identifier-lookup notes describe the TEXT search
@@ -1144,7 +1276,13 @@ def _reconcile_source_notes(
             names.add(str(content["document_title"]))
     if present_ids:
         try:
-            for doc in get_workspace_catalog(int(workspace_id)):
+            # Only titles/ids are needed here, never row counts.
+            catalog = (
+                resources.catalog()
+                if resources is not None and resources.workspace_id == int(workspace_id)
+                else get_workspace_catalog(int(workspace_id), include_row_counts=False)
+            )
+            for doc in catalog:
                 if _coerce_int(doc.get("document_id")) in present_ids:
                     for key in (
                         "title",
@@ -1302,6 +1440,65 @@ def _ensure_citation_sync(evidence: list[Any]) -> list[Any]:
     return assign_citation_indexes(list(evidence))
 
 
+def _join_adds_nothing(
+    state: AgentState,
+    resources: WorkspaceResources,
+    structured: list[Any],
+    documents: list[Any],
+    coverage_info: Any,
+    resolved_doc_ids: list[int],
+) -> str | None:
+    """Reason the cross-document key join provably has nothing left to add.
+
+    The join relates sources by a shared key. It can only contribute (a) rows
+    of tables not yet read and (b) text passages of documents that have text.
+    It is skipped ONLY when neither is possible:
+
+    * no resolved entity is available as a join anchor, and
+    * every resolved document is purely structured (coverage found no text
+      chunks for it) and no text evidence exists, and
+    * every in-scope table of every resolved document is already present as
+      complete, successful, single-table evidence.
+
+    Anything uncertain (no coverage report, a truncated or failed table, an
+    entity anchor, a document with text) returns None and the join runs.
+    """
+    if _resolved_entity_values(state) or documents:
+        return None
+
+    if not set(resolved_doc_ids) <= _documents_without_text(coverage_info):
+        return None
+
+    scope = _table_scope(state)
+    tables = [
+        str(table["table_name"])
+        for table in resources.table_index(resolved_doc_ids)
+        if scope is None or str(table["table_name"]) in scope
+    ]
+    if not tables:
+        return None
+
+    complete: set[str] = set()
+    for item in structured:
+        if (
+            not isinstance(item, dict)
+            or str(item.get("source_type", "")).lower() != "table_query"
+            or str(item.get("result_status", "")).upper() != "SUCCESS"
+            or not _is_complete_table_evidence(item)
+        ):
+            continue
+        names = _evidence_table_names(item)
+        if len(names) == 1:
+            complete |= names
+
+    if all(name in complete for name in tables):
+        return (
+            "no join anchors; all in-scope tables of the resolved documents "
+            "are already complete evidence and none has text to relate"
+        )
+    return None
+
+
 def dispatch_node(state: AgentState) -> dict[str, Any]:
     plan = state.get("execution_plan", {})
 
@@ -1353,6 +1550,10 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         ]
 
     budget = _RecoveryBudget(MAX_RECOVERY_ATTEMPTS)
+    # Reuse the metadata planning already loaded (it travels on the state);
+    # if it did not arrive, build one holder here and share it from now on.
+    resources = _resources(state)
+    state = {**state, "resource_context": resources}
     state = _with_table_scope(state, capabilities)
 
     structured: list[Any] = []
@@ -1519,11 +1720,30 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         # The join is cross-document REASONING: it runs only when the plan
         # decided the request relates sources, not merely because >1 document
         # was retrieved (e.g. an independent multi-document summary).
+        join_skip_reason = (
+            _join_adds_nothing(
+                state,
+                resources,
+                structured,
+                documents,
+                coverage_info,
+                resolved_doc_ids,
+            )
+            if cross_document_plan
+            and len(resolved_doc_ids) >= 2
+            and "DOCUMENT_SEARCH" in capabilities
+            and not skip_document_search
+            else None
+        )
+        if join_skip_reason:
+            logger.info("cross-document join skipped: %s", join_skip_reason)
+
         if (
             cross_document_plan
             and len(resolved_doc_ids) >= 2
             and "DOCUMENT_SEARCH" in capabilities
             and not skip_document_search
+            and not join_skip_reason
         ):
             try:
                 understanding = state.get("query_understanding", {}) or {}
@@ -1666,6 +1886,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             notes,
             structured,
             state["workspace_id"],
+            resources,
         )
 
         if coverage_used:
@@ -1844,11 +2065,19 @@ def finish_node(state: AgentState) -> dict[str, Any]:
 
     try:
         parts: list[str] = []
+        answer_started = time.perf_counter()
+        first_token_seen = False
         for delta in generate_answer_stream(
             query=state.get("query", ""),
             evidence=evidence,
             conversation_history=state.get("conversation_history", []),
         ):
+            if not first_token_seen:
+                first_token_seen = True
+                logger.info(
+                    "[TIMING] stage=answer_first_token seconds=%.3f",
+                    time.perf_counter() - answer_started,
+                )
             parts.append(delta)
             _emit_event(
                 event="answer_delta",
@@ -1856,6 +2085,11 @@ def finish_node(state: AgentState) -> dict[str, Any]:
                 message="",
                 data={"delta": delta},
             )
+        logger.info(
+            "[TIMING] stage=answer_stream_total seconds=%.3f chars=%d",
+            time.perf_counter() - answer_started,
+            sum(len(p) for p in parts),
+        )
         answer = _parse_answer_response(
             "".join(parts),
             evidence_count=len(evidence),
@@ -1906,7 +2140,9 @@ def _build_context(state: AgentState) -> str:
 
     if workspace_id:
         try:
-            raw_catalog = get_workspace_catalog(int(workspace_id))
+            # The planner only needs ids/titles/types/table counts: use the
+            # request-scoped table index (no sampling, no COUNT(*)).
+            raw_catalog = _resources(state).catalog()
             relevant_ids = {
                 _coerce_int(value)
                 for value in state.get("relevant_document_ids", [])
@@ -1981,19 +2217,6 @@ def _parse_understanding(response: Any) -> dict[str, Any]:
         )
 
     return data
-
-
-def _first_resolved_match(
-    state: AgentState,
-    *types: str,
-) -> dict[str, Any] | None:
-    for item in state.get("resolved_references", {}).get("references", []):
-        match = item.get("match", {})
-        if item.get("status") != "RESOLVED":
-            continue
-        if match.get("type") in types:
-            return match
-    return None
 
 
 _GENERIC_CATALOG_REFERENCES = {
@@ -2478,7 +2701,7 @@ def _resolve_contextual_references(
     if not has_candidates:
         return resolution
 
-    catalog = get_workspace_catalog(state["workspace_id"])
+    catalog = _resources(state).catalog()
 
     current_resolved = [
         item
@@ -2565,7 +2788,7 @@ def _resolved_source_shapes(
 
     has_tables = {
         _coerce_int(doc.get("document_id")): bool(doc.get("tables"))
-        for doc in get_workspace_catalog(state["workspace_id"])
+        for doc in _resources(state).catalog()
     }
     return {
         document_id: bool(has_tables.get(document_id)) for document_id in document_ids
@@ -2676,7 +2899,7 @@ def _run_documents_with_coverage(
 
     titles: dict[int, str] = {}
     try:
-        for doc in get_workspace_catalog(workspace_id):
+        for doc in _resources(state).catalog():
             doc_id = _coerce_int(doc.get("document_id"))
             if doc_id is not None:
                 titles[doc_id] = str(doc.get("title") or f"document {doc_id}")
@@ -2861,7 +3084,7 @@ def _run_documents(
         if scoped_to_resolved and not chunks and _plan_is_mixed(state):
             widened = all_ids or [
                 _coerce_int(doc.get("document_id"))
-                for doc in get_workspace_catalog(state["workspace_id"])
+                for doc in _resources(state).catalog()
                 if _coerce_int(doc.get("document_id")) is not None
             ]
             if widened:
@@ -2939,7 +3162,9 @@ def _run_resolved_document_tables(
     if not resolved_ids:
         return []
 
-    schema = get_workspace_schema(state["workspace_id"])
+    # Only the resolved documents' tables are needed; details already loaded
+    # earlier in this request are reused, not re-read.
+    schema = _resources(state).schema(document_ids=resolved_ids)
     candidates = [
         item
         for item in schema
@@ -3622,11 +3847,12 @@ def _run_table(
     state: AgentState,
     budget: _RecoveryBudget,
 ) -> dict[str, Any]:
-    schema = get_workspace_schema(
-        state["workspace_id"],
-        allowed_document_ids=None,
-    )
-    if not schema:
+    resources = _resources(state)
+    # Cheap existence/shape check first (no sampling, no COUNT(*)). Table
+    # details are loaded below only for the documents this request needs, and
+    # reuse anything an earlier stage already loaded.
+    table_index = resources.table_index()
+    if not table_index:
         logger.info(
             "table_query: no structured tables exist in workspace %s; "
             "returning NOT_FOUND evidence",
@@ -3661,14 +3887,20 @@ def _run_table(
         and len(
             {
                 _coerce_int(item.get("document_id"))
-                for item in schema
+                for item in table_index
                 if str(item.get("table_name")) in resolved_table_names
                 and _coerce_int(item.get("document_id")) is not None
             }
         )
         >= 2
     ):
-        return _run_cross_document_tables(state, budget, schema)
+        # Cross-document groups only ever use the resolved documents' tables
+        # (plus entity-located tables), all covered by _scope_document_ids.
+        return _run_cross_document_tables(
+            state,
+            budget,
+            resources.schema(document_ids=_scope_document_ids(state, resources)),
+        )
 
     entity_location_tables = {
         str(location.get("table_name"))
@@ -3693,7 +3925,7 @@ def _run_table(
         available = sorted(
             {
                 str(item.get("document_title") or item.get("table_name"))
-                for item in schema
+                for item in table_index
                 if item.get("document_title") or item.get("table_name")
             }
         )
@@ -3720,6 +3952,13 @@ def _run_table(
             ],
             "status": "NOT_FOUND",
         }
+
+    # Details for just the documents the request established; with nothing
+    # resolved the whole workspace is the SQL scope, as before.
+    if resolved_document_ids or resolved_table_names:
+        schema = resources.schema(document_ids=_scope_document_ids(state, resources))
+    else:
+        schema = resources.schema()
 
     if resolved_table_names:
         filtered_schema = [

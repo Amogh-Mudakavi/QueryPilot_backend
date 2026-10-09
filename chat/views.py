@@ -20,12 +20,16 @@ The views do NOT:
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import AsyncIterator, Generator
+from concurrent.futures import ThreadPoolExecutor
 
+from django.db import connections
 from django.http import StreamingHttpResponse
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
-from rest_framework.renderers import BaseRenderer
+from rest_framework.renderers import BaseRenderer, JSONRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -58,13 +62,62 @@ CHAT_LIMIT_MESSAGE = (
     "and this product can go much further."
 )
 
+_STREAM_DONE = object()
+
+
+async def iterate_sync_stream(
+    sync_stream: Generator[str, None, None],
+) -> AsyncIterator[str]:
+    """
+    Expose a synchronous SSE generator to ASGI as an async iterator,
+    yielding each chunk as soon as the generator produces it.
+
+    Django's ASGI handler only streams async iterators incrementally.
+    A synchronous iterator is fully consumed (buffered) before the first
+    byte is sent, which defeats SSE.
+
+    The generator runs on one dedicated worker thread for its whole
+    lifetime, so thread-local DB connections and the contextvars set by
+    track_usage() stay consistent, and Django's shared thread-sensitive
+    executor (which would serialize every sync view for up to the full
+    request budget) is never occupied.
+    """
+    executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="sse-stream",
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        while True:
+            chunk = await loop.run_in_executor(
+                executor,
+                next,
+                sync_stream,
+                _STREAM_DONE,
+            )
+            if chunk is _STREAM_DONE:
+                break
+            yield chunk
+    finally:
+
+        def _cleanup() -> None:
+            try:
+                sync_stream.close()
+            finally:
+                connections.close_all()
+
+        executor.submit(_cleanup)
+        executor.shutdown(wait=False)
+
 
 class EventStreamRenderer(BaseRenderer):
     """
     Renderer used only for DRF content negotiation.
 
-    The actual response is a StreamingHttpResponse, so DRF's
-    renderer is not responsible for rendering the stream body.
+    The actual SSE response is a StreamingHttpResponse, so DRF's
+    renderer is not responsible for rendering the stream body. It does
+    render the view's own early Response(...) returns (400 validation
+    errors, 404), so dict/list payloads are JSON-encoded here.
     """
 
     media_type = "text/event-stream"
@@ -78,7 +131,13 @@ class EventStreamRenderer(BaseRenderer):
         accepted_media_type=None,
         renderer_context=None,
     ):
-        return data
+        if data is None:
+            return b""
+        if isinstance(data, bytes):
+            return data
+        if isinstance(data, str):
+            return data.encode(self.charset)
+        return json.dumps(data, ensure_ascii=False).encode(self.charset)
 
 
 class ConversationListCreateView(APIView):
@@ -355,9 +414,16 @@ class StreamMessageView(APIView):
 
     User messages are persisted before execution begins. Successful assistant
     answers are persisted before the final `complete` event is emitted.
+
+    ASGI note: the synchronous execution generator is exposed to Django's
+    ASGI handler through `iterate_sync_stream`, so every event is flushed
+    as soon as it is produced instead of being buffered until completion.
     """
 
-    renderer_classes = [EventStreamRenderer]
+    # EventStreamRenderer first so Accept: text/event-stream negotiates to it;
+    # JSONRenderer lets clients that send Accept: application/json receive
+    # proper JSON for 400/404 responses instead of a 406.
+    renderer_classes = [EventStreamRenderer, JSONRenderer]
     permission_classes = [
         IsAuthenticated,
     ]
@@ -401,7 +467,7 @@ class StreamMessageView(APIView):
 
         if not allowed:
 
-            def limited_event_stream():
+            async def limited_event_stream():
                 payload = {
                     "message": CHAT_LIMIT_MESSAGE,
                     "data": {
@@ -465,7 +531,7 @@ class StreamMessageView(APIView):
                 )
 
         response = StreamingHttpResponse(
-            event_stream(),
+            iterate_sync_stream(event_stream()),
             content_type="text/event-stream",
         )
 

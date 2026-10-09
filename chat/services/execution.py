@@ -1,5 +1,6 @@
 """
 Canonical streaming execution entrypoint for QueryPilot.
+
 Flow:
     load conversation settings
         -> load conversation memory (if enabled)
@@ -9,17 +10,19 @@ Flow:
            failure NEVER falls through to the agent)
         -> start title generation in the background (first message only)
         -> Evidence Agent (single LangGraph run)
-        -> source extraction + citation extraction/validation
-        -> grounding evaluation (deterministic, fail-closed)
-        -> apply citation setting
-        -> normalized metadata
+        -> source extraction (Sources list built from final evidence)
+        -> grounding flag (deterministic, not citation based)
+        -> strip any legacy citation markers from the answer
+        -> normalized metadata (citations is always [])
         -> persist assistant message
         -> rolling conversation memory update (background, if enabled)
         -> apply title (already generated while the agent ran)
         -> final SSE event
+
 Document scope:
     if the conversation has attached documents, retrieval is scoped to
     exactly those; otherwise it falls back to every workspace document.
+
 Follow-up resource context (memory enabled only):
     the previous turn's deterministically resolved documents/tables
     are carried into the next request's planner state so contextual
@@ -27,14 +30,31 @@ Follow-up resource context (memory enabled only):
     resolve against what was actually established last turn. Catalog
     facts only (ids, titles, table names) - never evidence payloads,
     SQL, or raw internal state.
+
 Correction replay:
     an explicit correction ("that's wrong", "I asked you top 3 ...") is
     resolved ONCE here against the history that was loaded BEFORE the current
     message was persisted. The scope guard judges the replayed task, not the
     bare correction. The agent performs its own replay and carries the
     effective query and an empty history through the whole graph.
+
+Function summaries:
+    `_scoped_document_ids(conversation)` -- Returns attached document ids for
+        the conversation or all workspace document ids if none are attached.
+
+    `_TitleJob` -- Runs the title LLM call in a background thread while the
+        agent works. The thread makes no DB access; the request thread
+        provides all required inputs and applies the result afterwards.
+
+    `_start_title_job(...)` -- Starts `_TitleJob` for meaningful first-user
+        messages and returns the job handle.
+
+    `_apply_title(...)` -- Applies a completed title to the `Conversation`
+        instance if available.
 """
+
 from __future__ import annotations
+
 import contextvars
 import logging
 import re
@@ -42,10 +62,12 @@ import threading
 import time
 from collections.abc import Iterator
 from typing import Any
+
 from django.conf import settings
 from django.db import connections
+
 from chat.models import ConversationSettings, Message
-from chat.services.citations import extract_citations, find_marker_numbers
+from chat.services.citations import extract_citations
 from chat.services.conversation import (
     add_message,
     get_attached_document_ids,
@@ -67,8 +89,11 @@ from planner.services.agent_service import agent_graph
 from planner.services.history import resolve_replay
 from planner.services.scope_guard_services import ScopeGuard
 from planner.services.state import AgentState
+
 logger = logging.getLogger(__name__)
+
 REQUEST_BUDGET_SECONDS = 90
+
 FAILURE_MESSAGE = "I couldn't complete this request. Please try again."
 OUT_OF_SCOPE_MESSAGE = (
     "I can't help with this request. I can answer questions within "
@@ -79,22 +104,23 @@ SCOPE_GUARD_FAILURE_MESSAGE = (
     "stopped it for safety. No document or table access was performed. "
     "Please try again in a moment."
 )
+CHITCHAT_FALLBACK = "I'm here 😄 What's up?"
+
 SCOPE_GUARD_LLM_ENABLED = getattr(
     settings,
     "SCOPE_GUARD_LLM_ENABLED",
     True,
 )
+
 MAX_THOUGHTS = 30
 MAX_THOUGHT_MESSAGE_CHARS = 300
 PLANNER_CONTEXT_KEY = "planner_context"
 MAX_PRIOR_CONTEXT_MATCHES = 5
-TITLE_JOIN_TIMEOUT_SECONDS = 3.0
+TITLE_JOIN_TIMEOUT_SECONDS = 1.0
+
+
 def _scoped_document_ids(conversation) -> list[int]:
-    """
-    Documents this conversation may draw on: its attached documents when
-    there are any, otherwise every document in the workspace (previous
-    behavior for conversations with nothing attached).
-    """
+    
     attached = get_attached_document_ids(conversation=conversation)
     if attached:
         return attached
@@ -103,13 +129,9 @@ def _scoped_document_ids(conversation) -> list[int]:
             workspace_id=conversation.workspace_id,
         ).values_list("id", flat=True)
     )
+
+
 class _TitleJob:
-    """
-    Runs the title LLM call in a background thread while the agent works.
-    The thread performs NO database access: everything it needs is read on
-    the request thread before it starts, and the result is applied on the
-    request thread afterwards.
-    """
     def __init__(
         self,
         *,
@@ -117,8 +139,6 @@ class _TitleJob:
         document_profiles: list[str],
     ) -> None:
         self.title: str | None = None
-        # ContextVars do not automatically cross threads. Copy the active
-        # usage context so title usage is included in the same request log.
         self._context = contextvars.copy_context()
         self._thread = threading.Thread(
             target=self._context.run,
@@ -126,6 +146,7 @@ class _TitleJob:
             daemon=True,
         )
         self._thread.start()
+
     def _run(
         self,
         user_query: str,
@@ -138,11 +159,14 @@ class _TitleJob:
             )
         except Exception:
             logger.exception("Title generation failed")
+
     def result(self, timeout: float) -> str | None:
         self._thread.join(timeout)
         if self._thread.is_alive():
             return None
         return self.title
+
+
 def _start_title_job(
     *,
     conversation,
@@ -179,6 +203,8 @@ def _start_title_job(
         user_query=user_query_for_title,
         document_profiles=document_profiles,
     )
+
+
 def _apply_title(
     *,
     conversation,
@@ -191,11 +217,14 @@ def _apply_title(
         return
     conversation.title = title
     conversation.save(update_fields=["title", "updated_at"])
+
+
 def _update_memory_in_background(conversation_id: int) -> None:
     """
     The rolling summary is only needed by the NEXT request, so it must not
     delay this one. Runs in its own thread with its own DB connection.
     """
+
     def run() -> None:
         try:
             conversation = get_conversation(conversation_id)
@@ -207,7 +236,10 @@ def _update_memory_in_background(conversation_id: int) -> None:
             )
         finally:
             connections.close_all()
+
     threading.Thread(target=run, daemon=True).start()
+
+
 def _track(
     thoughts: list[dict[str, Any]],
     event: ChatEvent,
@@ -219,6 +251,8 @@ def _track(
         }
     )
     return event
+
+
 def _bound_thoughts(
     thoughts: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -231,6 +265,8 @@ def _bound_thoughts(
             }
         )
     return bounded
+
+
 def _compact_planner_context(final_result: dict[str, Any]) -> list[dict[str, Any]]:
     """
     Compact, deterministic record of the documents/tables this request
@@ -262,6 +298,8 @@ def _compact_planner_context(final_result: dict[str, Any]) -> list[dict[str, Any
         if len(matches) >= MAX_PRIOR_CONTEXT_MATCHES:
             break
     return matches
+
+
 def _prior_tool_history(conversation) -> list[dict[str, Any]]:
     """
     Seed the agent's tool_history with the PREVIOUS turn's resolved
@@ -302,11 +340,14 @@ def _prior_tool_history(conversation) -> list[dict[str, Any]]:
             conversation.id,
         )
         return []
+
+
 def _has_meaningful_conversation_context(
     conversation_history: list[dict[str, str]],
 ) -> bool:
     """
     Return True when prior user/assistant content is available for context.
+
     A system summary alone is not enough to suppress the lightweight
     chitchat path. At least one real user/assistant turn must be present.
     """
@@ -318,6 +359,8 @@ def _has_meaningful_conversation_context(
         and bool(str(item.get("content") or "").strip())
         for item in conversation_history
     )
+
+
 def _out_of_scope_response(
     *,
     conversation,
@@ -346,6 +389,8 @@ def _out_of_scope_response(
             **metadata,
         },
     )
+
+
 def _scope_guard_failure_response(
     *,
     conversation,
@@ -379,7 +424,8 @@ def _scope_guard_failure_response(
             **metadata,
         },
     )
-CHITCHAT_FALLBACK = "I'm here 😄 What's up?"
+
+
 def _chitchat_response(
     *,
     conversation,
@@ -444,57 +490,29 @@ def _chitchat_response(
             **metadata,
         },
     )
+
 _CITATION_MARKER_PATTERN = re.compile(r" ?\[(\d{1,3})\]")
-def _sanitize_citation_markers(
-    answer: str,
-    *,
-    valid_indices: set[int],
-    keep_valid: bool,
-) -> str:
-    def replace(match: re.Match[str]) -> str:
-        number = int(match.group(1))
-        if keep_valid and number in valid_indices:
-            return match.group(0)
-        return ""
-    return _CITATION_MARKER_PATTERN.sub(replace, answer).strip()
-def _evaluate_grounding(
-    *,
-    answer: str,
-    sources: list[dict[str, Any]],
-    citations: list[dict[str, Any]],
-    route: str,
-) -> bool | None:
-    if route != "ANSWER":
-        return None
-    valid_indices = {
-        int(source["index"])
-        for source in sources
-        if isinstance(source, dict) and source.get("index") is not None
-    }
-    marker_numbers = find_marker_numbers(answer)
-    if not marker_numbers:
-        return False
-    if marker_numbers - valid_indices:
-        return False
-    cited = {
-        int(entry["index"])
-        for entry in citations
-        if isinstance(entry, dict) and entry.get("index") is not None
-    }
-    return bool(cited) and cited == marker_numbers
+
+
+def _strip_citation_markers(answer: str) -> str:
+    """Defensive cleanup: remove any legacy inline markers like [1]."""
+    return _CITATION_MARKER_PATTERN.sub("", answer).strip()
+
+
 def _execute_message_stream(
     *,
     conversation_id: int,
     user_message: str,
 ) -> Iterator[ChatEvent]:
     conversation = get_conversation(conversation_id)
-    # Passive usage logging covers every LLM call made by this user message.
+
     conversation_settings, _ = ConversationSettings.objects.get_or_create(
         conversation=conversation,
     )
     memory_enabled = conversation_settings.memory_enabled
-    citations_enabled = conversation_settings.citations_enabled
+    citations_enabled = conversation_settings.citations_enabled  # noqa: F841
     thoughts: list[dict[str, Any]] = []
+
     conversation_history: list[dict[str, str]] = []
     if memory_enabled:
         memory_context = build_memory_context(conversation=conversation)
@@ -515,11 +533,13 @@ def _execute_message_stream(
                 }
             )
         conversation_history.extend(memory_context.get("recent_messages", []))
+
     add_message(
         conversation=conversation,
         role="USER",
         content=user_message,
     )
+
     yield _track(
         thoughts,
         ChatEvent(
@@ -535,11 +555,13 @@ def _execute_message_stream(
                 message="Conversation context loaded.",
             ),
         )
+
     replay = resolve_replay(user_message, conversation_history)
     scope_query = replay[1] if replay else user_message
     has_conversation_context = _has_meaningful_conversation_context(
         conversation_history
     )
+
     deterministic_route = ScopeGuard.deterministic_route(scope_query)
     if deterministic_route == "OUT":
         yield _out_of_scope_response(
@@ -554,7 +576,9 @@ def _execute_message_stream(
             thoughts=thoughts,
         )
         return
+
     document_ids = _scoped_document_ids(conversation)
+
     if SCOPE_GUARD_LLM_ENABLED:
         try:
             scope_decision = ScopeGuard().classify(
@@ -598,6 +622,7 @@ def _execute_message_stream(
                 thoughts=thoughts,
             )
             return
+
     title_job: _TitleJob | None = None
     try:
         title_job = _start_title_job(
@@ -610,6 +635,7 @@ def _execute_message_stream(
             "Could not start title generation: conversation_id=%s",
             conversation.id,
         )
+
     state: AgentState = {
         "query": user_message,
         "workspace_id": conversation.workspace_id,
@@ -636,6 +662,7 @@ def _execute_message_stream(
         "recovery_attempts": 0,
         "deadline_monotonic": time.monotonic() + REQUEST_BUDGET_SECONDS,
     }
+
     yield _track(
         thoughts,
         ChatEvent(
@@ -643,6 +670,7 @@ def _execute_message_stream(
             message="Starting evidence agent.",
         ),
     )
+
     final_result: dict[str, Any] | None = None
     failure_code = ""
     try:
@@ -681,8 +709,10 @@ def _execute_message_stream(
             conversation.id,
         )
         failure_code = "EXECUTION_ERROR"
+
     if final_result is None and not failure_code:
         failure_code = "NO_FINAL_STATE"
+
     if failure_code:
         add_message(
             conversation=conversation,
@@ -702,29 +732,29 @@ def _execute_message_stream(
             data={"error_code": failure_code},
         )
         return
+
     answer = final_result.get("answer", "")
     final_route = final_result.get("route", "")
     if not answer:
         answer = "I could not generate an answer from the available evidence."
+
     final_evidence = final_result.get("final_evidence", [])
-    sources, citations = extract_citations(
+
+    # Sources are still built from the final evidence. The citations part of
+    # the result is no longer used: citations metadata is always [].
+    sources, _ = extract_citations(
         answer=answer,
         evidence=final_evidence,
         workspace_id=conversation.workspace_id,
     )
-    grounding_passed = _evaluate_grounding(
-        answer=answer,
-        sources=sources,
-        citations=citations,
-        route=final_route,
-    )
-    answer = _sanitize_citation_markers(
-        answer,
-        valid_indices={source["index"] for source in sources},
-        keep_valid=citations_enabled,
-    )
-    if not citations_enabled:
-        citations = []
+
+    # Grounding no longer depends on citation markers or citation presence.
+    # For answered requests it is true when the agent produced final evidence.
+    grounding_passed = None if final_route != "ANSWER" else bool(final_evidence)
+
+    answer = _strip_citation_markers(answer)
+
+    citations: list[dict[str, Any]] = []
     metadata: dict[str, Any] = {
         "sources": sources,
         "citations": citations,
@@ -732,18 +762,21 @@ def _execute_message_stream(
         "grounding_passed": grounding_passed,
         "route": final_route,
     }
+
     persisted_metadata = dict(metadata)
     if memory_enabled and final_route not in {
         "ERROR",
         "NEEDS_CLARIFICATION",
     }:
         persisted_metadata[PLANNER_CONTEXT_KEY] = _compact_planner_context(final_result)
+
     add_message(
         conversation=conversation,
         role="ASSISTANT",
         content=answer,
         metadata=persisted_metadata,
     )
+
     if final_route == "ERROR":
         yield ChatEvent(
             event="error",
@@ -756,8 +789,10 @@ def _execute_message_stream(
             },
         )
         return
+
     if memory_enabled:
         _update_memory_in_background(conversation.id)
+
     try:
         _apply_title(conversation=conversation, job=title_job)
     except Exception:
@@ -765,6 +800,7 @@ def _execute_message_stream(
             "Applying title failed: conversation_id=%s",
             conversation.id,
         )
+
     yield ChatEvent(
         event="complete",
         message="Request completed.",

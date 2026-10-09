@@ -79,11 +79,6 @@ _TOO_LARGE_MARKERS = (
 )
 
 
-# ---------------------------------------------------------------------------
-# Pure helpers: usage extraction, error parsing, classification
-# ---------------------------------------------------------------------------
-
-
 def _tpm_limit(model: str) -> int:
     return int(MODEL_TPM_LIMITS.get(model, DEFAULT_TPM_LIMIT))
 
@@ -245,11 +240,6 @@ def _terminal_error(kind: str, exc) -> Exception:
     if kind in ("invalid_request", "invalid_response"):
         return InvalidResponseError(str(exc))
     return ProviderUnavailableError(f"Groq request failed: {exc}")
-
-
-# ---------------------------------------------------------------------------
-# Provider
-# ---------------------------------------------------------------------------
 
 
 class GroqProvider:
@@ -549,7 +539,7 @@ class GroqProvider:
             logger.info(
                 "[LLM_REQUEST] task=%s model=%s key=%s attempt=%s/%s "
                 "estimated_input=%s max_tokens=%s reserved=%s bucket_window_used=%s "
-                "queue_wait_seconds=%.3f stream=%s",
+                "queue_wait_seconds=%.3f stream=%s reasoning_effort=%s",
                 task,
                 model,
                 lease.key_index,
@@ -561,6 +551,9 @@ class GroqProvider:
                 lease.bucket_used,
                 lease.waited,
                 stream,
+                # What is actually placed in the provider request (None means
+                # the parameter is omitted and the model default applies).
+                kwargs.get("reasoning_effort"),
             )
 
             try:

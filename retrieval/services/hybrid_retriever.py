@@ -4,7 +4,8 @@ retrieval/services/hybrid_retriever.py
 QueryPilot's primary workspace evidence retriever.
 
 Responsibilities:
-    1. Dense semantic retrieval from Chroma.
+
+    1. Dense semantic retrieval from AWS S3 Vectors.
     2. BM25 lexical retrieval over the current workspace.
     3. Optional source-type filtering (text/table).
     4. Merge and deduplicate candidates.
@@ -13,6 +14,7 @@ Responsibilities:
        confidence estimate.
 
 This class deliberately does NOT:
+
     - decide whether the question is in scope
     - decide whether SQL is required
     - execute SQLite queries
@@ -22,6 +24,7 @@ This class deliberately does NOT:
 Those are planner/agent responsibilities.
 
 Important:
+
     `confidence` is a retrieval-strength heuristic, NOT a calibrated
     probability that the final answer is correct.
 """
@@ -75,7 +78,6 @@ class RetrievalResult:
     evidence: list[Evidence]
     confidence: float
     candidate_count: int
-
     dense_failed: bool = False
     dense_error_code: str | None = None
 
@@ -130,7 +132,6 @@ class HybridRetriever:
     RRF_K = 60
 
     KEY_MAX_CHUNKS = 4
-
     KEY_TAIL_CHARS = 400
 
     TEXT_SOURCE_TYPE = "text"
@@ -167,9 +168,10 @@ class HybridRetriever:
         """
         Retrieve the strongest evidence for a query inside one workspace.
 
-        All available scope constraints are applied in the Chroma where
-        clause before ranking. A defensive validation pass is still kept
-        after retrieval so malformed/stale metadata cannot widen scope.
+        All available scope constraints are applied in the S3 Vectors
+        metadata filter (dense) / application-side filter (lexical corpus)
+        before ranking. A defensive validation pass is still kept after
+        retrieval so malformed/stale metadata cannot widen scope.
         """
         query = query.strip()
 
@@ -192,6 +194,7 @@ class HybridRetriever:
 
         dense_candidates: list[dict[str, Any]] = []
         bm25_candidates: list[dict[str, Any]] = []
+
         dense_error: RetrievalError | None = None
         bm25_error: RetrievalError | None = None
 
@@ -234,6 +237,7 @@ class HybridRetriever:
             )
 
             final_candidates = fused_candidates[: self.top_k]
+
             evidence = [candidate["evidence"] for candidate in final_candidates]
 
             confidence = self._calculate_confidence(
@@ -255,8 +259,8 @@ class HybridRetriever:
                 logger.warning(
                     "HybridRetriever.retrieve: DEGRADED result, dense "
                     "retrieval failed (code=%s cause=%r); using lexical "
-                    "signal only. The Chroma vector index for the "
-                    "requested scope is probably inconsistent.",
+                    "signal only. The S3 Vectors query for the "
+                    "requested scope failed.",
                     dense_error.code,
                     dense_error.__cause__,
                 )
@@ -295,10 +299,10 @@ class HybridRetriever:
         Deterministic exact lookup of stable keys (e.g. an Employee ID that
         was resolved in another document).
 
-        Independent of embeddings: it reads chunk text + metadata with
-        collection.get (the same call the BM25 corpus uses), under the SAME
-        workspace / document / type predicate and the SAME fail-closed
-        validation as ranked retrieval. Matching is case- and
+        Independent of embeddings: it reads chunk text + metadata by
+        listing the knowledge index (the same read the BM25 corpus uses),
+        under the SAME workspace / document / type predicate and the SAME
+        fail-closed validation as ranked retrieval. Matching is case- and
         separator-insensitive ('EMP-1150' also finds 'EMP 1150').
         """
         if workspace_id <= 0:
@@ -309,6 +313,7 @@ class HybridRetriever:
             key = str(key or "").strip()
             if key and key not in clean_keys:
                 clean_keys.append(key)
+
         if not clean_keys:
             return KeyLookupResult([], {}, [])
 
@@ -316,13 +321,10 @@ class HybridRetriever:
         types = self._normalize_source_types(source_types)
 
         try:
-            corpus = VectorStore.knowledge_collection().get(
-                where=self._build_chroma_where(
-                    workspace_id=workspace_id,
-                    allowed_document_ids=document_ids,
-                    source_types=types,
-                ),
-                include=["documents", "metadatas"],
+            corpus = VectorStore.list_knowledge(
+                workspace_id=workspace_id,
+                allowed_document_ids=document_ids,
+                source_types=types,
             )
         except Exception as exc:
             raise RetrievalError(
@@ -342,11 +344,22 @@ class HybridRetriever:
             }
             for i in range(len(docs))
         ]
+
         entries = self._validate_candidates(
             candidates=candidates,
             workspace_id=workspace_id,
             allowed_document_ids=document_ids,
             source_types=types,
+        )
+        logger.info(
+            "fetch_document_chunks: workspace_id=%s requested=%s raw_rows=%d "
+            "validated=%d raw_types=%s raw_document_ids=%s",
+            workspace_id,
+            ids,
+            len(docs),
+            len(entries),
+            sorted({str((m or {}).get("type")) for m in metas if isinstance(m, dict)}),
+            sorted({str((m or {}).get("document_id")) for m in metas if isinstance(m, dict)}),
         )
 
         by_position: dict[tuple[int, Any], dict[str, Any]] = {}
@@ -366,8 +379,10 @@ class HybridRetriever:
                 m = pattern.search(entry["text"])
                 if m:
                     hits.append((entry, m))
+
             if not hits:
                 continue
+
             if len(hits) > self.KEY_MAX_CHUNKS:
                 non_identifying.append(key)
                 continue
@@ -435,8 +450,8 @@ class HybridRetriever:
         """
         Every text chunk of the given documents, in reading order.
 
-        Uses collection.get (metadata/text segment), NOT a vector query, so it
-        keeps working when the vector index is damaged. Same workspace /
+        Lists the knowledge index (metadata/text), NOT a vector query, so it
+        keeps working when the vector search is unavailable. Same workspace /
         document / type predicate and the same fail-closed validation as
         ranked retrieval.
         """
@@ -446,16 +461,14 @@ class HybridRetriever:
         ids = self._normalize_document_ids(document_ids)
         if not ids:
             return []
+
         types = self._normalize_source_types(source_types)
 
         try:
-            corpus = VectorStore.knowledge_collection().get(
-                where=self._build_chroma_where(
-                    workspace_id=workspace_id,
-                    allowed_document_ids=ids,
-                    source_types=types,
-                ),
-                include=["documents", "metadatas"],
+            corpus = VectorStore.list_knowledge(
+                workspace_id=workspace_id,
+                allowed_document_ids=ids,
+                source_types=types,
             )
         except Exception as exc:
             raise RetrievalError(
@@ -495,6 +508,7 @@ class HybridRetriever:
                     "metadata": entry["metadata"],
                 }
             )
+
         chunks.sort(key=lambda c: (c["document_id"], c["chunk_index"]))
         return chunks
 
@@ -519,6 +533,7 @@ class HybridRetriever:
         Normalize a document allow-list.
 
         None means unrestricted at the document-ID level.
+
         An explicitly supplied empty list remains empty and is treated as
         matching no documents.
         """
@@ -548,7 +563,7 @@ class HybridRetriever:
         cls,
         source_types: Iterable[str] | None,
     ) -> list[str] | None:
-        """Normalize and validate Chroma source-type filters."""
+        """Normalize and validate vector source-type filters."""
         if source_types is None:
             return None
 
@@ -572,50 +587,6 @@ class HybridRetriever:
 
         return normalized
 
-    @staticmethod
-    def _build_chroma_where(
-        *,
-        workspace_id: int,
-        allowed_document_ids: list[int] | None,
-        source_types: list[str] | None,
-    ) -> dict[str, Any]:
-        """
-        Build the complete Chroma metadata predicate.
-
-        Scope is enforced before ranking rather than by post-filtering a
-        larger candidate pool.
-        """
-        clauses: list[dict[str, Any]] = [
-            {"workspace_id": workspace_id},
-        ]
-
-        if allowed_document_ids is not None:
-            clauses.append(
-                {
-                    "document_id": {
-                        "$in": (allowed_document_ids if allowed_document_ids else [-1])
-                    }
-                }
-            )
-
-        if source_types is not None:
-            clauses.append(
-                {
-                    "type": {
-                        "$in": (
-                            source_types
-                            if source_types
-                            else ["__querypilot_no_source__"]
-                        )
-                    }
-                }
-            )
-
-        if len(clauses) == 1:
-            return clauses[0]
-
-        return {"$and": clauses}
-
     def _dense_search(
         self,
         *,
@@ -625,28 +596,21 @@ class HybridRetriever:
         source_types: list[str] | None,
     ) -> list[dict[str, Any]]:
         """
-        Perform semantic retrieval from Chroma.
+        Perform semantic retrieval from S3 Vectors (QueryVectors).
 
-        Chroma receives the workspace, document and source-type boundaries
-        directly so table metadata cannot contaminate text-only retrieval.
+        The workspace, document and source-type boundaries are passed as a
+        metadata filter so table metadata cannot contaminate text-only
+        retrieval.
         """
         try:
-            collection = VectorStore.knowledge_collection()
             query_embedding = VectorStore.embed([query])[0]
 
-            results = collection.query(
-                query_embeddings=[query_embedding],
-                n_results=self.dense_k,
-                where=self._build_chroma_where(
-                    workspace_id=workspace_id,
-                    allowed_document_ids=allowed_document_ids,
-                    source_types=source_types,
-                ),
-                include=[
-                    "documents",
-                    "metadatas",
-                    "distances",
-                ],
+            hits = VectorStore.query_knowledge(
+                query_embedding=query_embedding,
+                top_k=self.dense_k,
+                workspace_id=workspace_id,
+                allowed_document_ids=allowed_document_ids,
+                source_types=source_types,
             )
         except Exception as exc:
             raise RetrievalError(
@@ -654,43 +618,20 @@ class HybridRetriever:
                 message="Dense retrieval failed.",
             ) from exc
 
-        documents = (
-            results.get("documents", [[]])[0] if isinstance(results, dict) else []
-        )
-        metadatas = (
-            results.get("metadatas", [[]])[0] if isinstance(results, dict) else []
-        )
-        distances = (
-            results.get("distances", [[]])[0] if isinstance(results, dict) else []
-        )
-        ids = results.get("ids", [[]])[0] if isinstance(results, dict) else []
-
-        if not isinstance(documents, list):
-            documents = []
-        if not isinstance(metadatas, list):
-            metadatas = []
-        if not isinstance(distances, list):
-            distances = []
-        if not isinstance(ids, list):
-            ids = []
-
         candidates: list[dict[str, Any]] = []
 
-        for index, document in enumerate(documents):
-            metadata = (
-                metadatas[index]
-                if index < len(metadatas) and isinstance(metadatas[index], dict)
-                else {}
-            )
+        for hit in hits:
+            metadata = hit.get("metadata")
+
+            if not isinstance(metadata, dict):
+                metadata = {}
 
             candidates.append(
                 {
-                    "id": ids[index] if index < len(ids) else None,
-                    "text": str(document or ""),
+                    "id": hit.get("id"),
+                    "text": str(hit.get("text") or ""),
                     "metadata": metadata,
-                    "dense_distance": (
-                        distances[index] if index < len(distances) else None
-                    ),
+                    "dense_distance": hit.get("distance"),
                 }
             )
 
@@ -712,21 +653,14 @@ class HybridRetriever:
         """
         Perform workspace-scoped BM25 retrieval.
 
-        The corpus is restricted by the same Chroma metadata predicate as
-        dense retrieval before the lexical ranker sees it.
+        The corpus is restricted by the same workspace / document / type
+        predicate as dense retrieval before the lexical ranker sees it.
         """
         try:
-            collection = VectorStore.knowledge_collection()
-            corpus = collection.get(
-                where=self._build_chroma_where(
-                    workspace_id=workspace_id,
-                    allowed_document_ids=allowed_document_ids,
-                    source_types=source_types,
-                ),
-                include=[
-                    "documents",
-                    "metadatas",
-                ],
+            corpus = VectorStore.list_knowledge(
+                workspace_id=workspace_id,
+                allowed_document_ids=allowed_document_ids,
+                source_types=source_types,
             )
         except Exception as exc:
             raise RetrievalError(
@@ -740,8 +674,10 @@ class HybridRetriever:
 
         if not isinstance(documents, list):
             documents = []
+
         if not isinstance(metadatas, list):
             metadatas = []
+
         if not isinstance(ids, list):
             ids = []
 
@@ -750,6 +686,7 @@ class HybridRetriever:
 
         try:
             bm25 = BM25Retriever(documents=documents)
+
             matches = bm25.top_k(
                 query=query,
                 k=self.bm25_k,
@@ -804,13 +741,14 @@ class HybridRetriever:
         """
         Defensive post-validation.
 
-        Chroma is the primary enforcement point. This second check is
-        intentionally fail-closed: malformed candidates are discarded,
-        never retained as an unscoped fallback.
+        The vector store filter is the primary enforcement point. This
+        second check is intentionally fail-closed: malformed candidates are
+        discarded, never retained as an unscoped fallback.
         """
         allowed_document_set = (
             set(allowed_document_ids) if allowed_document_ids is not None else None
         )
+
         source_type_set = set(source_types) if source_types is not None else None
 
         validated: list[dict[str, Any]] = []
@@ -844,6 +782,7 @@ class HybridRetriever:
             candidate["document_id"] = document_id
             candidate["source_type"] = source_type
             candidate["metadata"] = metadata
+
             validated.append(candidate)
 
         return validated
@@ -855,13 +794,13 @@ class HybridRetriever:
         """
         Stable identity used by RRF fusion.
 
-        Chroma IDs are preferred. Metadata identity is the fail-safe when
-        a backend result lacks an ID.
+        Vector keys are preferred. Metadata identity is the fail-safe when
+        a backend result lacks a key.
         """
         evidence_id = candidate.get("id")
 
         if evidence_id is not None:
-            return f"chroma:{evidence_id}"
+            return f"vec:{evidence_id}"
 
         metadata = candidate.get("metadata") or {}
 
@@ -1042,7 +981,7 @@ class HybridRetriever:
         best_dense_similarity = 0.0
 
         if dense_candidates:
-            best_dense_similarity = cls._l2_distance_to_similarity(
+            best_dense_similarity = cls._cosine_distance_to_similarity(
                 dense_candidates[0].get("dense_distance")
             )
 
@@ -1078,12 +1017,12 @@ class HybridRetriever:
         return max(0.0, min(1.0, confidence))
 
     @staticmethod
-    def _l2_distance_to_similarity(
+    def _cosine_distance_to_similarity(
         distance: float | None,
     ) -> float:
         """
-        Convert L2 distance between normalized vectors into cosine
-        similarity.
+        Convert an S3 Vectors cosine distance (1 - cosine similarity)
+        into cosine similarity, clamped to [0, 1].
         """
         if distance is None:
             return 0.0
@@ -1093,6 +1032,6 @@ class HybridRetriever:
         except (TypeError, ValueError):
             return 0.0
 
-        similarity = 1.0 - (value * value / 2.0)
+        similarity = 1.0 - value
 
         return max(0.0, min(1.0, similarity))

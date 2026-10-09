@@ -1,67 +1,86 @@
-"""Ingestion Sqlite module for QueryPilot."""
+"""
+Structured database module for QueryPilot.
+
+Historical module name is retained for compatibility.
+
+The physical structured-data store is now MySQL RDS #2.
+"""
+
+from __future__ import annotations
 
 import re
-import sqlite3
-import threading
-from pathlib import Path
 
-from django.conf import settings
+from django.db import connections, transaction
 
-MAX_QUERY_SECONDS = 3.0
+
 CONNECTION_TIMEOUT_SECONDS = 10
 
-_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_IDENTIFIER_PATTERN = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*$"
+)
 
 
 class SQLiteManager:
-    DB_PATH = Path(settings.BASE_DIR) / "storage" / "workspace_data.db"
+    """
+    Compatibility manager for QueryPilot structured data.
 
-    _wal_initialized = False
-    _wal_lock = threading.Lock()
+    Historical class name is retained so the ingestion pipeline does
+    not need to be rewritten.
+
+    Physical storage:
+        MySQL RDS #2
+
+    Django database alias:
+        structured
+
+    Responsibilities:
+        - Create tables
+        - Insert rows
+        - List tables
+        - List document tables
+        - Drop tables
+        - Drop document tables
+    """
+
+    DB_ALIAS = "structured"
 
     @classmethod
     def get_connection(cls):
-
-        cls.DB_PATH.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        connection = sqlite3.connect(
-            cls.DB_PATH,
-            timeout=CONNECTION_TIMEOUT_SECONDS,
-        )
-
-        connection.execute(f"PRAGMA busy_timeout={CONNECTION_TIMEOUT_SECONDS * 1000}")
-
-        if not cls._wal_initialized:
-            with cls._wal_lock:
-                if not cls._wal_initialized:
-                    connection.execute("PRAGMA journal_mode=WAL")
-
-                    cls._wal_initialized = True
-
-        connection.execute("PRAGMA synchronous=NORMAL")
-
-        return connection
+        """
+        Return the Django database wrapper for RDS #2.
+        """
+        return connections[cls.DB_ALIAS]
 
     @staticmethod
     def validate_identifier(
         identifier,
         label="identifier",
     ):
+        """
+        Validate a MySQL identifier before interpolating it into SQL.
 
+        Parameters cannot be used for identifiers, so table/column names
+        must be strictly validated.
+        """
         identifier = str(identifier)
 
         if not _IDENTIFIER_PATTERN.fullmatch(identifier):
-            raise ValueError(f"Invalid SQLite {label}: '{identifier}'.")
+            raise ValueError(
+                f"Invalid MySQL {label}: '{identifier}'."
+            )
 
         return identifier
 
     @staticmethod
-    def sanitize_column_name(column_name):
-
-        column_name = str(column_name).strip()
+    def sanitize_column_name(
+        column_name,
+    ):
+        """
+        Preserve the existing QueryPilot column sanitisation behavior.
+        """
+        column_name = str(
+            column_name
+        ).strip()
 
         column_name = re.sub(
             r"[^a-zA-Z0-9_]",
@@ -83,9 +102,11 @@ class SQLiteManager:
         table_name,
         columns,
     ):
-
         if not columns:
-            raise ValueError(f"Cannot create table '{table_name}' with no columns.")
+            raise ValueError(
+                f"Cannot create table '{table_name}' "
+                "with no columns."
+            )
 
         table_name = cls.validate_identifier(
             table_name,
@@ -95,37 +116,55 @@ class SQLiteManager:
         normalized_columns = []
         used_columns = set()
 
-        for index, column in enumerate(columns):
-            column = cls.sanitize_column_name(column)
+        # Preserve the current duplicate-column handling exactly.
+        for column in columns:
+
+            column = cls.sanitize_column_name(
+                column
+            )
 
             if column.lower() in used_columns:
+
                 base = column
                 suffix = 2
 
-                while f"{base}_{suffix}".lower() in used_columns:
+                while (
+                    f"{base}_{suffix}".lower()
+                    in used_columns
+                ):
                     suffix += 1
 
                 column = f"{base}_{suffix}"
 
-            used_columns.add(column.lower())
-            normalized_columns.append(column)
+            used_columns.add(
+                column.lower()
+            )
+
+            normalized_columns.append(
+                column
+            )
 
         connection = cls.get_connection()
 
+        column_sql = ", ".join(
+            f"`{column}` TEXT"
+            for column in normalized_columns
+        )
+
+        query = (
+            f"CREATE TABLE IF NOT EXISTS "
+            f"`{table_name}` ({column_sql})"
+        )
+
         try:
-            column_sql = ", ".join(f'"{column}" TEXT' for column in normalized_columns)
-
-            query = f'CREATE TABLE IF NOT EXISTS "{table_name}" ({column_sql})'
-
-            connection.execute(query)
-            connection.commit()
+            with transaction.atomic(
+                using=cls.DB_ALIAS
+            ):
+                with connection.cursor() as cursor:
+                    cursor.execute(query)
 
         except Exception:
-            connection.rollback()
             raise
-
-        finally:
-            connection.close()
 
     @classmethod
     def insert_rows(
@@ -133,7 +172,6 @@ class SQLiteManager:
         table_name,
         rows,
     ):
-
         if not rows:
             return
 
@@ -142,12 +180,15 @@ class SQLiteManager:
             "table name",
         )
 
-        expected_width = len(rows[0])
+        expected_width = len(
+            rows[0]
+        )
 
         if expected_width == 0:
             return
 
         for row in rows:
+
             if len(row) != expected_width:
                 raise ValueError(
                     f"Row width mismatch for table "
@@ -156,45 +197,56 @@ class SQLiteManager:
                     f"{len(row)}."
                 )
 
+        placeholders = ",".join(
+            "%s"
+            for _ in range(expected_width)
+        )
+
+        query = (
+            f"INSERT INTO `{table_name}` "
+            f"VALUES ({placeholders})"
+        )
+
         connection = cls.get_connection()
 
         try:
-            placeholders = ",".join("?" for _ in range(expected_width))
-
-            query = f'INSERT INTO "{table_name}" VALUES ({placeholders})'
-
-            connection.executemany(
-                query,
-                rows,
-            )
-
-            connection.commit()
+            with transaction.atomic(
+                using=cls.DB_ALIAS
+            ):
+                with connection.cursor() as cursor:
+                    cursor.executemany(
+                        query,
+                        rows,
+                    )
 
         except Exception:
-            connection.rollback()
             raise
-
-        finally:
-            connection.close()
 
     @classmethod
     def list_tables(cls):
+        """
+        Return all structured tables in RDS #2.
 
+        Uses MySQL information_schema instead of
+        SQLite sqlite_master.
+        """
         connection = cls.get_connection()
 
-        try:
-            rows = connection.execute(
-                """
-                SELECT name
-                FROM sqlite_master
-                WHERE type='table'
-                """
-            ).fetchall()
+        query = """
+            SELECT TABLE_NAME
+            FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_TYPE = 'BASE TABLE'
+        """
 
-            return [row[0] for row in rows]
+        with connection.cursor() as cursor:
+            cursor.execute(query)
+            rows = cursor.fetchall()
 
-        finally:
-            connection.close()
+        return [
+            row[0]
+            for row in rows
+        ]
 
     @classmethod
     def list_document_tables(
@@ -202,35 +254,42 @@ class SQLiteManager:
         workspace_id,
         document_id,
     ):
+        prefix = (
+            f"ws_{workspace_id}"
+            f"_doc_{document_id}_"
+        )
 
-        prefix = f"ws_{workspace_id}_doc_{document_id}_"
-
-        return [table for table in cls.list_tables() if table.startswith(prefix)]
+        return [
+            table
+            for table in cls.list_tables()
+            if table.startswith(prefix)
+        ]
 
     @classmethod
     def drop_table(
         cls,
         table_name,
     ):
-
         table_name = cls.validate_identifier(
             table_name,
             "table name",
         )
 
+        query = (
+            f"DROP TABLE IF EXISTS `{table_name}`"
+        )
+
         connection = cls.get_connection()
 
         try:
-            connection.execute(f'DROP TABLE IF EXISTS "{table_name}"')
-
-            connection.commit()
+            with transaction.atomic(
+                using=cls.DB_ALIAS
+            ):
+                with connection.cursor() as cursor:
+                    cursor.execute(query)
 
         except Exception:
-            connection.rollback()
             raise
-
-        finally:
-            connection.close()
 
     @classmethod
     def drop_document_tables(
@@ -238,35 +297,39 @@ class SQLiteManager:
         workspace_id,
         document_id,
     ):
+        prefix = (
+            f"ws_{workspace_id}"
+            f"_doc_{document_id}_"
+        )
 
-        prefix = f"ws_{workspace_id}_doc_{document_id}_"
+        # First discover the document's tables from RDS.
+        tables = [
+            table
+            for table in cls.list_tables()
+            if table.startswith(prefix)
+        ]
+
+        if not tables:
+            return
 
         connection = cls.get_connection()
 
         try:
-            tables = connection.execute(
-                """
-                SELECT name
-                FROM sqlite_master
-                WHERE type='table'
-                """
-            ).fetchall()
+            with transaction.atomic(
+                using=cls.DB_ALIAS
+            ):
+                with connection.cursor() as cursor:
 
-            document_tables = [row[0] for row in tables if row[0].startswith(prefix)]
+                    for table_name in tables:
 
-            for table_name in document_tables:
-                table_name = cls.validate_identifier(
-                    table_name,
-                    "table name",
-                )
+                        table_name = cls.validate_identifier(
+                            table_name,
+                            "table name",
+                        )
 
-                connection.execute(f'DROP TABLE IF EXISTS "{table_name}"')
-
-            connection.commit()
+                        cursor.execute(
+                            f"DROP TABLE IF EXISTS `{table_name}`"
+                        )
 
         except Exception:
-            connection.rollback()
             raise
-
-        finally:
-            connection.close()

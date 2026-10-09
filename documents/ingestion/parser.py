@@ -719,9 +719,11 @@ class LlamaParseService:
                         len(str(raw_html)),
                     )
 
-                    logger.info("[CHECKPOINT 1] RAW table rows=%r", raw_rows)
                     logger.info(
-                        "[CHECKPOINT 1] RAW table cell types (first 3 rows)=%r",
+                        "[CHECKPOINT 1] RAW table rows_preview suppressed; "
+                        "rows_count=%d first_rows=%d row_cell_types=%s",
+                        len(raw_rows) if isinstance(raw_rows, (list, tuple)) else 0,
+                        min(3, len(raw_rows)) if isinstance(raw_rows, (list, tuple)) else 0,
                         [
                             [type(cell).__name__ for cell in row]
                             for row in raw_rows[:3]
@@ -793,13 +795,10 @@ class LlamaParseService:
                         csv_text = csv_text or rep["csv"]
 
                     logger.info(
-                        "[CHECKPOINT 2] NORMALIZED table: rows_count=%d columns=%d.",
+                        "[CHECKPOINT 2] NORMALIZED table: rows_count=%d columns=%d "
+                        "cell_types_preview=%s.",
                         len(rows),
                         len(rows[0]) if rows else 0,
-                    )
-                    logger.info("[CHECKPOINT 2] NORMALIZED rows=%r", rows)
-                    logger.info(
-                        "[CHECKPOINT 2] NORMALIZED cell types (first 3 rows)=%r",
                         [[type(cell).__name__ for cell in row] for row in rows[:3]],
                     )
 
@@ -1125,7 +1124,6 @@ class LlamaAdapter:
                     len(rows),
                     len(rows[0]) if rows else 0,
                 )
-                logger.info("[CHECKPOINT 3] ADAPTER rows=%r", rows)
 
                 table_nodes.append(
                     {

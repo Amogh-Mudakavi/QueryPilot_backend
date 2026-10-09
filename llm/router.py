@@ -20,6 +20,8 @@ from .providers import get_provider
 
 logger = logging.getLogger(__name__)
 
+VALID_REASONING_EFFORTS = frozenset({"low", "medium", "high"})
+
 
 class LLMRouter:
     def __init__(self):
@@ -36,9 +38,18 @@ class LLMRouter:
         return self._profile(task).model
 
     @staticmethod
-    def _reasoning_effort(profile: TaskProfile, include_reasoning: bool | None):
-        # Callers that pass include_reasoning=False ask for the cheapest
-        # reasoning; anything else uses the task's own setting.
+    def _reasoning_effort(
+        profile: TaskProfile,
+        include_reasoning: bool | None,
+        reasoning_effort: str | None = None,
+    ):
+        if reasoning_effort is not None:
+            if reasoning_effort in VALID_REASONING_EFFORTS:
+                return reasoning_effort
+            logger.warning(
+                "Ignoring unsupported reasoning_effort=%r for task profile",
+                reasoning_effort,
+            )
         return "low" if include_reasoning is False else profile.reasoning_effort
 
     def generate(
@@ -51,11 +62,13 @@ class LLMRouter:
         response_format: dict[str, Any] | None = None,
         stream: bool = False,
         include_reasoning: bool | None = None,
+        reasoning_effort: str | None = None,
     ):
         """Execute a normal (or raw-streaming) LLM request.
 
         `max_tokens` is an optional explicit override and is used verbatim;
-        otherwise the task profile's cap applies.
+        otherwise the task profile's cap applies. `reasoning_effort` is an
+        optional explicit per-call override ("low" / "medium" / "high").
         """
         profile = self._profile(task)
         return self.provider.generate(
@@ -66,7 +79,9 @@ class LLMRouter:
             temperature=DEFAULT_TEMPERATURE if temperature is None else temperature,
             response_format=response_format,
             stream=stream,
-            reasoning_effort=self._reasoning_effort(profile, include_reasoning),
+            reasoning_effort=self._reasoning_effort(
+                profile, include_reasoning, reasoning_effort
+            ),
             timeout=profile.timeout,
             input_hint=profile.input_hint,
         )
@@ -79,6 +94,7 @@ class LLMRouter:
         temperature: float | None = None,
         max_tokens: int | None = None,
         include_reasoning: bool | None = None,
+        reasoning_effort: str | None = None,
     ) -> Iterator[str]:
         """Start a text stream; the application receives plain text deltas."""
         profile = self._profile(task)
@@ -88,7 +104,9 @@ class LLMRouter:
             messages=messages,
             max_tokens=profile.max_tokens if max_tokens is None else max_tokens,
             temperature=DEFAULT_TEMPERATURE if temperature is None else temperature,
-            reasoning_effort=self._reasoning_effort(profile, include_reasoning),
+            reasoning_effort=self._reasoning_effort(
+                profile, include_reasoning, reasoning_effort
+            ),
             timeout=profile.timeout,
             input_hint=profile.input_hint,
         )

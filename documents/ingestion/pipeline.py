@@ -35,7 +35,10 @@ Flow:
 """
 
 import logging
+import shutil
+import tempfile
 import time
+from pathlib import Path
 
 from documents.ingestion.chunker import (
     StructureAwareChunker,
@@ -122,10 +125,62 @@ class IngestionPipeline:
             document_id=document_id,
         )
 
-        result = LlamaParseService.parse_document(
-            document.file.path,
-            file_hash=document.file_hash,
-        )
+        temp_path = None
+
+        try:
+            original_filename = Path(
+                document.file.name
+            ).name
+
+            suffix = Path(
+                original_filename
+            ).suffix
+
+            with document.file.open("rb") as source_file:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    suffix=suffix,
+                    prefix="querypilot_ingestion_",
+                    delete=False,
+                ) as temp_file:
+
+                    temp_path = Path(temp_file.name)
+
+                    shutil.copyfileobj(
+                        source_file,
+                        temp_file,
+                        length=8 * 1024 * 1024,
+                    )
+
+            logger.info(
+                "Document %s: materialized temporary parsing file %s.",
+                document_id,
+                temp_path,
+            )
+
+            result = LlamaParseService.parse_document(
+                str(temp_path),
+                file_hash=document.file_hash,
+            )
+
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(
+                        missing_ok=True,
+                    )
+
+                    logger.info(
+                        "Document %s: removed temporary parsing file.",
+                        document_id,
+                    )
+
+                except Exception:
+                    logger.exception(
+                        "Document %s: failed to remove temporary parsing file %s.",
+                        document_id,
+                        temp_path,
+                    )
 
         text_nodes = LlamaAdapter.extract_text_nodes(result)
 
@@ -172,18 +227,15 @@ class IngestionPipeline:
             table_nodes,
             start=1,
         ):
+            rows = table_node.get("rows") or []
+            column_count = len(rows[0]) if rows else 0
             logger.info(
                 "[CHECKPOINT 3B] TABLE PROCESSOR INPUT #%d: page=%s "
-                "rows_count=%d headers=%r rows=%r.",
+                "rows_count=%d columns=%d.",
                 index,
                 table_node.get("page"),
-                len(table_node.get("rows") or []),
-                (table_node.get("rows") or [])[0]
-                if (table_node.get("rows") or [])
-                else [],
-                (table_node.get("rows") or [])[1:]
-                if len(table_node.get("rows") or []) > 1
-                else [],
+                len(rows),
+                column_count,
             )
 
             processed = TableProcessor.process(
@@ -194,9 +246,15 @@ class IngestionPipeline:
             if not processed:
                 continue
 
-            table_metadata.append(processed["metadata"])
+            table_metadata.append(
+                processed["metadata"]
+            )
 
-            table_name = f"ws_{workspace_id}_doc_{document_id}_table_{index}"
+            table_name = (
+                f"ws_{workspace_id}_"
+                f"doc_{document_id}_"
+                f"table_{index}"
+            )
 
             sqlite_payload = processed["sqlite_payload"]
 
@@ -205,13 +263,12 @@ class IngestionPipeline:
             rows = sqlite_payload["rows"]
 
             logger.info(
-                "[CHECKPOINT 4] SQLITE INPUT #%d: table=%s headers=%r "
-                "rows_count=%d rows=%r.",
+                "[CHECKPOINT 4] SQLITE INPUT #%d: table=%s "
+                "headers_count=%d rows_count=%d.",
                 index,
                 table_name,
-                headers,
+                len(headers),
                 len(rows),
-                rows,
             )
 
             SQLiteManager.create_table(
@@ -225,7 +282,8 @@ class IngestionPipeline:
             )
 
             logger.info(
-                "[CHECKPOINT 5] SQLITE INSERT COMPLETED #%d: table=%s rows_count=%d.",
+                "[CHECKPOINT 5] SQLITE INSERT COMPLETED #%d: "
+                "table=%s rows_count=%d.",
                 index,
                 table_name,
                 len(rows),
@@ -272,7 +330,9 @@ class IngestionPipeline:
     ):
 
         try:
-            VectorStore.delete_document(document_id=document_id)
+            VectorStore.delete_document(
+                document_id=document_id,
+            )
 
         except Exception:
             logger.exception(

@@ -28,11 +28,6 @@ ALLOWED_ROUTES = {
     "CLARIFY",
 }
 
-# Semantic labels are schema-level validation values only. They are not
-# heuristic keywords and do not decide scope by themselves.
-
-# The user-facing intent category.
-
 ALLOWED_TARGETS = (
     "documents_or_subject",
     "querypilot_public",
@@ -40,15 +35,11 @@ ALLOWED_TARGETS = (
     "social",
 )
 
-# What the user wants handed back.
-
 ALLOWED_DELIVERABLES = (
     "answer_from_documents",
     "authored_software",
     "not_applicable",
 )
-
-# Behavioral class of an attempt to manipulate QueryPilot itself.
 
 ALLOWED_THREAT_CATEGORIES = (
     "none",
@@ -64,43 +55,27 @@ ALLOWED_THREAT_CATEGORIES = (
 
 MAX_DOCUMENTS = 3
 
-MAX_HISTORY_MESSAGES = 4
-
 MAX_PROFILE_CHARS = 250
-
-# Budgeting note: the request text is never truncated because the downstream
-# planner still needs the full query. We trim the catalog/profile context first,
-# not the user's actual query.
 
 CHARS_PER_TOKEN = 3
 MAX_QUERY_TOKENS = 2000
-# The classifier should stay small: semantic judgment belongs to the LLM.
-# This is an input target, not a hard rejection threshold.
 MAX_INPUT_TOKENS = 650
 MAX_QUERY_CHARS = MAX_QUERY_TOKENS * CHARS_PER_TOKEN
 MAX_INPUT_CHARS = MAX_INPUT_TOKENS * CHARS_PER_TOKEN
 SCHEMA_AND_FRAMING_CHARS = 1000
 MAX_CATALOG_NAME_CHARS = 80
 
-# gpt-oss completion includes reasoning. The JSON verdict is tiny; keep enough
-# headroom for semantic reasoning and one safe retry without reserving a large
-# per-stage allowance.
 MAX_OUTPUT_TOKENS = 300
 RETRY_OUTPUT_TOKENS = 500
 
 MIN_STEM_CHARS = 3
 
-# Deterministic shortcuts remain intentionally narrow. They are UX helpers only
-# and never substitute for the LLM's semantic judgment on scope or jailbreak
-# attempts.
 
 
 def _strip_query_punctuation(normalized: str) -> str:
     return re.sub(r"[\s?!.]+$", "", normalized.replace("\u2019", "'"))
 
 
-# First-party product questions. This is a UX optimization, not a security
-# classifier; arbitrary mentions of QueryPilot still go to the LLM.
 _PRODUCT_TOPIC = (
     r"(?:architecture|tech(?:nology)?\s+stack|creator|developer|builder|"
     r"purpose|capabilities|limitations|features|security(?:\s+model)?|"
@@ -135,73 +110,49 @@ _PRODUCT_CONTEXTUAL_RE = re.compile(
 @dataclass(frozen=True)
 class ScopeDecision:
     """
-
     Result returned by the Scope Guard.
 
     `route`, `relevant_document_ids` and `reason` are the original
-
     contract. `threat_category` and `deliverable` are additive fields
-
     with defaults (logging / telemetry), so any existing
-
     ScopeDecision(route=..., relevant_document_ids=..., reason=...)
-
     construction and any attribute access keeps working unchanged.
-
     """
 
     route: str
-
     relevant_document_ids: list[int]
-
     reason: str
-
     threat_category: str = "none"
-
     deliverable: str = "not_applicable"
 
 
 class ScopeGuard:
     """
-
     Classifies a user request before it reaches the evidence agent.
 
     The conversation's attached document IDs are authoritative.
-
-    Chroma document profiles are supplemental context for the classifier.
-
+    S3 Vector document profiles are supplemental context for the classifier.
     They are never the security boundary.
 
     The LLM makes every semantic judgment (what is the request aimed at,
-
     what must be delivered, is the user manipulating QueryPilot). Python
-
     only validates structure and applies consistency rules to those
-
     labels.
-
     """
 
     @classmethod
     def deterministic_route(cls, query: str) -> str | None:
         """
-
         Classify clear cases without any LLM call.
 
         Returns:
-
             "CHITCHAT" for obvious lightweight social chat,
-
             "OUT" for clearly out-of-scope requests,
-
             "PRODUCT" for first-party QueryPilot self-knowledge,
-
             None when the query needs the LLM classifier.
 
         NOTE: classify() only honors an "OUT" result when no documents
-
         are attached. See the comment above the deterministic lists.
-
         """
 
         normalized = " ".join(query.strip().lower().split())
@@ -253,13 +204,9 @@ class ScopeGuard:
         deterministic = self.deterministic_route(query)
 
         # With documents attached, a lexical "this looks like
-
         # programming / world knowledge" match cannot know whether an
-
         # attached document covers that topic (a Python modules guide,
-
         # a Django manual, a finance report). The LLM decides from the
-
         # catalog instead. File names are data, never scope signals.
 
         if deterministic == "OUT" and allowed_ids:
@@ -307,21 +254,13 @@ class ScopeGuard:
         history = self._prepare_history(conversation_history)
 
         # A short follow-up such as "who built it" is not self-contained.
-
         # Resolve it as a QueryPilot product question only when the recent
-
         # conversation explicitly established QueryPilot as the subject.
-
         # This keeps the override deterministic and narrow: it cannot turn
-
         # arbitrary follow-ups into PRODUCT.
-
         #
-
         # NOTE: classify() is an INSTANCE method; the helper is bound
-
         # through self (like every other helper in this method), never
-
         # through cls.
 
         if self._is_contextual_product_question(query, history):
@@ -407,53 +346,29 @@ class ScopeGuard:
         allowed_document_ids: set[int],
     ) -> list[dict]:
         """
-
         Load document profiles only for documents actually attached
-
         to the current conversation.
 
+        The vector store is only a data source here. Every returned row is
+        re-validated against the conversation's authoritative attached IDs,
+        so a store bug can never widen the document boundary.
         """
 
         if not allowed_document_ids:
             return []
 
-        collection = VectorStore.document_collection()
-
-        result = collection.get(
-            where={
-                "$and": [
-                    {
-                        "workspace_id": workspace_id,
-                    },
-                    {
-                        "document_id": {
-                            "$in": sorted(allowed_document_ids),
-                        },
-                    },
-                ]
-            },
-            include=[
-                "documents",
-                "metadatas",
-            ],
-        )
-
-        documents = result.get(
-            "documents",
-            [],
-        )
-
-        metadatas = result.get(
-            "metadatas",
-            [],
+        items = VectorStore.get_document_catalog(
+            workspace_id=workspace_id,
+            document_ids=sorted(allowed_document_ids),
         )
 
         catalog: list[dict] = []
 
-        for index, profile_text in enumerate(documents):
-            metadata = metadatas[index] if index < len(metadatas) else {}
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
 
-            document_id = metadata.get("document_id")
+            document_id = item.get("document_id")
 
             if document_id is None:
                 continue
@@ -473,11 +388,11 @@ class ScopeGuard:
             catalog.append(
                 {
                     "document_id": document_id,
-                    "document_name": metadata.get(
+                    "document_name": item.get(
                         "document_name",
                         "",
                     ),
-                    "profile": (profile_text or "")[:MAX_PROFILE_CHARS],
+                    "profile": str(item.get("profile") or "")[:MAX_PROFILE_CHARS],
                 }
             )
 
@@ -579,11 +494,8 @@ class ScopeGuard:
         allowed_document_ids: list[int],
     ) -> int:
         """
-
         Characters left for the document catalog after everything else
-
         in the classifier input is accounted for.
-
         """
 
         fixed = (
@@ -603,13 +515,9 @@ class ScopeGuard:
         char_budget: int,
     ) -> list[dict]:
         """
-
         Shrink the catalog to fit char_budget. Profiles shrink first
-
         (full -> 120 -> 60 -> none). Document IDs and (capped) names are
-
         never dropped, so the model can always resolve a named file.
-
         """
 
         fitted = [
@@ -643,13 +551,9 @@ class ScopeGuard:
         history: list[dict] | None,
     ) -> list[dict]:
         """
-
         Small, bounded context: enough to resolve "it"/"that file"/
-
         "the second one", never a transcript. Role + trimmed content
-
         only. Reuses the shared planner bounding helper.
-
         """
 
         if not history:
@@ -732,13 +636,9 @@ class ScopeGuard:
         normalized_query: str,
     ) -> bool:
         """
-
         True only for a well-formed, explicit product question
-
         (strict allowlist, whole-query match). Everything else that
-
         merely mentions QueryPilot is left to the LLM classifier.
-
         """
 
         if not normalized_query:
@@ -755,37 +655,23 @@ class ScopeGuard:
         history: list[dict] | None,
     ) -> bool:
         """
-
         Recognize a narrow product-knowledge follow-up whose subject is
-
         established by the recent conversation.
 
         Example:
-
             USER: What is QueryPilot?
-
             USER: Who built it?
 
         The current message alone is ambiguous, so the established subject
-
         is taken from the MOST RECENT EXCHANGE in the conversation data:
-
         the last user message plus the assistant answer that followed it.
-
         An older QueryPilot discussion does not count once a newer user
-
         turn exists, so a follow-up after a different subject (e.g. a
-
         salary question) never inherits a QueryPilot subject from several
-
         turns back, and rolling-memory summaries of older conversation
-
         never establish the current subject. The current query must also
-
         contain a product-intent phrase; merely mentioning "it" is never
-
         enough.
-
         """
 
         normalized = " ".join(str(query or "").lower().split())
@@ -794,20 +680,15 @@ class ScopeGuard:
             return False
 
         # Strict allowlist, whole-query match. History supplies the
-
         # REFERENT ("it" -> QueryPilot); it never widens what may be
-
         # asked. Anything outside the allowlist goes to the LLM.
 
         if not _PRODUCT_CONTEXTUAL_RE.fullmatch(_strip_query_punctuation(normalized)):
             return False
 
         # The most recent exchange that can establish the current
-
         # subject: everything newer than the last user message, plus
-
         # that message itself. System messages are summaries of OLDER
-
         # conversation; they never establish the current subject.
 
         window: list[str] = []
@@ -858,9 +739,7 @@ class ScopeGuard:
         query: str,
     ) -> bool:
         """
-
         Keep CHITCHAT deliberately narrow.
-
         """
 
         normalized = " ".join(query.lower().split())
@@ -972,13 +851,9 @@ class ScopeGuard:
         allowed: tuple[str, ...],
     ) -> str:
         """
-
         Structural validation of a semantic label. A missing or unknown
-
         label raises ValueError so the caller's existing fail-safe
-
         handling applies; there is no silent default for a safety field.
-
         """
 
         value = decision_data.get(field)
@@ -1090,17 +965,11 @@ class ScopeGuard:
             )
 
         # -----------------------------------------------------
-
         # Consistency rules over the model's semantic labels.
-
         # Each is FINAL: none of the rescue overrides below may
-
         # reverse an OUT produced here, so a request that combines a
-
         # legitimate document task with one of these can never be
-
         # "rescued" into the document pipeline.
-
         # -----------------------------------------------------
 
         # 1) The user is trying to manipulate QueryPilot itself.
@@ -1126,6 +995,7 @@ class ScopeGuard:
                     threat_category=threat_category,
                     deliverable=deliverable,
                 )
+
         # 2) The request is aimed at QueryPilot's non-public internals.
 
         if target == "querypilot_internals" and deliverable != "answer_from_documents":
@@ -1146,9 +1016,7 @@ class ScopeGuard:
             )
 
         # 3) The user wants new software authored, not an answer from
-
         #    the documents. The subject (salary, tax, Python...) is
-
         #    irrelevant; the deliverable decides.
 
         if deliverable == "authored_software":
@@ -1169,13 +1037,9 @@ class ScopeGuard:
             )
 
         # Explicit attached-document names are deterministic source references.
-
         # They are resolved only against the already-authoritative catalog, so
-
         # this cannot widen the conversation's document boundary. We only get
-
         # here when the model judged the request to be a normal request
-
         # (no manipulation, not aimed at internals, not authored software).
 
         mentioned_document_ids = ScopeGuard._mentioned_document_ids(
@@ -1196,16 +1060,13 @@ class ScopeGuard:
             route = "DOCUMENT"
 
         # Explicit document names also take precedence over a weaker LLM choice
-
         # of DOCUMENT with the wrong IDs. Keep only the files actually named.
 
         if mentioned_document_ids and route == "DOCUMENT":
             document_ids = mentioned_document_ids
 
         # For document-backed questions, if the LLM failed to select
-
         # IDs, use the authoritative attached-document set. This is
-
         # routing fallback, not document-content inference.
 
         if route == "DOCUMENT" and not document_ids and allowed_document_ids:

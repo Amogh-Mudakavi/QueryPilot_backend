@@ -42,4 +42,7 @@ class AgentState(TypedDict, total=False):
     error: str
     tool_failed: bool
 
+    # Request-scoped structured-resource metadata shared by agent/dispatch.
+    resource_context: Any
+
     _pending_action: dict[str, Any]
