@@ -76,42 +76,150 @@ def check_hourly_limit(email, ip_address=None):
 
 
 def send_otp_email(email, otp):
+    from html import escape
+
+    lifetime = settings.OTP_LIFETIME_MINUTES
+    safe_otp = escape(str(otp))
+
     params = {
-        "from": "HelpDesk AI <support@query-pilot.dev>",
+        "from": "QueryPilot <support@query-pilot.dev>",
         "to": [email],
-        "subject": "Verify Your Email - HelpDesk AI",
-        "html": f"""
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto;">
-            <h2>Email Verification</h2>
+        "subject": "Your QueryPilot verification code",
+        "html": f"""\
+<!DOCTYPE html>
+<html lang="en">
+<body style="margin:0;padding:0;background:#F4F1EA;
+    font-family:Geist,-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
+    color:#171717;">
 
-            <p>Hello,</p>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0"
+           style="background:#F4F1EA;padding:40px 16px;">
+        <tr>
+            <td align="center">
+                <table role="presentation" width="100%" cellspacing="0"
+                       cellpadding="0" style="max-width:480px;background:#FFFFFF;
+                       border:1px solid #E8E4DC;border-radius:10px;">
 
-            <p>Thank you for registering with <strong>HelpDesk AI</strong>.</p>
+                    <tr>
+                        <td style="padding:30px 32px 24px;">
+                            <div style="font-size:22px;font-weight:650;
+                                        letter-spacing:-0.8px;">
+                                QueryPilot
+                            </div>
+                        </td>
+                    </tr>
 
-            <p>
-                Please use the following One-Time Password (OTP)
-                to verify your email address:
-            </p>
+                    <tr>
+                        <td style="padding:0 32px;">
+                            <div style="height:1px;background:#ECEAE5;"></div>
+                        </td>
+                    </tr>
 
-            <h1 style="letter-spacing: 4px;">{otp}</h1>
+                    <tr>
+                        <td style="padding:30px 32px 12px;">
+                            <p style="margin:0 0 12px;font-size:11px;
+                                      font-weight:600;letter-spacing:1.5px;
+                                      color:#737373;">
+                                ACCOUNT VERIFICATION
+                            </p>
 
-            <p>
-                This OTP is valid for
-                <strong>{settings.OTP_LIFETIME_MINUTES} minutes</strong>.
-            </p>
+                            <h1 style="margin:0 0 14px;font-size:25px;
+                                       line-height:1.3;font-weight:650;
+                                       letter-spacing:-0.8px;">
+                                Verify your email address
+                            </h1>
 
-            <p>
-                If you did not request this verification,
-                you can safely ignore this email.
-            </p>
+                            <p style="margin:0;font-size:14px;line-height:1.8;
+                                      color:#666666;">
+                                Thanks for signing up for QueryPilot.
+                                Enter the verification code below to complete
+                                your registration.
+                            </p>
+                        </td>
+                    </tr>
 
-            <hr>
+                    <tr>
+                        <td style="padding:22px 32px;">
+                            <table role="presentation" width="100%"
+                                   cellspacing="0" cellpadding="0"
+                                   style="background:#F8F6F1;
+                                   border:1px solid #EAE6DE;border-radius:8px;">
+                                <tr>
+                                    <td align="center" style="padding:24px 12px;">
+                                        <p style="margin:0 0 12px;font-size:10px;
+                                                  font-weight:600;
+                                                  letter-spacing:1.8px;
+                                                  color:#737373;">
+                                            VERIFICATION CODE
+                                        </p>
 
-            <p style="color: gray; font-size: 12px;">
-                This is an automated email. Please do not reply.
-            </p>
-        </div>
-        """,
+                                        <p style="margin:0;font-family:
+                                            'Geist Mono',ui-monospace,
+                                            'SFMono-Regular',Consolas,monospace;
+                                            font-size:32px;font-weight:600;
+                                            letter-spacing:7px;color:#171717;
+                                            overflow-wrap:anywhere;">
+                                            {safe_otp}
+                                        </p>
+
+                                        <p style="margin:14px 0 0;font-size:12px;
+                                                  color:#666666;">
+                                            Expires in
+                                            <strong>{lifetime} minutes</strong>
+                                        </p>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <td style="padding:0 32px 30px;">
+                            <p style="margin:0 0 12px;font-size:13px;
+                                      line-height:1.8;color:#525252;">
+                                <strong style="color:#171717;">
+                                    Keep your account secure.
+                                </strong>
+                                Never share this code with anyone.
+                            </p>
+
+                            <p style="margin:0;font-size:13px;line-height:1.8;
+                                      color:#737373;">
+                                Didn't request this code? You can safely ignore
+                                this email.
+                            </p>
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <td style="padding:20px 24px;border-top:1px solid #ECEAE5;
+                                   text-align:center;">
+                            <p style="margin:0 0 6px;font-size:11px;
+                                      color:#737373;">
+                                Secure access to your knowledge.
+                            </p>
+                            <p style="margin:0;font-size:11px;color:#999999;">
+                                Automated email. Please do not reply.
+                            </p>
+                        </td>
+                    </tr>
+
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>
+""",
+        "text": (
+            "QueryPilot — Verify your email address\n\n"
+            "Enter this verification code to complete your registration:\n\n"
+            f"{otp}\n\n"
+            f"This code expires in {lifetime} minutes.\n\n"
+            "Never share this code with anyone. If you did not request it, "
+            "you can safely ignore this email.\n\n"
+            "QueryPilot"
+        ),
     }
 
     return resend.Emails.send(params)
