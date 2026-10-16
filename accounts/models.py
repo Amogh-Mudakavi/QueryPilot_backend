@@ -95,3 +95,56 @@ class PendingRegistration(models.Model):
 
     def __str__(self):
         return "PendingRegistration"
+
+class GoogleIdentity(models.Model):
+    """
+    Maps a Google account to a QueryPilot user.
+    Google subject ID is the stable identity key, not the email.
+    """
+
+    user = models.OneToOneField(
+        User,
+        on_delete=models.CASCADE,
+        related_name="google_identity",
+    )
+
+    google_subject = models.CharField(
+        max_length=255,
+        unique=True,
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"GoogleIdentity (user={self.user_id})"
+
+
+class OAuthLoginCode(models.Model):
+    """
+    Stores a hashed, short-lived, single-use code for JWT handoff.
+    The raw code must never be stored in the database.
+    """
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="oauth_login_codes",
+    )
+
+    code_hash = models.CharField(
+        max_length=64,
+        unique=True,
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    expires_at = models.DateTimeField()
+
+    consumed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    def __str__(self):
+        return f"OAuthLoginCode (user={self.user_id})"

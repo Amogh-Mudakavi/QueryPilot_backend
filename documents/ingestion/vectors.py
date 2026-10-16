@@ -1,13 +1,9 @@
-"""AWS S3 vector storage for QueryPilot.
+"""Provide a shared vector-storage interface for ingestion and retrieval.
 
-This module stores text, table, and document metadata embeddings used by
-
-retrieval and planning. It keeps the storage API separate from parsing and
-
-chunking logic and exposes the minimal operations the rest of the backend
-
-needs: embedding generation, vector upserts, document-scoped deletes, and lookups.
-
+Embedding generation and backend selection live here. ChromaDB is used for
+local development and AWS S3 Vectors is used for production. Configure the
+backend with VECTOR_BACKEND=chroma or VECTOR_BACKEND=s3. When unset, DEBUG
+selects the default: ChromaDB for DEBUG=True and S3 Vectors for DEBUG=False.
 """
 from __future__ import annotations
 
@@ -16,30 +12,15 @@ import os
 import threading
 import time
 
-import boto3
 import onnxruntime as ort
-from botocore.config import Config
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 from sentence_transformers import SentenceTransformer
 
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_S3_VECTOR_REGION = "ap-south-1"
-
-DEFAULT_S3_VECTOR_BUCKET = "querypilot-prod-vectors"
-
-DEFAULT_KNOWLEDGE_INDEX = "querypilot-knowledge"
-
-DEFAULT_DOCUMENT_INDEX = "querypilot-document-metadata"
-
-S3_VECTORS_MAX_BATCH = 500
-
-S3_VECTORS_MAX_GET_KEYS = 100
-
-S3_VECTORS_MAX_TOP_K = 100
-
-TEXT_METADATA_KEY = "text"
+MAX_TOP_K = 100
 
 MAX_HEADING_CHARS = 300
 
@@ -55,17 +36,18 @@ EMBEDDING_BATCH_SIZE = getattr(
     32,
 )
 
-S3_VECTOR_BATCH_SIZE = max(
+VECTOR_BATCH_SIZE = max(
     1,
-    min(
-        S3_VECTORS_MAX_BATCH,
-        int(
+    int(
+        getattr(
+            settings,
+            "VECTOR_BATCH_SIZE",
             getattr(
                 settings,
                 "S3_VECTOR_BATCH_SIZE",
                 getattr(settings, "CHROMA_BATCH_SIZE", 128),
-            )
-        ),
+            ),
+        )
     ),
 )
 
@@ -81,12 +63,10 @@ def _clip(value, limit: int) -> str:
 
 def _resolve_onnx_threads() -> int:
     """
-
     ONNX Runtime intra-op threads for CPU embedding inference.
 
     EMBEDDING_ONNX_THREADS > 0 wins. Otherwise default to at most 4
     threads to limit CPU oversubscription on small/shared instances.
-
     """
     try:
         configured = int(
@@ -108,53 +88,54 @@ def _resolve_onnx_threads() -> int:
     )
 
 
+def _resolve_backend_name() -> str:
+    default = "chroma" if settings.DEBUG else "s3"
+    name = _env("VECTOR_BACKEND", default).lower()
+    if name not in ("chroma", "s3"):
+        raise ImproperlyConfigured(
+            "VECTOR_BACKEND must be 'chroma' or 's3'."
+        )
+    if name == "chroma" and not settings.DEBUG:
+        raise ImproperlyConfigured(
+            "VECTOR_BACKEND=chroma is only allowed when DEBUG is True. "
+            "Use VECTOR_BACKEND=s3 in production."
+        )
+    return name
+
+
 class VectorStore:
-    _client = None
+    _backend = None
     _embedder = None
-    _client_lock = threading.Lock()
+    _backend_lock = threading.Lock()
     _embedder_lock = threading.Lock()
     _embedding_lock = threading.Lock()
 
+
+
+
+
     @classmethod
-    def get_client(cls):
-        if cls._client is None:
-            with cls._client_lock:
-                if cls._client is None:
-                    region = _env(
-                        "S3_VECTOR_REGION",
-                        DEFAULT_S3_VECTOR_REGION,
-                    )
-                    cls._client = boto3.client(
-                        "s3vectors",
-                        region_name=region,
-                        config=Config(
-                            retries={
-                                "max_attempts": 5,
-                                "mode": "standard",
-                            },
-                        ),
-                    )
-                    logger.info(
-                        "[S3VECTORS] Client ready: region=%s bucket=%s "
-                        "knowledge_index=%s document_index=%s.",
-                        region,
-                        cls.bucket_name(),
-                        cls.knowledge_index(),
-                        cls.document_index(),
-                    )
-        return cls._client
+    def get_backend(cls):
+        if cls._backend is None:
+            with cls._backend_lock:
+                if cls._backend is None:
+                    name = _resolve_backend_name()
 
-    @staticmethod
-    def bucket_name() -> str:
-        return _env("S3_VECTOR_BUCKET", DEFAULT_S3_VECTOR_BUCKET)
 
-    @staticmethod
-    def knowledge_index() -> str:
-        return _env("S3_KNOWLEDGE_INDEX", DEFAULT_KNOWLEDGE_INDEX)
+                    if name == "s3":
+                        from .vector_s3 import S3VectorsBackend
 
-    @staticmethod
-    def document_index() -> str:
-        return _env("S3_DOCUMENT_INDEX", DEFAULT_DOCUMENT_INDEX)
+                        cls._backend = S3VectorsBackend()
+                    else:
+                        from .vector_chroma import ChromaBackend
+
+                        cls._backend = ChromaBackend()
+                    logger.info("[VECTORS] Backend selected: %s.", name)
+        return cls._backend
+
+
+
+
 
     @classmethod
     def get_embedder(cls):
@@ -179,7 +160,7 @@ class VectorStore:
                             trust_remote_code=False,
                         )
                     except OSError:
-                        # Permit downloading the model if it is not cached yet.
+
                         cls._embedder = SentenceTransformer(
                             EMBEDDING_MODEL,
                             backend="onnx",
@@ -228,84 +209,9 @@ class VectorStore:
         )
         return vectors
 
-    @staticmethod
-    def _vector(key, embedding, metadata) -> dict:
-        return {
-            "key": key,
-            "data": {"float32": [float(value) for value in embedding]},
-            "metadata": {k: v for k, v in metadata.items() if v is not None},
-        }
 
-    @classmethod
-    def _put_vectors(cls, index_name, vectors) -> None:
-        """PutVectors in batches of at most 500 (overwrites existing keys)."""
-        client = cls.get_client()
-        for start in range(0, len(vectors), S3_VECTORS_MAX_BATCH):
-            client.put_vectors(
-                vectorBucketName=cls.bucket_name(),
-                indexName=index_name,
-                vectors=vectors[start : start + S3_VECTORS_MAX_BATCH],
-            )
 
-    @classmethod
-    def _delete_keys(cls, index_name, keys) -> None:
-        """DeleteVectors in batches of at most 500 keys."""
-        client = cls.get_client()
-        for start in range(0, len(keys), S3_VECTORS_MAX_BATCH):
-            client.delete_vectors(
-                vectorBucketName=cls.bucket_name(),
-                indexName=index_name,
-                keys=keys[start : start + S3_VECTORS_MAX_BATCH],
-            )
 
-    @classmethod
-    def _iter_vectors(cls, index_name):
-        """
-
-        Yield every vector (key + metadata, no vector data) of an index.
-
-        ListVectors cannot filter, so callers filter in application code.
-
-        Pagination follows nextToken until exhausted.
-
-        """
-        client = cls.get_client()
-        params = {
-            "vectorBucketName": cls.bucket_name(),
-            "indexName": index_name,
-            "maxResults": S3_VECTORS_MAX_BATCH,
-            "returnData": False,
-            "returnMetadata": True,
-        }
-        while True:
-            response = client.list_vectors(**params)
-            for vector in response.get("vectors", []) or []:
-                yield vector
-            next_token = response.get("nextToken")
-            if not next_token:
-                break
-            params["nextToken"] = next_token
-
-    @staticmethod
-    def _knowledge_filter(
-        workspace_id,
-        allowed_document_ids,
-        source_types,
-    ) -> dict:
-        """QueryVectors metadata filter: workspace + documents + types."""
-        clauses = [{"workspace_id": {"$eq": int(workspace_id)}}]
-        if allowed_document_ids is not None:
-            clauses.append(
-                {"document_id": {"$in": [int(i) for i in allowed_document_ids]}}
-            )
-        if source_types is not None:
-            clauses.append({"type": {"$in": [str(t) for t in source_types]}})
-        if len(clauses) == 1:
-            return clauses[0]
-        return {"$and": clauses}
-    # ------------------------------------------------------------------
-    # Ingestion
-    # ------------------------------------------------------------------
 
     @classmethod
     def store_chunks(
@@ -316,23 +222,20 @@ class VectorStore:
     ):
         if not chunks:
             return
+        backend = cls.get_backend()
         started = time.monotonic()
         upserted = 0
-        for start in range(
-            0,
-            len(chunks),
-            S3_VECTOR_BATCH_SIZE,
-        ):
-            batch = chunks[start : start + S3_VECTOR_BATCH_SIZE]
-            documents = [chunk["text"] for chunk in batch]
-            embeddings = cls.embed(documents)
-            vectors = []
+        for start in range(0, len(chunks), VECTOR_BATCH_SIZE):
+            batch = chunks[start : start + VECTOR_BATCH_SIZE]
+            embeddings = cls.embed([chunk["text"] for chunk in batch])
+            records = []
             for chunk, embedding in zip(batch, embeddings):
-                vectors.append(
-                    cls._vector(
-                        f"doc_{document_id}_chunk_{chunk['chunk_index']}",
-                        embedding,
-                        {
+                records.append(
+                    {
+                        "id": f"doc_{document_id}_chunk_{chunk['chunk_index']}",
+                        "embedding": embedding,
+                        "text": chunk["text"],
+                        "metadata": {
                             "workspace_id": workspace_id,
                             "document_id": document_id,
                             "type": "text",
@@ -343,14 +246,13 @@ class VectorStore:
                                 chunk.get("heading") or "",
                                 MAX_HEADING_CHARS,
                             ),
-                            TEXT_METADATA_KEY: chunk["text"],
                         },
-                    )
+                    }
                 )
-            cls._put_vectors(cls.knowledge_index(), vectors)
+            backend.upsert_knowledge(records)
             upserted += len(batch)
         logger.info(
-            "[S3VECTORS] put completed: %d chunk(s) for document %s in %.2fs.",
+            "[VECTORS] put completed: %d chunk(s) for document %s in %.2fs.",
             upserted,
             document_id,
             time.monotonic() - started,
@@ -366,25 +268,23 @@ class VectorStore:
     ):
         if not isinstance(summary, str) or not summary.strip():
             raise ValueError("Table metadata summary cannot be empty.")
-        table_id = f"doc_{document_id}_table_{table_name}_metadata"
-        cls._put_vectors(
-            cls.knowledge_index(),
+        cls.get_backend().upsert_knowledge(
             [
-                cls._vector(
-                    table_id,
-                    cls.embed([summary])[0],
-                    {
+                {
+                    "id": f"doc_{document_id}_table_{table_name}_metadata",
+                    "embedding": cls.embed([summary])[0],
+                    "text": summary,
+                    "metadata": {
                         "workspace_id": workspace_id,
                         "document_id": document_id,
                         "type": "table",
                         "table_name": _clip(table_name, MAX_TABLE_NAME_CHARS),
-                        TEXT_METADATA_KEY: summary,
                     },
-                )
-            ],
+                }
+            ]
         )
         logger.info(
-            "[S3VECTORS] put completed: table metadata '%s' for document %s.",
+            "[VECTORS] put completed: table metadata '%s' for document %s.",
             table_name,
             document_id,
         )
@@ -399,32 +299,30 @@ class VectorStore:
     ):
         if not isinstance(profile_text, str) or not profile_text.strip():
             raise ValueError("Document profile cannot be empty.")
-        cls._put_vectors(
-            cls.document_index(),
-            [
-                cls._vector(
-                    f"document_{document_id}",
-                    cls.embed([profile_text])[0],
-                    {
-                        "workspace_id": workspace_id,
-                        "document_id": document_id,
-                        "document_name": _clip(
-                            document_name,
-                            MAX_DOCUMENT_NAME_CHARS,
-                        ),
-                        "type": "document_profile",
-                        TEXT_METADATA_KEY: profile_text,
-                    },
-                )
-            ],
+        cls.get_backend().upsert_document_profile(
+            {
+                "id": f"document_{document_id}",
+                "embedding": cls.embed([profile_text])[0],
+                "text": profile_text,
+                "metadata": {
+                    "workspace_id": workspace_id,
+                    "document_id": document_id,
+                    "document_name": _clip(
+                        document_name,
+                        MAX_DOCUMENT_NAME_CHARS,
+                    ),
+                    "type": "document_profile",
+                },
+            }
         )
         logger.info(
-            "[S3VECTORS] put completed: document profile for document %s.",
+            "[VECTORS] put completed: document profile for document %s.",
             document_id,
         )
-    # ------------------------------------------------------------------
-    # Document profiles (exact-key GetVectors)
-    # ------------------------------------------------------------------
+
+
+
+
 
     @staticmethod
     def _normalize_profile_scope(workspace_id, document_ids):
@@ -447,49 +345,6 @@ class VectorStore:
         return workspace_id, normalized_ids
 
     @classmethod
-    def _fetch_profile_rows(cls, workspace_id, normalized_ids) -> dict:
-        """
-
-        GetVectors for the deterministic keys document_<id>.
-
-        Every row is re-validated against the requested workspace and
-
-        document ids; anything else is dropped.
-
-        """
-        client = cls.get_client()
-        requested = set(normalized_ids)
-        keys = [f"document_{document_id}" for document_id in normalized_ids]
-        rows = {}
-        for start in range(0, len(keys), S3_VECTORS_MAX_GET_KEYS):
-            response = client.get_vectors(
-                vectorBucketName=cls.bucket_name(),
-                indexName=cls.document_index(),
-                keys=keys[start : start + S3_VECTORS_MAX_GET_KEYS],
-                returnData=False,
-                returnMetadata=True,
-            )
-            for vector in response.get("vectors", []) or []:
-                metadata = vector.get("metadata")
-                if not isinstance(metadata, dict):
-                    continue
-                try:
-                    profile_workspace_id = int(metadata.get("workspace_id"))
-                    document_id = int(metadata.get("document_id"))
-                except (TypeError, ValueError):
-                    continue
-                if profile_workspace_id != workspace_id or document_id not in requested:
-                    continue
-                profile_text = metadata.get(TEXT_METADATA_KEY)
-                if isinstance(profile_text, str) and profile_text.strip():
-                    rows[document_id] = {
-                        "document_id": document_id,
-                        "document_name": metadata.get("document_name") or "",
-                        "profile": profile_text,
-                    }
-        return rows
-
-    @classmethod
     def get_document_profiles(
         cls,
         workspace_id,
@@ -503,16 +358,19 @@ class VectorStore:
         if not normalized_ids:
             return {}
         try:
-            rows = cls._fetch_profile_rows(workspace_id, normalized_ids)
+            rows = cls.get_backend().fetch_profile_rows(
+                workspace_id,
+                normalized_ids,
+            )
         except Exception:
             logger.exception(
-                "[S3VECTORS] document profile retrieval failed for workspace %s.",
+                "[VECTORS] document profile retrieval failed for workspace %s.",
                 workspace_id,
             )
             return {}
         profiles = {document_id: row["profile"] for document_id, row in rows.items()}
         logger.info(
-            "[S3VECTORS] retrieved %d document profile(s) for workspace %s.",
+            "[VECTORS] retrieved %d document profile(s) for workspace %s.",
             len(profiles),
             workspace_id,
         )
@@ -525,15 +383,11 @@ class VectorStore:
         document_ids,
     ):
         """
-
         Document id + name + profile for the given documents of one workspace.
 
         Used by the Scope Guard. Raises on backend failure (the Scope Guard
-
         is fail-closed); rows outside the workspace / requested ids are
-
         never returned.
-
         """
         workspace_id, normalized_ids = cls._normalize_profile_scope(
             workspace_id,
@@ -541,16 +395,17 @@ class VectorStore:
         )
         if not normalized_ids:
             return []
-        rows = cls._fetch_profile_rows(workspace_id, normalized_ids)
+        rows = cls.get_backend().fetch_profile_rows(workspace_id, normalized_ids)
         logger.info(
-            "[S3VECTORS] retrieved %d document catalog row(s) for workspace %s.",
+            "[VECTORS] retrieved %d document catalog row(s) for workspace %s.",
             len(rows),
             workspace_id,
         )
         return [rows[document_id] for document_id in sorted(rows)]
-    # ------------------------------------------------------------------
-    # Knowledge retrieval primitives (used by HybridRetriever)
-    # ------------------------------------------------------------------
+
+
+
+
 
     @classmethod
     def query_knowledge(
@@ -563,55 +418,30 @@ class VectorStore:
         source_types=None,
     ) -> list[dict]:
         """
-
-        Dense search (QueryVectors) in the knowledge index.
+        Dense search in the knowledge index.
 
         Returns [{"id", "text", "metadata", "distance"}] ordered best first.
-
-        `distance` is the S3 Vectors cosine distance (1 - cosine similarity).
-
-        The "text" key is moved out of metadata. None for
-
-        allowed_document_ids / source_types means unrestricted; an empty
-
-        list matches nothing.
-
+        `distance` is cosine distance (1 - cosine similarity) on both backends.
+        None for allowed_document_ids / source_types means unrestricted;
+        an empty list matches nothing.
         """
         if allowed_document_ids is not None and not list(allowed_document_ids):
             return []
         if source_types is not None and not list(source_types):
             return []
-        response = cls.get_client().query_vectors(
-            vectorBucketName=cls.bucket_name(),
-            indexName=cls.knowledge_index(),
-            queryVector={"float32": [float(value) for value in query_embedding]},
-            topK=max(1, min(int(top_k), S3_VECTORS_MAX_TOP_K)),
-            filter=cls._knowledge_filter(
-                workspace_id,
-                allowed_document_ids,
-                source_types,
+        return cls.get_backend().query_knowledge(
+            query_embedding=query_embedding,
+            top_k=max(1, min(int(top_k), MAX_TOP_K)),
+            workspace_id=int(workspace_id),
+            allowed_document_ids=(
+                [int(i) for i in allowed_document_ids]
+                if allowed_document_ids is not None
+                else None
             ),
-            returnMetadata=True,
-            returnDistance=True,
+            source_types=(
+                [str(t) for t in source_types] if source_types is not None else None
+            ),
         )
-        hits = []
-        for vector in response.get("vectors", []) or []:
-            metadata = vector.get("metadata")
-            if not isinstance(metadata, dict):
-                metadata = {}
-            hits.append(
-                {
-                    "id": vector.get("key"),
-                    "text": str(metadata.get(TEXT_METADATA_KEY) or ""),
-                    "metadata": {
-                        key: value
-                        for key, value in metadata.items()
-                        if key != TEXT_METADATA_KEY
-                    },
-                    "distance": vector.get("distance"),
-                }
-            )
-        return hits
 
     @classmethod
     def list_knowledge(
@@ -622,62 +452,32 @@ class VectorStore:
         source_types=None,
     ) -> dict:
         """
+        Enumerate knowledge vectors filtered by workspace / document / type.
 
-        Enumerate knowledge vectors (ListVectors, paginated) and filter them
-
-        in application code by workspace / document / type.
-
-        Returns the Chroma-style shape {"ids", "documents", "metadatas"} so
-
-        the retriever's downstream handling is unchanged. The text is moved
-
-        out of metadata into "documents". None for allowed_document_ids /
-
-        source_types means unrestricted; an empty list matches nothing.
-
+        Returns {"ids", "documents", "metadatas"}. None for
+        allowed_document_ids / source_types means unrestricted;
+        an empty list matches nothing.
         """
-        ids: list = []
-        documents: list = []
-        metadatas: list = []
+        empty = {"ids": [], "documents": [], "metadatas": []}
         if allowed_document_ids is not None and not list(allowed_document_ids):
-            return {"ids": ids, "documents": documents, "metadatas": metadatas}
+            return empty
         if source_types is not None and not list(source_types):
-            return {"ids": ids, "documents": documents, "metadatas": metadatas}
-        workspace_id = int(workspace_id)
-        document_set = (
-            {int(i) for i in allowed_document_ids}
-            if allowed_document_ids is not None
-            else None
+            return empty
+        return cls.get_backend().list_knowledge(
+            workspace_id=int(workspace_id),
+            allowed_document_ids=(
+                [int(i) for i in allowed_document_ids]
+                if allowed_document_ids is not None
+                else None
+            ),
+            source_types=(
+                [str(t) for t in source_types] if source_types is not None else None
+            ),
         )
-        type_set = {str(t) for t in source_types} if source_types is not None else None
-        for vector in cls._iter_vectors(cls.knowledge_index()):
-            metadata = vector.get("metadata")
-            if not isinstance(metadata, dict):
-                continue
-            try:
-                vector_workspace_id = int(metadata.get("workspace_id"))
-                vector_document_id = int(metadata.get("document_id"))
-            except (TypeError, ValueError):
-                continue
-            if vector_workspace_id != workspace_id:
-                continue
-            if document_set is not None and vector_document_id not in document_set:
-                continue
-            if type_set is not None and metadata.get("type") not in type_set:
-                continue
-            ids.append(vector.get("key"))
-            documents.append(str(metadata.get(TEXT_METADATA_KEY) or ""))
-            metadatas.append(
-                {
-                    key: value
-                    for key, value in metadata.items()
-                    if key != TEXT_METADATA_KEY
-                }
-            )
-        return {"ids": ids, "documents": documents, "metadatas": metadatas}
-    # ------------------------------------------------------------------
-    # Deletion
-    # ------------------------------------------------------------------
+
+
+
+
 
     @classmethod
     def delete_document(
@@ -685,58 +485,8 @@ class VectorStore:
         document_id,
         workspace_id=None,
     ):
-        """
-
-        Delete every vector of a document.
-
-        Knowledge vectors are found through their document_id metadata
-
-        (and workspace_id when supplied); the profile vector is removed by
-
-        its deterministic key document_<id>.
-
-        """
-        errors = []
-        try:
-            target_document_id = int(document_id)
-            target_workspace_id = (
-                int(workspace_id) if workspace_id is not None else None
-            )
-            keys = []
-            for vector in cls._iter_vectors(cls.knowledge_index()):
-                metadata = vector.get("metadata")
-                if not isinstance(metadata, dict):
-                    continue
-                try:
-                    vector_document_id = int(metadata.get("document_id"))
-                except (TypeError, ValueError):
-                    continue
-                if vector_document_id != target_document_id:
-                    continue
-                if target_workspace_id is not None:
-                    try:
-                        vector_workspace_id = int(metadata.get("workspace_id"))
-                    except (TypeError, ValueError):
-                        continue
-                    if vector_workspace_id != target_workspace_id:
-                        continue
-                keys.append(vector["key"])
-            cls._delete_keys(cls.knowledge_index(), keys)
-            logger.info(
-                "[S3VECTORS] deleted %d knowledge vector(s) for document %s.",
-                len(keys),
-                document_id,
-            )
-        except Exception as exc:
-            errors.append(exc)
-        try:
-            cls._delete_keys(
-                cls.document_index(),
-                [f"document_{int(document_id)}"],
-            )
-        except Exception as exc:
-            errors.append(exc)
-        if errors:
-            raise RuntimeError(
-                f"Vector deletion failed for document {document_id}: {errors}"
-            )
+        """Delete every vector of a document (knowledge + profile)."""
+        cls.get_backend().delete_document(
+            int(document_id),
+            int(workspace_id) if workspace_id is not None else None,
+        )
