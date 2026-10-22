@@ -140,6 +140,15 @@ MAX_RECOVERY_ATTEMPTS = 1
 
 OVERVIEW_TEXT_SHARE = 0.6
 OVERVIEW_SEGMENT_HEADER_ALLOWANCE = 200
+# Exhaustive single/multi-document reads ("list ALL units", "full syllabus")
+# may use more of the answer payload than a generic overview.
+EXHAUSTIVE_TEXT_SHARE = 0.85
+_EXHAUSTIVE_CUE = re.compile(
+    r"\b(?:all|every|each|entire|whole|complete|full|exhaustive(?:ly)?)\b"
+    r"|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|\d{1,2})\s+"
+    r"(?:units?|modules?|chapters?|sections?|topics?)\b",
+    re.IGNORECASE,
+)
 
 
 MIN_RETRIEVAL_CONFIDENCE: float | None = None
@@ -3063,12 +3072,23 @@ def _has_document_table_evidence(items: list[Any]) -> bool:
     return False
 
 
+def _wants_exhaustive_read(state: AgentState) -> bool:
+    """A list/enumerate request that asks for ALL items needs the whole source."""
+    operation = normalized_operation(state.get("query_understanding"))
+    if operation in OVERVIEW_OPERATIONS:
+        return True
+    if operation == "list":
+        return bool(_EXHAUSTIVE_CUE.search(effective_planning_query(state)))
+    return False
+
+
 def _run_documents_with_coverage(
     state: AgentState,
     scope_ids: list[int],
     primary_query: str,
     *,
     answer_sized: bool = False,
+    require_complete: bool = False,
 ) -> dict[str, Any] | None:
     """
     Question-agnostic multi-document evidence: whole documents when they
@@ -3104,14 +3124,17 @@ def _run_documents_with_coverage(
             bool(result.get("degraded")),
         )
 
-    sizing: dict[str, Any] = {}
-    if answer_sized:
-        sizing = {
-            "budget": max(int(_payload_char_budget() * OVERVIEW_TEXT_SHARE), 2000),
-            "segment_char_limit": max(
-                MAX_TEXT_CHARS_PER_ITEM - OVERVIEW_SEGMENT_HEADER_ALLOWANCE, 800
-            ),
-        }
+    # ALWAYS size coverage to what answer generation can actually send:
+    # segments above MAX_TEXT_CHARS_PER_ITEM are cut by the answer layer, and
+    # anything above the payload budget is trimmed there, so a larger
+    # coverage budget would only make "full" claims that the model never sees.
+    share = EXHAUSTIVE_TEXT_SHARE if require_complete else OVERVIEW_TEXT_SHARE
+    sizing: dict[str, Any] = {
+        "budget": max(int(_payload_char_budget() * share), 2000),
+        "segment_char_limit": max(
+            MAX_TEXT_CHARS_PER_ITEM - OVERVIEW_SEGMENT_HEADER_ALLOWANCE, 800
+        ),
+    }
 
     return build_document_evidence(
         workspace_id=workspace_id,
@@ -3121,6 +3144,7 @@ def _run_documents_with_coverage(
         titles=titles,
         fetch_chunks=fetch_document_chunks,
         boost_lookup=boost,
+        require_complete=require_complete,
         **sizing,
     )
 
@@ -3139,9 +3163,7 @@ def _run_documents(
     # A summary/overview must see the whole document, not only the top-k
     # chunks most similar to the word "summarize". Use document coverage for
     # it even when a single document is in scope.
-    wants_whole_document = (
-        normalized_operation(state.get("query_understanding")) in OVERVIEW_OPERATIONS
-    )
+    wants_whole_document = _wants_exhaustive_read(state)
 
     # Whole-document coverage is for: a summary/overview, several explicitly
     # named sources, or a mixed table+document request (existing behaviour).
@@ -3164,6 +3186,7 @@ def _run_documents(
                 sorted(set(primary_ids)),
                 primary_query,
                 answer_sized=wants_whole_document,
+                require_complete=wants_whole_document,
             )
         except Exception:
             logger.exception("document coverage failed; using ranked search")
@@ -3176,6 +3199,7 @@ def _run_documents(
                 "degraded": covered["degraded"],
                 "notes": covered["notes"],
                 "coverage": covered["coverage"],
+                "complete": covered.get("complete"),
             }
 
     if multi_source:

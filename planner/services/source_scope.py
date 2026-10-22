@@ -51,11 +51,25 @@ def candidate_document_ids(
         for item in (_as_int(value) for value in decision.get("resolved_document_ids", []) or [])
         if item is not None
     )
-    ids.update(
-        item
-        for item in (_as_int(value) for value in state.get("relevant_document_ids", []) or [])
-        if item is not None
+    # A document the user explicitly NAMED (resolved reference of type
+    # "document") on a non-cross-document plan is the request's scope.  The
+    # Scope Guard's loose relevance proposal must not widen it again.
+    named_document_scope = (not plan.get("cross_document")) and any(
+        isinstance(ref, Mapping)
+        and ref.get("status") == "RESOLVED"
+        and isinstance(ref.get("match"), Mapping)
+        and ref["match"].get("type") == "document"
+        and _as_int(ref["match"].get("document_id")) is not None
+        for ref in (state.get("resolved_references") or {}).get("references", []) or []
     )
+    if not named_document_scope:
+        ids.update(
+            item
+            for item in (
+                _as_int(value) for value in state.get("relevant_document_ids", []) or []
+            )
+            if item is not None
+        )
 
     entity_table_names: set[str] = set()
     resolution = state.get("resolved_references") or {}

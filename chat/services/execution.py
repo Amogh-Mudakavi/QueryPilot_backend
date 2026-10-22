@@ -146,6 +146,39 @@ def _scoped_document_ids(conversation) -> list[int]:
     )
 
 
+_SCOPE_ID_ATTRS = ("relevant_document_ids", "document_ids", "selected_document_ids", "ids")
+
+
+def _scope_selected_document_ids(scope_decision, attached: list[int]) -> list[int]:
+    """Documents the Scope Guard selected for THIS request, inside the attached set.
+
+    The attached/conversation documents are the authorization boundary, not
+    the request's relevance decision.  Returns [] when the guard named
+    nothing usable; the caller then falls back to the attached set.
+    """
+    raw = None
+    for attr in _SCOPE_ID_ATTRS:
+        raw = (
+            scope_decision.get(attr)
+            if isinstance(scope_decision, dict)
+            else getattr(scope_decision, attr, None)
+        )
+        if raw:
+            break
+    if not raw:
+        return []
+    attached_set = set(attached)
+    selected: list[int] = []
+    for value in raw:
+        try:
+            doc_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if doc_id in attached_set and doc_id not in selected:
+            selected.append(doc_id)
+    return selected
+
+
 class _TitleJob:
     def __init__(
         self,
@@ -769,6 +802,7 @@ def _execute_message_stream(
         )
         return
 
+    scope_selected_ids: list[int] = []
     if SCOPE_GUARD_LLM_ENABLED:
         try:
             scope_decision = ScopeGuard().classify(
@@ -778,6 +812,15 @@ def _execute_message_stream(
                 conversation_history=conversation_history,
             )
             route = scope_decision.route
+            scope_selected_ids = _scope_selected_document_ids(
+                scope_decision, document_ids
+            )
+            if not scope_selected_ids:
+                logger.warning(
+                    "Scope Guard returned no usable document ids; falling back "
+                    "to all attached documents (conversation_id=%s)",
+                    conversation.id,
+                )
 
             if route == "OUT":
                 logger.info(
@@ -846,9 +889,11 @@ def _execute_message_stream(
 
     state: AgentState = {
         "query": user_message,
+        **({"allowed_document_ids": list(document_ids)} if document_ids else {}),
         "workspace_id": conversation.workspace_id,
         "conversation_history": conversation_history,
-        "relevant_document_ids": document_ids,
+        # Relevance (this request) is separate from authorization (this chat).
+        "relevant_document_ids": scope_selected_ids or document_ids,
         "evidence": [],
         "retrieval_confidence": 0.0,
         "known_facts": [],

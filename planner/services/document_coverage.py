@@ -209,9 +209,11 @@ def build_document_evidence(
     boost_lookup: Callable[[int], tuple[set[int], bool]] | None = None,
     budget: int = DOCUMENT_CONTEXT_CHAR_BUDGET,
     segment_char_limit: int = SEGMENT_CHAR_LIMIT,
+    require_complete: bool = False,
 ) -> dict[str, Any] | None:
     """
-    Returns {"evidence", "notes", "coverage", "confidence", "degraded"} or
+    Returns {"evidence", "notes", "coverage", "confidence", "degraded",
+    "complete"} or
     None when chunks could not be loaded (caller falls back to ranked search).
     """
     doc_ids = sorted({int(d) for d in document_ids})
@@ -302,6 +304,14 @@ def build_document_evidence(
                     "are provided (selected for relevance because the document is large)."
                 )
         partial = any(c["mode"] == "selected" for c in with_text)
+        if partial and require_complete:
+            lines.append(
+                "The request asks for the COMPLETE document/list, but some passages "
+                "could not be included. Present what the provided passages support, "
+                "and state clearly that the result may be incomplete because of "
+                "retrieval limits. Never say an item is absent from the document "
+                "unless the provided passages show that."
+            )
         guidance = (
             "If the answer needs content that is not in the provided passages, "
             "say it was not found in the provided passages; do not guess."
@@ -317,11 +327,22 @@ def build_document_evidence(
             }
         )
 
-    logger.info("document coverage: %s degraded=%s", coverage, degraded)
+    # `complete` = every document with text is fully included. It describes the
+    # evidence handed to answer generation (budgets are already answer-sized),
+    # and is independent of `degraded` (dense retrieval unavailable).
+    complete = bool(with_text) and all(c["mode"] == "full" for c in with_text)
+    logger.info(
+        "document coverage: %s degraded=%s complete=%s require_complete=%s",
+        coverage,
+        degraded,
+        complete,
+        require_complete,
+    )
     return {
         "evidence": evidence,
         "notes": notes,
         "coverage": coverage,
         "confidence": 1.0 if all(c["mode"] != "selected" for c in coverage) else 0.6,
         "degraded": degraded,
+        "complete": complete,
     }
