@@ -32,3 +32,8 @@ dist/
 *.bak
 *.backup
 *.sqlite3
+
+# Local vector databases and generated data
+chroma_data/
+chroma_db/
+.chroma/

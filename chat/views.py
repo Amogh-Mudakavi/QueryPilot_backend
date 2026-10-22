@@ -241,7 +241,7 @@ class ConversationListCreateView(APIView):
 
 class ConversationDetailView(APIView):
     """
-    Return one conversation and its messages.
+    Return, rename or delete one conversation.
     """
 
     permission_classes = [
@@ -284,6 +284,100 @@ class ConversationDetailView(APIView):
         return Response(
             conversation_data,
             status=status.HTTP_200_OK,
+        )
+
+    def _get_owned(
+        self,
+        request,
+        conversation_id: int,
+    ) -> Conversation | None:
+        """
+        Resolve a conversation belonging to the authenticated user.
+        """
+        try:
+            return Conversation.objects.get(
+                id=conversation_id,
+                created_by=request.user,
+            )
+        except Conversation.DoesNotExist:
+            return None
+
+    def patch(
+        self,
+        request,
+        conversation_id: int,
+    ):
+        """
+        Rename an owned conversation.
+        """
+
+        conversation = self._get_owned(
+            request,
+            conversation_id,
+        )
+
+        if conversation is None:
+            return Response(
+                {
+                    "detail": "Conversation not found.",
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        title = request.data.get("title")
+
+        if not isinstance(title, str) or not title.strip():
+            return Response(
+                {
+                    "detail": "title is required.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        conversation.title = title.strip()[:255]
+        conversation.save(
+            update_fields=[
+                "title",
+                "updated_at",
+            ],
+        )
+
+        return Response(
+            ConversationSerializer(
+                conversation,
+            ).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def delete(
+        self,
+        request,
+        conversation_id: int,
+    ):
+        """
+        Delete an owned conversation.
+
+        Messages, settings, memory and attached-document links are
+        removed by the models' on_delete=CASCADE rules.
+        """
+
+        conversation = self._get_owned(
+            request,
+            conversation_id,
+        )
+
+        if conversation is None:
+            return Response(
+                {
+                    "detail": "Conversation not found.",
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        conversation.delete()
+
+        return Response(
+            status=status.HTTP_204_NO_CONTENT,
         )
 
 
