@@ -826,46 +826,65 @@ def _with_table_scope(
                 if str(table.get("table_name")) in entity_tables
                 and _coerce_int(table.get("document_id")) in allowed_set
             }
-        # Candidates are only the resolved documents' tables (plus tables
-        # found by entity resolution), plus request-scoped relevant documents.
-        # This does not make every workspace document part of the final answer.
-        needed_documents = set(resolved_ids)
-        if entity_tables:
-            needed_documents |= {
-                doc_id
-                for doc_id in (
-                    _coerce_int(table.get("document_id"))
-                    for table in resources.table_index(document_ids=allowed_ids)
-                    if str(table.get("table_name")) in entity_tables
-                )
-                if doc_id is not None
-            }
-        if not resolved_ids and not entity_tables:
-            # With no source hint, preserve prior behavior while honoring an
-            # explicit conversation allow-list.
-            schema_ids = set(allowed_ids) if allowed_ids is not None else None
+        rule_dependent_mixed = _is_rule_dependent_mixed_request(state)
+
+        # A mixed data-plus-rules request often names the data file but refers
+        # to its governing formula/policy descriptively. Resolution may find
+        # only the data source, so selecting tables only from resolved IDs
+        # silently excludes structured policy tables from candidate discovery.
+        # In this case, ask the normal table selector to rank every table in
+        # the caller's authorized document scope; only selected tables flow to
+        # retrieval. This widens discovery, never authorization.
+        if rule_dependent_mixed:
+            # Discover companion rule tables within the caller's authorized
+            # document boundary, even when only the data source resolved.
             schema = resources.schema(
-                document_ids=sorted(schema_ids) if schema_ids is not None else None,
+                document_ids=allowed_ids,
                 include_sample_rows=True,
             )
             candidates = list(schema)
         else:
-            schema = resources.schema(
-                document_ids=sorted(needed_documents),
-                include_sample_rows=True,
-            )
-            candidates = [
-                item
-                for item in schema
-                if _coerce_int(item.get("document_id")) in resolved_ids
-                or str(item.get("table_name")) in entity_tables
-            ]
+            # Ordinary requests remain scoped to their resolved sources and
+            # tables found through entity resolution.
+            needed_documents = set(resolved_ids)
+            if entity_tables:
+                needed_documents |= {
+                    doc_id
+                    for doc_id in (
+                        _coerce_int(table.get("document_id"))
+                        for table in resources.table_index(document_ids=allowed_ids)
+                        if str(table.get("table_name")) in entity_tables
+                    )
+                    if doc_id is not None
+                }
+            if not resolved_ids and not entity_tables:
+                schema_ids = set(allowed_ids) if allowed_ids is not None else None
+                schema = resources.schema(
+                    document_ids=sorted(schema_ids) if schema_ids is not None else None,
+                    include_sample_rows=True,
+                )
+                candidates = list(schema)
+            else:
+                schema = resources.schema(
+                    document_ids=sorted(needed_documents),
+                    include_sample_rows=True,
+                )
+                candidates = [
+                    item
+                    for item in schema
+                    if _coerce_int(item.get("document_id")) in resolved_ids
+                    or str(item.get("table_name")) in entity_tables
+                ]
         selected = select_tables(
             workspace_id=state["workspace_id"],
             query=effective_planning_query(state),
             understanding=state.get("query_understanding", {}) or {},
             candidates=candidates,
-            forced_table_names=entity_tables,
+            forced_table_names=(
+                entity_tables | _resolved_table_names(state)
+                if rule_dependent_mixed
+                else entity_tables
+            ),
         )
     except Exception:
         logger.exception("table scope selection failed; not narrowing")
@@ -2628,10 +2647,18 @@ def _is_rule_dependent_mixed_request(state: AgentState) -> bool:
     plan = state.get("execution_plan") or {}
     decision = plan.get("decision") or {}
     understanding = state.get("query_understanding") or {}
-    category = str(
-        understanding.get("category_hint") or decision.get("category") or ""
-    ).strip().lower()
-    return category == "mixed" and _plan_is_mixed(state)
+    categories = {
+        str(value or "").strip().lower()
+        for value in (
+            understanding.get("category_hint"),
+            decision.get("category"),
+        )
+    }
+    # Query-understanding and execution planning are independent stages. Do
+    # not let a stale/more generic category hint mask the final planner's
+    # explicit mixed decision when both structured and document evidence are
+    # required.
+    return "mixed" in categories and _plan_is_mixed(state)
 
 
 def _parse_contextual_reference(reference: str) -> dict[str, Any] | None:
@@ -3436,15 +3463,55 @@ def _supplement_dependency_evidence(
     if not supplemental:
         return {**document_result, "dependency_evidence_found": False}
 
-    # Put the dependency-targeted hits first so they are not crowded out by
-    # whole-document coverage when the final answer payload is budgeted.
-    combined = _canonicalize_evidence(supplemental + primary)
+    # Ranked retrieval locates the companion source, but a few top passages
+    # may omit a table, formula, exception, or neighbouring definition needed
+    # for the calculation. Once a dependency document has been identified,
+    # load its authorized chunks in reading order with the same answer-sized
+    # coverage builder used for multi-document requests. This is still bounded
+    # by the final evidence budget and never widens beyond discovered IDs.
+    dependency_id_set = _document_ids_from_text_evidence(supplemental)
+    if allowed_ids is not None:
+        authorized_set = {int(value) for value in allowed_ids}
+        dependency_id_set.intersection_update(authorized_set)
+    dependency_ids = sorted(dependency_id_set)
+    dependency_coverage: list[Any] = []
+    if dependency_ids:
+        try:
+            covered = _run_documents_with_coverage(
+                state,
+                dependency_ids,
+                query,
+                require_complete=True,
+            )
+        except Exception:
+            logger.exception(
+                "Supplemental dependency-document coverage failed; "
+                "keeping ranked evidence"
+            )
+            covered = None
+        if covered is not None:
+            dependency_coverage = list(covered.get("evidence", []) or [])
+
+    # Prefer coverage for documents it actually represented, avoiding duplicate
+    # top-k chunks for the same document. Keep ranked results as a fallback if
+    # full-document loading returned no usable passage for that source.
+    covered_ids = _document_ids_from_text_evidence(dependency_coverage)
+    remaining_supplemental = [
+        item
+        for item in supplemental
+        if not (_document_ids_from_text_evidence([item]) & covered_ids)
+    ]
+    combined = _canonicalize_evidence(
+        dependency_coverage + remaining_supplemental + primary
+    )
     old_confidence = float(document_result.get("confidence") or 0.0)
     new_confidence = float(discovered.get("confidence") or 0.0)
     found_ids = sorted(_document_ids_from_text_evidence(supplemental))
     logger.info(
-        "Supplemental dependency evidence: chunks=%d document_ids=%s",
+        "Supplemental dependency evidence: ranked_chunks=%d coverage_items=%d "
+        "document_ids=%s",
         len(supplemental),
+        len(dependency_coverage),
         found_ids,
     )
     return {
@@ -4001,6 +4068,17 @@ def _cross_document_source_groups(
             if document_id is not None:
                 resolved_document_ids.append(document_id)
 
+    if _is_rule_dependent_mixed_request(state):
+        # The schema passed for this route is already restricted to the
+        # caller's authorization scope and selected by the table selector.
+        # Include its document IDs even when first-pass reference resolution
+        # found only one of the data/rule sources.
+        resolved_document_ids.extend(
+            document_id
+            for item in schema
+            if (document_id := _coerce_int(item.get("document_id"))) is not None
+        )
+
     entities = _resolved_entity_values(state)
     entity_table_names = {
         str(location.get("table_name"))
@@ -4156,10 +4234,12 @@ def _run_cross_document_tables(
                         "evidence_role": "document_table",
                         "document_title": item.get("document_title"),
                         "interpretation": (
-                            "Rows extracted directly from a table belonging to a "
-                            "document the user explicitly referenced. This is source "
-                            "content for cross-document reasoning. It was retrieved "
-                            "independently and was never joined with another document."
+                            "Rows extracted directly from an authorized source table "
+                            "selected as relevant to this request. This is source "
+                            "content for cross-document reasoning, including facts, "
+                            "rules, rates, thresholds, or formulas represented in the "
+                            "table. It was retrieved independently and was never joined "
+                            "with another document."
                         ),
                     },
                     "result_status": "SUCCESS" if success else "NOT_FOUND",
@@ -4215,6 +4295,30 @@ def _run_table(
     resolved_document_ids = _document_ids_for_search(state)
     entities = _resolved_entity_values(state)
     is_mixed = _plan_is_mixed(state)
+
+    if _is_rule_dependent_mixed_request(state):
+        # Do this before ordinary resolved-document narrowing. The policy may
+        # be a companion source the resolver did not name-match, even though
+        # cross-document intent is already known. Each selected table is read
+        # independently with an allowlisted SELECT; no cross-document SQL join
+        # is introduced.
+        mixed_schema = resources.schema(
+            document_ids=allowed_document_ids,
+            include_sample_rows=True,
+        )
+        mixed_schema = _apply_table_scope(state, mixed_schema)
+        if mixed_schema:
+            logger.info(
+                "table_query: mixed-request discovery selected %d table(s) "
+                "across authorized documents",
+                len(mixed_schema),
+            )
+            return _run_cross_document_tables(
+                state,
+                budget,
+                mixed_schema,
+                allow_single_source=True,
+            )
 
     if len(set(resolved_document_ids)) >= 2 or (
         resolved_table_names

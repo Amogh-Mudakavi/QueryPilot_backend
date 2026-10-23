@@ -24,12 +24,36 @@ from dataclasses import dataclass
 CONTEXT_WORDS = 4
 MAX_METRIC_WORDS = 4
 
-_NUMBER = r"[-+]?(?:[₹$€£]\s*)?\d[\d,]*(?:\.\d+)?"
+# Include common currency prefixes in the numeric token so comparisons such
+# as ``above Rs. 12,00,000`` retain their amount during parsing.
+_NUMBER = (
+    r"[-+]?(?:(?:[₹$€£]\s*|(?:rs\.?|inr|usd|eur|gbp)\s*))?"
+    r"\d[\d,]*(?:\.\d+)?"
+)
 _WORD = re.compile(r"[A-Za-z0-9']+")
 
 
-_SEGMENT_BREAK = re.compile(r"(?<=[.?!;])\s+|,?\s*\bthen\b,?\s*", re.IGNORECASE)
+_SEGMENT_BREAK = re.compile(
+    r"(?<=[?!;])\s+|(?<!Rs\.)(?<=[.])\s+|,?\s*\bthen\b,?\s*",
+    re.IGNORECASE,
+)
 _LEADING_THEN = re.compile(r"^\s*then\b[,\s]*", re.IGNORECASE)
+
+_LABELLED_LEVEL_PREFIX = re.compile(
+    r"\b(?:tier|level|grade|stage|step|phase|chapter|section|part|version|"
+    r"class|rank|priority|category|band|group|type|slab)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_labelled_level_predicate(text: str, match: re.Match[str]) -> bool:
+    """Recognize ordinal labels such as ``Tier 4 or higher``.
+
+    A labelled level is a category, not a scalar threshold to match against
+    an arbitrary numeric column. This remains domain-neutral: it applies to
+    common labelled stages, grades, versions, bands, and similar concepts.
+    """
+    return bool(_LABELLED_LEVEL_PREFIX.search(text[: match.start()].rstrip()))
 
 
 def split_segments(query: str) -> list[str]:
@@ -101,7 +125,13 @@ _ONE_SIDED = tuple(
 
 
 def _to_float(text: str) -> float:
-    return float(re.sub(r"[^\d.+-]", "", text))
+    # Remove textual currency abbreviations before stripping punctuation. If
+    # ``Rs.`` is stripped afterwards, its period is mistaken for a decimal
+    # point (``Rs. 12,00,000`` would become ``.1200000``).
+    without_currency = re.sub(
+        r"(?i)\b(?:rs\.?|inr|usd|eur|gbp)", "", str(text or "")
+    )
+    return float(re.sub(r"[^\d.+-]", "", without_currency))
 
 
 def _context_before(text: str, position: int) -> str:
@@ -136,6 +166,11 @@ def extract_numeric_predicates(text: str) -> list[NumericPredicate]:
     for operator, pattern in _ONE_SIDED:
         for match in pattern.finditer(text):
             if is_claimed(match.start(), match.end()):
+                continue
+            # ``Stage 3 or higher`` is an ordinal category. Leave it to the
+            # evidence/rule reasoning path rather than treating 3 as a value
+            # that must exist in a source column.
+            if _is_labelled_level_predicate(text, match):
                 continue
             predicate = NumericPredicate(
                 operator=operator,

@@ -435,6 +435,12 @@ MAX_QUALIFYING_ROWS_SHOWN = 25
 MAX_QUALIFYING_KEYS_SHOWN = 50
 MAX_TEXT_FILTER_CHARS = 80
 
+# Avoid treating a weak token overlap (for example, ``monthly`` in both
+# ``monthly net pay`` and ``monthly gross salary``) as a resolved metric.
+# A metric phrase should identify a column with meaningful overlap, not just
+# share one generic word with it.
+MIN_NUMERIC_COLUMN_MATCH_SCORE = 0.5
+
 _DATE_NAME_TOKENS = ("date", "dob", "datetime", "timestamp")
 _EXCEL_EPOCH = datetime(1899, 12, 30)
 _SERIAL_MIN = 20000.0
@@ -485,11 +491,23 @@ _GENERIC_DATE_ROOTS = _DATE_ROOTS | {_root("time")}
 
 
 def _column_match_score(column: str, text: str) -> float:
-    """Lexical overlap between a schema column and the words that name it."""
+    """Symmetric lexical overlap between a column and the requested metric.
+
+    Column-only coverage made a single shared modifier such as ``monthly``
+    sufficient to resolve ``monthly net pay`` to ``monthly gross salary``.
+    Scoring both the column and the phrase preserves short valid names like
+    ``salary`` while rejecting weak one-token matches to a different metric.
+    """
     col_tokens = _tokens(column)
-    if not col_tokens:
+    text_tokens = _tokens(text)
+    if not col_tokens or not text_tokens:
         return 0.0
-    score = len(col_tokens & _tokens(text)) / len(col_tokens)
+    overlap = col_tokens & text_tokens
+    if not overlap:
+        return 0.0
+    column_coverage = len(overlap) / len(col_tokens)
+    phrase_coverage = len(overlap) / len(text_tokens)
+    score = (column_coverage + phrase_coverage) / 2.0
     normalized_col = " ".join(re.findall(r"[a-z0-9]+", column.lower()))
     normalized_text = " ".join(re.findall(r"[a-z0-9]+", text.lower()))
     if normalized_col and normalized_col in normalized_text:
@@ -654,7 +672,7 @@ def _pick_numeric_column(sources: list[_Source], text: str) -> tuple[_Source, st
     scored = [
         (score, source, column)
         for source, column in _numeric_columns(sources)
-        if (score := _column_match_score(column, text)) > 0
+        if (score := _column_match_score(column, text)) >= MIN_NUMERIC_COLUMN_MATCH_SCORE
     ]
     if not scored:
         raise _Unresolved(f"no numeric column matches '{text}'")
@@ -1417,21 +1435,58 @@ def finalize_structured(
     aggregates: list[dict[str, Any]] = []
     needed: dict[int, set[str]] = {}
     if needs_population:
-        try:
-            aggregates, needed = _derive_aggregates(
-                tables,
-                query=query,
-                focus_norms=focus_norms,
-                workspace_id=workspace_id,
-                run_query=run_query,
-                filtered=filtered,
-                filter_columns=_filter_columns(selection, filtered),
+        # If the requested aggregate cannot be tied to a real numeric column,
+        # it may be a derived metric whose formula lives in another source.
+        # Do not invent a substitute aggregate from a loosely matching column
+        # (e.g. summing gross salary for a request for net pay). Keep the full
+        # source rows available so the cross-document answer path can combine
+        # them with the governing formula/rules.
+        unresolved_derived_metric = False
+        unresolved_filtered_population = False
+        if intent.aggregate is not None and filtered is None:
+            try:
+                _pick_numeric_column(sources, intent.aggregate.metric_phrase)
+            except _Unresolved:
+                unresolved_derived_metric = True
+
+            # Do not publish an unfiltered whole-population aggregate when a
+            # query explicitly describes a subset but its filter depends on a
+            # derived value or a rule from another source. That would look like
+            # a successful answer while ignoring the requested eligibility.
+            try:
+                has_categorical_filter = bool(
+                    _find_categorical_filters(sources, intent.aggregate.scope_text)
+                )
+            except _Unresolved:
+                has_categorical_filter = True
+            unresolved_filtered_population = bool(
+                extract_numeric_predicates(intent.aggregate.scope_text)
+                or has_categorical_filter
             )
-        except Exception:
-            logger.exception("population aggregate derivation failed")
-            aggregates, needed = [], {}
-            if filtered is not None:
-                aggregates = [_aggregate_item(filtered, workspace_id)]
+
+        if unresolved_derived_metric or unresolved_filtered_population:
+            logger.info(
+                "population aggregate deferred: metric_resolved=%s "
+                "population_filter_resolved=%s; preserving complete source rows",
+                not unresolved_derived_metric,
+                not unresolved_filtered_population,
+            )
+        else:
+            try:
+                aggregates, needed = _derive_aggregates(
+                    tables,
+                    query=query,
+                    focus_norms=focus_norms,
+                    workspace_id=workspace_id,
+                    run_query=run_query,
+                    filtered=filtered,
+                    filter_columns=_filter_columns(selection, filtered),
+                )
+            except Exception:
+                logger.exception("population aggregate derivation failed")
+                aggregates, needed = [], {}
+                if filtered is not None:
+                    aggregates = [_aggregate_item(filtered, workspace_id)]
 
     protected_tables = _source_table_names([*selections, *aggregates])
 
