@@ -2623,6 +2623,17 @@ def _plan_is_mixed(state: AgentState) -> bool:
     return "TABLE_QUERY" in capabilities and "DOCUMENT_SEARCH" in capabilities
 
 
+def _is_rule_dependent_mixed_request(state: AgentState) -> bool:
+    """Whether structured rows must be preserved for a document-rule task."""
+    plan = state.get("execution_plan") or {}
+    decision = plan.get("decision") or {}
+    understanding = state.get("query_understanding") or {}
+    category = str(
+        understanding.get("category_hint") or decision.get("category") or ""
+    ).strip().lower()
+    return category == "mixed" and _plan_is_mixed(state)
+
+
 def _parse_contextual_reference(reference: str) -> dict[str, Any] | None:
     """
     Recognize purely contextual/positional source references:
@@ -3315,10 +3326,18 @@ def _run_documents(
         retry_ids = primary_ids if scoped_to_resolved else (all_ids or primary_ids)
 
         if scoped_to_resolved and not chunks and _plan_is_mixed(state):
-            widened = all_ids or [
+            # Widen only inside the conversation allow-list (None = whole
+            # workspace, which the catalog is already limited to).
+            authorized = _allowed_document_ids(state)
+            authorized_set = set(authorized) if authorized is not None else None
+            catalog_ids = [
                 _coerce_int(doc.get("document_id"))
                 for doc in _resources(state).catalog()
-                if _coerce_int(doc.get("document_id")) is not None
+            ]
+            widened = [
+                i
+                for i in dict.fromkeys(list(all_ids) + catalog_ids)
+                if i is not None and (authorized_set is None or i in authorized_set)
             ]
             if widened:
                 retry_ids = widened
@@ -4032,21 +4051,21 @@ def _run_cross_document_tables(
     state: AgentState,
     budget: _RecoveryBudget,
     schema: list[dict[str, Any]],
+    *,
+    allow_single_source: bool = False,
 ) -> dict[str, Any]:
-    """Retrieve resolved cross-document tables independently, without LLM SQL generation.
+    """Retrieve source tables independently, without LLM-generated SQL.
 
-    A cross-document request has already identified the exact source documents.
-    At this stage we need the source contents, not a model-generated join. Each
-    table is therefore read directly with a single allowlisted SELECT * query.
-    This guarantees that tables from different documents can never be joined
-    or produce a Cartesian product, and it also removes the failure mode where
-    the SQL model incorrectly returns ``needs_sql=false`` for a request that
-    the planner has already classified as requiring structured evidence.
+    Cross-document requests need source contents, not a model-generated join.
+    For a mixed data-plus-policy request, the same row-preserving path can be
+    used with one initially resolved structured source while the companion
+    policy is discovered separately. Tables are read with allowlisted SELECT *
+    queries, never joined across documents.
     """
     del budget
 
     groups = _cross_document_source_groups(state, schema)
-    if len(groups) < 2:
+    if not groups or (len(groups) < 2 and not allow_single_source):
         return {"evidence": [], "status": "NOT_FOUND"}
 
     evidence: list[dict[str, Any]] = []
@@ -4343,6 +4362,23 @@ def _run_table(
     schema_for_sql = _apply_table_scope(state, schema_for_sql)
     allowed = {item["table_name"] for item in schema_for_sql}
     schema_by_table = {item["table_name"]: item for item in schema_for_sql}
+
+    # In a mixed request, document rules may control eligibility, thresholds,
+    # deductions, or the derived measure itself. Do not let generated SQL apply
+    # an incomplete policy or aggregate away the employee/record-level inputs.
+    # Preserve the authorized table rows; the companion rules are retrieved by
+    # DOCUMENT_SEARCH and the final answer combines both evidence streams.
+    if _is_rule_dependent_mixed_request(state):
+        logger.info(
+            "table_query: preserving source rows for rule-dependent mixed request; "
+            "skipping generated SQL aggregation/filtering"
+        )
+        return _run_cross_document_tables(
+            state,
+            budget,
+            schema_for_sql,
+            allow_single_source=True,
+        )
 
     planner_notes = list(
         state.get("resolved_references", {}).get("contextual_notes", []) or []

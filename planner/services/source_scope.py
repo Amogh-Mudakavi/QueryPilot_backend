@@ -54,7 +54,10 @@ def candidate_document_ids(
     # A document the user explicitly NAMED (resolved reference of type
     # "document") on a non-cross-document plan is the request's scope.  The
     # Scope Guard's loose relevance proposal must not widen it again.
-    named_document_scope = (not plan.get("cross_document")) and any(
+    named_document_scope = (
+        (not plan.get("cross_document"))
+        and str(decision.get("category") or "").lower() != "mixed"
+    ) and any(
         isinstance(ref, Mapping)
         and ref.get("status") == "RESOLVED"
         and isinstance(ref.get("match"), Mapping)

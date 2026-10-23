@@ -202,6 +202,12 @@ def _decide_cross_document(
     compares, joins or calculates across them.
     """
     if len(source_ids) < 2:
+        # A mixed request is explicitly defined as structured data plus rules
+        # or formulas from document evidence. The companion source may not be
+        # resolved by name on the first pass, so do not disable cross-source
+        # reasoning solely because only the data source resolved initially.
+        if category == "mixed" and source_ids:
+            return True, "mixed request requires rules beyond the initially resolved source"
         return False, "fewer than two resolved sources"
     if (
         operation in INDEPENDENT_MULTI_SOURCE_OPERATIONS
@@ -365,11 +371,15 @@ def build_execution_plan(
     # and no table named. The document's own content is the evidence.
     # DOCUMENT_SEARCH already reads the document's text AND its extracted
     # tables, so nothing is lost by not starting from TABLE_QUERY.
+    # A "mixed" request (a value that depends on a rule/policy in ANOTHER
+    # source) is not anchored on the named document alone, even when only one
+    # source resolved: the missing companion must still be discovered.
     document_only = (
         bool(resolved_documents)
         and not resolved_tables
         and not resolved_entities
         and not pending_value_reference
+        and category != "mixed"
     )
     if document_only:
         if len(source_ids) >= 2:

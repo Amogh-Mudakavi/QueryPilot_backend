@@ -83,7 +83,9 @@ software is OUT.
 
 DOCUMENT IDS
 Only IDs from ATTACHED_IDS. A named file -> exactly its ID(s). A document
-question with no file named -> relevant IDs, or [] if unclear. Always [] for
+question with no file named -> relevant IDs, or [] if unclear. When the answer
+needs data from one source and a rule/policy/formula from another, include
+every source the result depends on. Always [] for
 WORKSPACE, CONVERSATION, PRODUCT, CHITCHAT, OUT. Never invent IDs.
 
 OUTPUT
