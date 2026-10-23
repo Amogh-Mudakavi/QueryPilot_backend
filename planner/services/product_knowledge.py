@@ -212,7 +212,7 @@ FAILURE STATES
 def _developer_section() -> str:
     if not DEVELOPER_FACTS:
         return (
-            "DEVELOPER / PROJECT\n"
+            "DEVELOPER / CREATOR / BUILDER OF QUERYPILOT\n"
             "QueryPilot's documented product knowledge does not include "
             "details about its developer or project history. Only "
             "documented facts are shared; QueryPilot will not guess."
@@ -223,7 +223,7 @@ def _developer_section() -> str:
         for key, value in DEVELOPER_FACTS.items()
     )
 
-    return f"DEVELOPER / PROJECT\n{body}"
+    return f"DEVELOPER / CREATOR / BUILDER OF QUERYPILOT\n{body}"
 
 
 def get_product_knowledge() -> dict:

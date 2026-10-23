@@ -17,6 +17,10 @@ class AgentState(TypedDict, total=False):
     # Conversation-level authorization boundary. None means the containing
     # workspace access policy is authoritative; [] means no documents allowed.
     allowed_document_ids: list[int] | None
+    # Scope Guard's verdict for THIS request (DOCUMENT, PRODUCT, ...). Empty
+    # when the guard is disabled. The planner honours PRODUCT; it never
+    # re-derives the request's intent from scratch.
+    scope_route: str
 
     query_understanding: dict[str, Any]
     resolved_references: dict[str, Any]

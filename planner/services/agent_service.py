@@ -504,6 +504,33 @@ def _needs_entity_lookup(
     }
 
 
+def _apply_scope_route(state: AgentState, plan: dict[str, Any]) -> dict[str, Any]:
+    """Honour the Scope Guard's PRODUCT verdict.
+
+    The Scope Guard already resolved the request's intent (including pronouns
+    such as "who built it"). The planner sees only a bounded history and can
+    mislabel such a question as chat history, so no product evidence is
+    fetched. PRODUCT questions need exactly the product knowledge source.
+    """
+    if state.get("scope_route") != "PRODUCT":
+        return plan
+    return {
+        **plan,
+        "status": "OK",
+        "capabilities": ["PRODUCT_KNOWLEDGE"],
+        "fallback_capabilities": [],
+        "cross_document": False,
+        "clarification_options": [],
+        "decision": {
+            **(plan.get("decision") or {}),
+            "category": "product",
+            "resolved_document_ids": [],
+            "reason": "QueryPilot product question (Scope Guard)",
+            "cross_document_reason": "no document sources needed",
+        },
+    }
+
+
 def _log_planner_decision(plan: dict[str, Any]) -> None:
     """One concise line: what was chosen and why. Never logs prompt text."""
     decision = plan.get("decision") or {}
@@ -725,6 +752,7 @@ def agent_node(state: AgentState) -> dict[str, Any]:
             for r in resolution.get("references", [])
         ],
     )
+    plan = _apply_scope_route(state, plan)
     _log_planner_decision(plan)
 
     clarification = plan.get("status") == "NEEDS_CLARIFICATION"

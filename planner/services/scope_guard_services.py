@@ -29,15 +29,19 @@ from planner.services.history import bound_history_for_planner
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_ROUTES = {
+# One source of truth for route labels: the JSON schema, the validator and the
+# retry reminder all read this tuple.
+ROUTE_LABELS = (
     "DOCUMENT",
+    "WORKSPACE",
+    "CONVERSATION",
     "PRODUCT",
     "CHITCHAT",
     "OUT",
     "CLARIFY",
-    "WORKSPACE",
-    "CONVERSATION",
-}
+)
+
+ALLOWED_ROUTES = set(ROUTE_LABELS)
 
 ALLOWED_TARGETS = (
     "documents_or_subject",
@@ -442,15 +446,7 @@ class ScopeGuard:
                         },
                         "route": {
                             "type": "string",
-                            "enum": [
-                                "DOCUMENT",
-                                "WORKSPACE",
-                                "CONVERSATION",
-                                "PRODUCT",
-                                "CHITCHAT",
-                                "OUT",
-                                "CLARIFY",
-                            ],
+                            "enum": list(ROUTE_LABELS),
                         },
                         "relevant_document_ids": {
                             "type": "array",
@@ -495,13 +491,38 @@ class ScopeGuard:
                 first_error,
                 query,
             )
+        # JSON-object mode carries no enum constraint, so restate the exact
+        # label contract on the retry; otherwise the model tends to repeat the
+        # same mistake (e.g. a route name in the deliverable field).
+        retry_messages = list(messages)
+        retry_messages[-1] = {
+            **retry_messages[-1],
+            "content": str(retry_messages[-1].get("content") or "")
+            + self._output_contract(),
+        }
         return router.generate(
             task="scope_guard",
-            messages=messages,
+            messages=retry_messages,
             temperature=0.0,
             max_tokens=RETRY_OUTPUT_TOKENS,
             response_format={"type": "json_object"},
             include_reasoning=False,
+        )
+
+    @staticmethod
+    def _output_contract() -> str:
+        return (
+            "\nOUTPUT CONTRACT (exact values only): target="
+            + "|".join(ALLOWED_TARGETS)
+            + "; deliverable="
+            + "|".join(ALLOWED_DELIVERABLES)
+            + " (never a route name; use not_applicable when nothing is authored)"
+            + "; threat_category="
+            + "|".join(ALLOWED_THREAT_CATEGORIES)
+            + "; route="
+            + "|".join(ROUTE_LABELS)
+            + ". Return one JSON object with keys target, deliverable, "
+            "threat_category, route, relevant_document_ids, reason."
         )
 
     @staticmethod
@@ -874,6 +895,35 @@ class ScopeGuard:
         return value
 
     @staticmethod
+    def _deliverable_label(decision_data: dict, route: str) -> str:
+        """Validate `deliverable`, tolerating one specific, safe slip.
+
+        A route name in the deliverable field (e.g. "OUT") carries no
+        information about what is being authored, and a route label is NOT a
+        deliverable. It is tolerated only when the model's own route grants no
+        document access; then no software check can be bypassed and the
+        decision is the model's own route. For DOCUMENT/CLARIFY the label stays
+        invalid and the request fails closed, as before.
+        """
+        try:
+            return ScopeGuard._require_label(
+                decision_data, "deliverable", ALLOWED_DELIVERABLES
+            )
+        except ValueError:
+            raw = decision_data.get("deliverable")
+            leaked = isinstance(raw, str) and raw.strip().upper() in ALLOWED_ROUTES
+            if leaked and route in NO_DOCUMENT_ROUTES:
+                logger.warning(
+                    "Scope Guard put route label %r in deliverable; treating "
+                    "deliverable as not_applicable (route=%s grants no document "
+                    "access).",
+                    raw,
+                    route,
+                )
+                return "not_applicable"
+            raise
+
+    @staticmethod
     def _validate_decision(
         *,
         decision_data: dict,
@@ -901,11 +951,7 @@ class ScopeGuard:
             ALLOWED_TARGETS,
         )
 
-        deliverable = ScopeGuard._require_label(
-            decision_data,
-            "deliverable",
-            ALLOWED_DELIVERABLES,
-        )
+        deliverable = ScopeGuard._deliverable_label(decision_data, route)
 
         threat_category = ScopeGuard._require_label(
             decision_data,
