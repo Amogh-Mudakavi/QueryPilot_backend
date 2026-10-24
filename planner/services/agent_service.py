@@ -55,7 +55,6 @@ from planner.services.history import (
 )
 from planner.services.intent import (
     OVERVIEW_OPERATIONS,
-    ROW_RESULT_OPERATIONS,
     build_execution_plan,
     normalized_operation,
 )
@@ -3561,12 +3560,18 @@ def _supplement_dependency_evidence(
 
 
 def _tables_used_by_table_query(table: dict[str, Any] | None) -> set[str]:
-    """Table names the executed business SQL actually read."""
+    """Table names the executed business SQL actually read rows from.
+
+    A query that ran but returned nothing did not read the table's content,
+    so that table must stay available to the document-evidence fallback.
+    """
     if not table:
         return set()
     names: set[str] = set()
     for item in table.get("evidence", []):
         if not isinstance(item, dict):
+            continue
+        if str(item.get("result_status", "")).upper() != "SUCCESS":
             continue
         for name in item.get("content", {}).get("tables_used", []) or []:
             names.add(str(name))
@@ -3715,14 +3720,92 @@ def _is_infrastructure_error(message: str) -> bool:
     return any(marker in lowered for marker in _INFRASTRUCTURE_ERRORS)
 
 
+_PROBE_MAX_COLUMNS = 8
+_PROBE_MAX_DISTINCT = 25
+_PROBE_MAX_VALUE_CHARS = 60
+
+
+def _is_empty_result(result: dict[str, Any] | None) -> bool:
+    """True when a query that RAN produced nothing usable.
+
+    Zero rows, or only rows whose every value is NULL (what an aggregate
+    returns when its filter matched nothing).
+    """
+    if result is None:
+        return False
+    if int(result.get("row_count", 0) or 0) == 0:
+        return True
+    rows = [r for r in (result.get("rows") or []) if isinstance(r, dict)]
+    return bool(rows) and all(all(v is None for v in r.values()) for r in rows)
+
+
+def _probe_stored_values(
+    state: AgentState,
+    schema_for_sql: list[dict[str, Any]],
+    allowed: set[str],
+    tables_used: list[str],
+) -> dict[str, dict[str, list[str]]]:
+    """Read-only look at what low-cardinality text columns really contain.
+
+    Uses the same query_tables path (allow-list, validation, read-only), so no
+    authorization or SQL-safety rule is bypassed.
+    """
+    by_name = {str(item.get("table_name")): item for item in schema_for_sql}
+    names = [n for n in tables_used if n in by_name] or list(by_name)[:2]
+    found: dict[str, dict[str, list[str]]] = {}
+    budget_left = _PROBE_MAX_COLUMNS
+
+    for table_name in names:
+        for column in by_name[table_name].get("columns") or []:
+            if budget_left <= 0 or _past_deadline(state):
+                return found
+            column = str(column)
+            if '"' in column or table_name not in allowed:
+                continue
+            budget_left -= 1
+            try:
+                result = query_tables(
+                    workspace_id=state["workspace_id"],
+                    sql=(
+                        f'SELECT DISTINCT "{column}" FROM "{table_name}" '
+                        f"LIMIT {_PROBE_MAX_DISTINCT + 1}"
+                    ),
+                    parameters=[],
+                    allowed_table_names={table_name},
+                )
+            except ValueError as exc:
+                if _is_infrastructure_error(str(exc)):
+                    raise AgentRuntimeError(str(exc), code="DATABASE_ERROR") from exc
+                continue
+            values = [
+                r.get(column)
+                for r in result.get("rows", [])
+                if r.get(column) is not None
+            ]
+            if not values or len(values) > _PROBE_MAX_DISTINCT:
+                continue  # empty, or too many values to be a category/period list
+            if all(
+                isinstance(v, (int, float)) and not isinstance(v, bool)
+                for v in values
+            ):
+                continue  # plain numbers do not help fix a text/period filter
+            found.setdefault(table_name, {})[column] = [
+                str(v)[:_PROBE_MAX_VALUE_CHARS] for v in values
+            ]
+    return found
+
+
 def _zero_rows_repair_guidance(
     schema_for_sql: list[dict[str, Any]],
     is_mixed: bool,
+    stored_values: dict[str, dict[str, list[str]]] | None = None,
+    parameters: Any = None,
 ) -> str:
     """
-    Generic, evidence-driven repair guidance for a zero-row result
-    that contradicts the actual source data. Keyed on table sizes from
-    the authoritative schema and on the plan — never on query wording.
+    Generic, evidence-driven repair guidance for an empty result that
+    contradicts the actual source data. Keyed on table sizes from the
+    authoritative schema, the previous parameters and the stored values -
+    never on query wording. It never asks the model to drop a requested filter.
     """
     sizes = ", ".join(
         f"{item.get('table_name')}: {int(item.get('row_count') or 0)} rows"
@@ -3730,11 +3813,24 @@ def _zero_rows_repair_guidance(
     )
     guidance = (
         "The query returned zero rows although the source table(s) contain "
-        f"rows ({sizes}), so the SQL conditions are wrong - the data is not "
-        "missing. Remove conditions the question does not require, verify "
-        "column names, CASTs and exact stored values, and remove any JOIN "
-        "that is not required by the question."
+        f"rows ({sizes}), so a condition did not match what is stored - the "
+        "data is not missing. KEEP every entity, date, period, status or "
+        "category condition the question asks for; do NOT drop them. Instead "
+        "rewrite each one so its literal or parameter matches the format and "
+        "spelling actually stored in the column (shown below). Also check "
+        "column names and CASTs, and remove only a JOIN or condition the "
+        "question does not require."
     )
+    if isinstance(parameters, (list, tuple)) and parameters:
+        shown = ", ".join(repr(str(p))[:80] for p in parameters[:8])
+        guidance += f" Parameter values used last time: [{shown}]."
+    if stored_values:
+        parts = [
+            f"{table}.{column} = {values}"
+            for table, columns in stored_values.items()
+            for column, values in columns.items()
+        ]
+        guidance += " Values actually stored (distinct): " + "; ".join(parts) + "."
     if is_mixed:
         guidance += (
             " This request also depends on a rule/policy from a document: if "
@@ -3831,10 +3927,12 @@ def _attempt_sql(
         return outcome
 
     logger.info(
-        "table_query attempt: repair=%s sql_preview=%r parameter_count=%d",
+        "table_query attempt: repair=%s sql_preview=%r parameter_count=%d "
+        "parameters=%.200r",
         previous_attempt is not None,
         str(sql)[:300],
         len(parameters) if isinstance(parameters, (list, tuple)) else 0,
+        parameters,
     )
 
     try:
@@ -4439,10 +4537,15 @@ def _run_table(
 
     # Details for just the documents the request established; with nothing
     # resolved the whole workspace is the SQL scope, as before.
+    # Sample rows are already fetched/cached for numeric detection; exposing them
+    # lets SQL generation see the real stored format of every column.
     if resolved_document_ids or resolved_table_names:
-        schema = resources.schema(document_ids=_scope_document_ids(state, resources))
+        schema = resources.schema(
+            document_ids=_scope_document_ids(state, resources),
+            include_sample_rows=True,
+        )
     else:
-        schema = resources.schema()
+        schema = resources.schema(include_sample_rows=True)
 
     if resolved_table_names:
         filtered_schema = [
@@ -4545,43 +4648,68 @@ def _run_table(
 
     chosen = first
 
-    failed = first["result"] is None
-    zero_rows_for_known_entity = (
-        first["result"] is not None
-        and first["result"].get("row_count", 0) == 0
-        and bool(entities)
-    )
     operation = str(
         state.get("query_understanding", {}).get("operation") or "answer"
     ).lower()
 
-    zero_rows_implies_bad_sql = (
-        first["result"] is not None
-        and first["result"].get("row_count", 0) == 0
-        and operation in ROW_RESULT_OPERATIONS
-        and any(int(item.get("row_count") or 0) > 0 for item in schema_for_sql)
+    failed = first["result"] is None
+    empty_result = _is_empty_result(first["result"])
+    source_populated = any(
+        int(item.get("row_count") or 0) > 0 for item in schema_for_sql
+    )
+    # A query that ran but found nothing, against a populated source or for an
+    # entity we already located, is a repairable query problem. This does not
+    # depend on the operation label or on entity resolution succeeding.
+    empty_but_source_has_data = empty_result and (
+        bool(entities) or source_populated
     )
 
-    if (
-        failed or zero_rows_for_known_entity or zero_rows_implies_bad_sql
-    ) and not _past_deadline(state):
+    logger.info(
+        "table_query recovery gate: failed=%s empty_result=%s entities=%d "
+        "source_populated=%s operation=%s past_deadline=%s budget_used=%d/%d",
+        failed,
+        empty_result,
+        len(entities),
+        source_populated,
+        operation,
+        _past_deadline(state),
+        budget.used,
+        budget.limit,
+    )
+
+    if (failed or empty_but_source_has_data) and not _past_deadline(state):
         if budget.try_consume():
             previous: dict[str, Any] = {
                 "sql": first["sql"],
                 "parameters": first["parameters"],
             }
+            stored_values: dict[str, dict[str, list[str]]] = {}
             if failed:
                 previous["error"] = first["error"]
             else:
                 previous["zero_rows"] = True
-                if zero_rows_implies_bad_sql:
-                    previous["error"] = _zero_rows_repair_guidance(
-                        schema_for_sql, is_mixed
+                try:
+                    stored_values = _probe_stored_values(
+                        state,
+                        schema_for_sql,
+                        allowed,
+                        list((first["result"] or {}).get("tables_used", [])),
                     )
+                except AgentRuntimeError:
+                    raise
+                except Exception:
+                    logger.exception("stored-value probe failed; repairing without it")
+                previous["error"] = _zero_rows_repair_guidance(
+                    schema_for_sql,
+                    is_mixed,
+                    stored_values=stored_values,
+                    parameters=first["parameters"],
+                )
 
             logger.info(
-                "table_query recovery: reason=%s",
-                "error" if failed else "zero_rows",
+                "table_query recovery: reason=%s probed_columns=%d",
+                "error" if failed else "empty_result",
+                sum(len(cols) for cols in stored_values.values()),
             )
             try:
                 second = _attempt_sql(

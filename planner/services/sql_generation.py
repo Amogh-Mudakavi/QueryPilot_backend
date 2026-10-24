@@ -20,7 +20,7 @@ You generate one SQLite read-only SQL statement for QueryPilot.
 
 INPUT
 - user_question: the current request
-- tables: authoritative table names, exact column names, numeric_columns, and row counts
+- tables: authoritative table names, exact column names, numeric_columns, row counts, and sample_rows (a few real stored rows showing each column's stored format)
 - resolved_entities: deterministic entity values plus the exact table/column locations
 - query_semantics: planner operation, whether population-wide context is required, and ranking_limit (the exact N the user asked for, when it is a top/bottom N request)
 - planner_notes: deterministic source/context notes
@@ -38,6 +38,7 @@ HARD RULES
 10. If a repair attempt is supplied, change only the part contradicted by the real error/result; do not broaden scope.
 11. RANKING (top/bottom/highest/lowest N): ORDER BY the CAST numeric measure (never a text column), DESC for top/highest and ASC for bottom/lowest, and LIMIT exactly ranking_limit when it is given. If one entity can have several rows in the table (row_count is larger than the number of distinct entities), GROUP BY the entity key and rank by SUM(CAST(measure AS REAL)) instead of ranking single rows. Add the entity key as a final ORDER BY tie-break so the order is stable. Select the entity key and the ranked measure so the ranking can be verified.
 12. A LIMIT belongs only to the ranked rows. Company-wide totals or shares are computed from the whole population elsewhere; never try to get a total by summing the LIMITed rows.
+13. STORED VALUES: sample_rows and previous_attempt.error (when present) show how values are really stored. Express every filter from the question (entity, date, month, period, status, category) in the stored representation and spelling of the column you filter on, mapping the user's wording to it. Keep the meaning of the user's filter exactly. Never drop or widen a filter to get rows; if the stored values show the requested value does not exist, keep the filter.
 
 OUTPUT
 Return exactly one JSON object matching the provided schema. `needs_sql` must be true whenever the planner requested SQL. Keep SQL as short as correctness allows.
@@ -183,6 +184,34 @@ def _ranking_problems(
     return problems
 
 
+_SAMPLE_ROWS_IN_PROMPT = 3
+_SAMPLE_VALUE_CHARS = 40
+
+
+def _prompt_schema(schema: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Schema as sent to the model: sample rows kept small (token budget)."""
+    compact: list[Any] = []
+    for item in schema or []:
+        if not isinstance(item, dict):
+            compact.append(item)
+            continue
+        item = dict(item)
+        rows = item.get("sample_rows")
+        if isinstance(rows, list):
+            item["sample_rows"] = [
+                {
+                    str(key): (
+                        value[:_SAMPLE_VALUE_CHARS] if isinstance(value, str) else value
+                    )
+                    for key, value in row.items()
+                }
+                for row in rows[:_SAMPLE_ROWS_IN_PROMPT]
+                if isinstance(row, dict)
+            ]
+        compact.append(item)
+    return compact
+
+
 def _call_model(payload: dict[str, Any]) -> dict[str, Any]:
     response = router.generate(
         task="sql_generation",
@@ -218,7 +247,7 @@ def generate_sql(
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "user_question": query,
-        "tables": schema,
+        "tables": _prompt_schema(schema),
     }
 
     if resolved_entities:
