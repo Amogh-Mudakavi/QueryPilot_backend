@@ -35,6 +35,10 @@ MAX_TEXT_CHARS_PER_ITEM = 1800
 MAX_NOTE_CHARS = 400
 MAX_CELL_CHARS = 120
 MIN_ROWS_WHEN_TRIMMED = 3
+# Retrieved passages are shortened only down to this size while any table can
+# still be narrowed; only then (last resort) down to the old 300-char floor.
+MIN_TEXT_CHARS_WHEN_TRIMMED = 900
+MIN_TEXT_CHARS_LAST_RESORT = 300
 MIN_ROWS_FOR_COVERAGE_REDUCTION = 6
 
 
@@ -854,13 +858,14 @@ def _fit_to_budget(
     mistaken for a complete population. Aggregates and notes are never trimmed.
     """
     guard = 0
+    text_floor = MIN_TEXT_CHARS_WHEN_TRIMMED
     while _size(items) > budget_chars and guard < 200:
         guard += 1
         texts = [
             i
             for i in items
             if isinstance(i.get("content"), str)
-            and len(i["content"]) > 300
+            and len(i["content"]) > text_floor
             and i.get("source_type") not in _NOTE_TYPES
             and i.get("source_type") != "product_knowledge"
         ]
@@ -900,6 +905,9 @@ def _fit_to_budget(
             if _is_table(i) and len(i["content"]["rows"]) > MIN_ROWS_WHEN_TRIMMED
         ]
         if not tables:
+            if text_floor > MIN_TEXT_CHARS_LAST_RESORT:
+                text_floor = MIN_TEXT_CHARS_LAST_RESORT
+                continue
             break
         biggest = max(tables, key=lambda i: _size(i["content"]["rows"]))
         content = biggest["content"]

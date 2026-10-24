@@ -18,11 +18,11 @@ reason = <=15 words
 
 Rules:
 - Copy references exactly; never invent canonical names. Keep ALL named sources.
-- A calculation needing a rule/policy/formula in another source is mixed.
+- Mixed = the answer needs both table data and document text: a calculation combining a rule/policy/formula in one source with data in another, OR a figure, rate, period or measurement that the named source may not itself contain. When unsure whether the needed data sits in a table elsewhere in workspace_catalog, choose mixed.
 - Table content is structured; file/table catalog questions are metadata.
 - "first/second/last/nth" preserves position semantics. Deterministic resolution handles ambiguity later.
 - For contextual follow-ups, use history only when the subject is unambiguous; a self-contained query does not inherit prior topic/files.
-- If workspace_catalog is present, phrases like "both PDFs" may copy the exact matching titles.
+- If workspace_catalog is present, phrases like "both PDFs" may copy the exact matching titles. likely_relevant is only a hint: use every catalog entry (see its columns) that could hold data the question needs.
 
 Return ONLY the supplied JSON schema.
 """

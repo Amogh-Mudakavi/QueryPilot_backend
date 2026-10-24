@@ -82,8 +82,12 @@ from planner.services.sufficiency import (
     documents_insufficient,
     insufficiency_note,
 )
-from planner.services.table_selection import select_tables
+from planner.services.table_selection import (
+    select_tables,
+    select_tables_detailed,
+)
 from planner.tools.conversation_memory import conversation_memory
+from planner.tools.query_tables import MAX_RESULTS as QUERY_ROW_CAP
 from planner.tools.query_tables import query_tables
 from planner.tools.search_evidence import fetch_document_chunks, search_evidence
 from planner.tools.source_metadata import source_metadata
@@ -116,6 +120,9 @@ resolve_entities_from_query = _timed_call(
 get_workspace_schema = _timed_call("get_workspace_schema", get_workspace_schema)
 get_workspace_catalog = _timed_call("get_workspace_catalog", get_workspace_catalog)
 select_tables = _timed_call("select_tables", select_tables)
+select_tables_detailed = _timed_call(
+    "select_tables", select_tables_detailed
+)
 generate_sql = _timed_call("generate_sql", generate_sql)
 query_tables = _timed_call("query_tables", query_tables)
 search_evidence = _timed_call("search_evidence", search_evidence)
@@ -132,6 +139,14 @@ MAX_EVIDENCE_CROSS_DOCUMENT = 12
 
 
 MAX_EVIDENCE_WITH_COVERAGE = 24
+
+# Retrieved passages always keep at least this many evidence slots, even when
+# structured tables alone would fill the limit.
+MIN_TEXT_EVIDENCE = 4
+
+# Planner catalog: how many documents / columns per document it is shown.
+PLANNER_MAX_CATALOG_DOCUMENTS = 12
+PLANNER_MAX_DIGEST_COLUMNS = 24
 
 PLANNER_MAX_COMPLETION_TOKENS = 400
 
@@ -875,7 +890,7 @@ def _with_table_scope(
                     if _coerce_int(item.get("document_id")) in resolved_ids
                     or str(item.get("table_name")) in entity_tables
                 ]
-        selected = select_tables(
+        selection = select_tables_detailed(
             workspace_id=state["workspace_id"],
             query=effective_planning_query(state),
             understanding=state.get("query_understanding", {}) or {},
@@ -890,11 +905,14 @@ def _with_table_scope(
         logger.exception("table scope selection failed; not narrowing")
         return state
 
+    selected = selection.tables if selection is not None else None
     if not selected:
         return state
 
     scoped = dict(state)
     scoped["table_scope"] = sorted(selected)
+    scoped["table_roles"] = dict(selection.roles)
+    scoped["table_computed"] = list(selection.computed)
     return scoped
 
 
@@ -2071,7 +2089,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
 
         room_for_documents = max(
             evidence_limit - len(structured) - len(notes),
-            0,
+            min(len(documents), MIN_TEXT_EVIDENCE),
         )
 
         evidence = _ensure_citation_sync(
@@ -2335,16 +2353,24 @@ def _build_context(state: AgentState) -> str:
                     if _coerce_int(doc.get("document_id")) in authorized_set
                 ]
                 relevant_ids.intersection_update(authorized_set)
-            if relevant_ids:
-                raw_catalog = [
-                    doc
-                    for doc in raw_catalog
-                    if _coerce_int(doc.get("document_id")) in relevant_ids
-                ]
-            else:
-                # Fallback catalog discovery remains bounded, and happens only
-                # after authorization filtering (including the empty allow-list).
-                raw_catalog = raw_catalog[:12]
+            # Scope Guard's picks are a ranking hint, not a boundary: keep every
+            # authorized document (bounded), most relevant first, so the planner
+            # can still see data that lives in a source Scope Guard did not pick.
+            raw_catalog = sorted(
+                raw_catalog,
+                key=lambda doc: _coerce_int(doc.get("document_id"))
+                not in relevant_ids,
+            )[:PLANNER_MAX_CATALOG_DOCUMENTS]
+            column_digest = _planner_column_digest(
+                state,
+                [
+                    document_id
+                    for document_id in (
+                        _coerce_int(doc.get("document_id")) for doc in raw_catalog
+                    )
+                    if document_id is not None
+                ],
+            )
 
             for document in raw_catalog:
                 # Planner needs titles/ids/types to copy exact reference
@@ -2355,6 +2381,15 @@ def _build_context(state: AgentState) -> str:
                     "title": document.get("title"),
                     "source_type": document.get("source_type"),
                 }
+                if relevant_ids:
+                    entry["likely_relevant"] = (
+                        _coerce_int(document.get("document_id")) in relevant_ids
+                    )
+                digest_columns = column_digest.get(
+                    _coerce_int(document.get("document_id"))
+                )
+                if digest_columns:
+                    entry["columns"] = digest_columns
                 table_count = len(document.get("tables", []) or [])
                 if table_count > 1:
                     entry["table_count"] = table_count
@@ -4140,8 +4175,6 @@ def _run_cross_document_tables(
     policy is discovered separately. Tables are read with allowlisted SELECT *
     queries, never joined across documents.
     """
-    del budget
-
     groups = _cross_document_source_groups(state, schema)
     if not groups or (len(groups) < 2 and not allow_single_source):
         return {"evidence": [], "status": "NOT_FOUND"}
@@ -4149,6 +4182,7 @@ def _run_cross_document_tables(
     evidence: list[dict[str, Any]] = []
     any_success = False
     any_error = False
+    big_tables: list[dict[str, Any]] = []
     operation = str(
         state.get("query_understanding", {}).get("operation") or "answer"
     ).lower()
@@ -4163,6 +4197,12 @@ def _run_cross_document_tables(
 
             table_name = str(item.get("table_name") or "")
             if not table_name:
+                continue
+
+            if int(item.get("row_count") or 0) > QUERY_ROW_CAP:
+                # Larger than the read cap: SELECT * would return only the
+                # first rows, which must never stand in for the population.
+                big_tables.append(item)
                 continue
 
             schema_by_table = {table_name: item}
@@ -4245,6 +4285,12 @@ def _run_cross_document_tables(
                     "result_status": "SUCCESS" if success else "NOT_FOUND",
                 }
             )
+
+    if big_tables:
+        large = _run_large_tables_via_sql(state, budget, big_tables)
+        evidence.extend(large["evidence"])
+        any_success = any_success or large["success"]
+        any_error = any_error or large["error"]
 
     if any_success:
         overall = "SUCCESS"
@@ -4609,6 +4655,173 @@ def _run_table(
         ],
         "status": status,
     }
+
+
+def _planner_column_digest(
+    state: AgentState,
+    document_ids: list[int],
+) -> dict[int, list[str]]:
+    """Distinct column names per document, so the planner can see where data lives.
+
+    Metadata only (no row sampling). Any failure returns {} and the planner
+    simply runs without the digest.
+    """
+    if not document_ids:
+        return {}
+    try:
+        schema = _resources(state).schema(document_ids=sorted(set(document_ids)))
+    except Exception:
+        logger.exception("planner column digest unavailable; continuing without it")
+        return {}
+    digest: dict[int, list[str]] = {}
+    for table in schema:
+        document_id = _coerce_int(table.get("document_id"))
+        if document_id is None:
+            continue
+        bucket = digest.setdefault(document_id, [])
+        for column in table.get("columns") or []:
+            name = str(column)
+            if name not in bucket and len(bucket) < PLANNER_MAX_DIGEST_COLUMNS:
+                bucket.append(name)
+    return digest
+
+
+def _run_large_tables_via_sql(
+    state: AgentState,
+    budget: _RecoveryBudget,
+    tables: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate tables that exceed the read cap in SQL instead of dumping rows.
+
+    A table with more rows than query_tables can return is never read with
+    SELECT *: the first rows would be mistaken for the whole population. Each
+    document's large tables go through normal SQL generation (with one repair
+    attempt from the shared recovery budget); values the table selector marked
+    as computed are passed along as planner notes.
+    """
+    evidence: list[dict[str, Any]] = []
+    success = False
+    error = False
+    operation = str(
+        (state.get("query_understanding", {}) or {}).get("operation") or "answer"
+    ).lower()
+
+    notes = list(
+        state.get("resolved_references", {}).get("contextual_notes", []) or []
+    )
+    computed = [str(item) for item in state.get("table_computed") or []]
+    if computed:
+        notes.append(
+            "Derive these values in SQL over ALL rows: "
+            + "; ".join(computed[:6])
+            + "."
+        )
+    notes.append(
+        "The table(s) hold more rows than can be returned. Compute counts, sums, "
+        "averages, rates and rankings in SQL and return only the aggregated "
+        "result, never raw rows."
+    )
+
+    by_document: dict[int | None, list[dict[str, Any]]] = {}
+    for item in tables:
+        by_document.setdefault(_coerce_int(item.get("document_id")), []).append(item)
+
+    for group in by_document.values():
+        if _past_deadline(state):
+            break
+
+        schema_by_table = {str(item["table_name"]): item for item in group}
+        allowed = set(schema_by_table)
+
+        chosen = _attempt_sql(
+            state=state,
+            schema_for_sql=group,
+            entities=[],
+            allowed=allowed,
+            previous_attempt=None,
+            planner_notes=notes,
+        )
+
+        if (
+            chosen["result"] is None
+            and not _past_deadline(state)
+            and budget.try_consume()
+        ):
+            previous = {
+                "sql": chosen["sql"],
+                "parameters": chosen["parameters"],
+                "error": chosen["error"],
+            }
+            try:
+                second = _attempt_sql(
+                    state=state,
+                    schema_for_sql=group,
+                    entities=[],
+                    allowed=allowed,
+                    previous_attempt=previous,
+                    planner_notes=notes,
+                )
+            except AgentRuntimeError:
+                raise
+            except Exception:
+                logger.exception("large-table SQL recovery failed")
+                second = None
+            if second is not None and _outcome_rank(second) >= _outcome_rank(chosen):
+                chosen = second
+
+        result = chosen["result"]
+        if result is None:
+            error = True
+            logger.error("Large-table aggregation failed: %s", chosen["error"])
+            evidence.append(
+                {
+                    "source_type": "table_query",
+                    "workspace_id": state["workspace_id"],
+                    "sources": [],
+                    "content": {
+                        "message": (
+                            "A table too large to return in full could not be "
+                            "aggregated, so no population-level figure is "
+                            "available from it."
+                        ),
+                    },
+                    "result_status": "RETRIEVAL_ERROR",
+                }
+            )
+            continue
+
+        status = "SUCCESS" if int(result.get("row_count", 0) or 0) > 0 else "NOT_FOUND"
+        success = success or status == "SUCCESS"
+        evidence.append(
+            {
+                "source_type": "table_query",
+                "workspace_id": state["workspace_id"],
+                "sources": [
+                    {
+                        "table_name": name,
+                        "document_id": (
+                            schema_by_table[name].get("document_id")
+                            if name in schema_by_table
+                            else None
+                        ),
+                    }
+                    for name in result.get("tables_used", [])
+                ],
+                "content": {
+                    **_table_content(
+                        result,
+                        schema_by_table,
+                        sql=chosen["sql"],
+                        operation=operation,
+                    ),
+                    "evidence_role": "query_result",
+                    "document_title": group[0].get("document_title"),
+                },
+                "result_status": status,
+            }
+        )
+
+    return {"evidence": evidence, "success": success, "error": error}
 
 
 agent_graph = build_agent_graph()
