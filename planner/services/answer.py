@@ -37,21 +37,52 @@ MAX_CELL_CHARS = 120
 MIN_ROWS_WHEN_TRIMMED = 3
 # Retrieved passages are shortened only down to this size while any table can
 # still be narrowed; only then (last resort) down to the old 300-char floor.
+
 MIN_TEXT_CHARS_WHEN_TRIMMED = 900
 MIN_TEXT_CHARS_LAST_RESORT = 300
 MIN_ROWS_FOR_COVERAGE_REDUCTION = 6
-
+# Column projection is only an emergency payload-compaction step. These terms
+# identify requests where schema/content completeness matters more than lexical
+# overlap with the question.
+_FULL_CONTENT_QUERY_RE = re.compile(
+    r"\b(?:all available content|all available data|full content|complete content|"
+    r"entire content|full workbook|entire workbook|whole workbook|everything|"
+    r"whatever is there|whatever is available|all cell values|all columns and rows|"
+    r"all rows and columns|every sheet|every column)\b",
+    re.IGNORECASE,
+)
+_TABLE_CONTENT_QUERY_RE = re.compile(
+    r"\b(?:workbook|spreadsheet|sheet|table|row|rows|column|columns|header|headers|cell|cells|content|data|value|values)\b",
+    re.IGNORECASE,
+)
+_SCHEMA_QUERY_RE = re.compile(
+    r"\b(?:headers?|column names|sheet names|list columns|available columns)\b",
+    re.IGNORECASE,
+)
+_ANALYTIC_QUERY_RE = re.compile(
+    r"\b(?:average|avg|mean|sum|total|count|highest|lowest|top|rank|compare|comparison|"
+    r"breach(?:ed|es|ing)?|sla|credit|owe|owed|threshold|compliance|calculate|calculation|"
+    r"eligible|below|above|percentage|percent|rate|variance|difference|shortfall|"
+    r"exceed(?:s|ed|ing)?)\b",
+    re.IGNORECASE,
+)
+_MEASURE_COLUMN_WORDS = frozenset(
+    {
+        "amount", "average", "balance", "charge", "cost", "count", "credit",
+        "day", "delay", "distance", "duration", "fee", "hour", "latency",
+        "percent", "price", "quantity", "rate", "revenue", "score", "time",
+        "total", "uptime", "availability", "value", "variance", "volume", "weight",
+    }
+)
+_CELL_VALUE_STOPWORDS = frozenset(
+    {"system", "systems", "service", "services", "company", "companies", "limited", "ltd", "inc", "llc", "corp", "corporation"}
+)
 
 HISTORY_MAX_MESSAGES = 2
 HISTORY_MAX_CHARS_PER_MESSAGE = 240
 HISTORY_MAX_QUERY_WORDS = 15
-
-
 DEFAULT_CURRENCY_SYMBOL = None
-
-
 SYSTEM_PROMPT = BASE_SYSTEM_PROMPT
-
 ANSWER_RESPONSE_FORMAT = None
 DEFAULT_REASONING_EFFORT = "low"
 CALCULATION_REASONING_EFFORT = "low"
@@ -72,7 +103,6 @@ def _system_tokens() -> int:
 
 def _payload_char_budget() -> int:
     """Characters the user payload may take for one provider call.
-
     This is a per-call provider-safety calculation only. It does not inspect
     or depend on any earlier LLM calls from the same user request.
     Required evidence is never trimmed merely to satisfy a request-wide
@@ -86,7 +116,6 @@ def _payload_char_budget() -> int:
 
 def _completion_budget(payload: str) -> tuple[int, int]:
     """Return the fixed task output cap, constrained only by this call.
-
     Earlier LLM calls cannot reduce Answer's generation allowance. The only
     reduction possible is when this individual Answer request itself is too
     large to fit the provider-safe per-call ceiling.
@@ -96,7 +125,6 @@ def _completion_budget(payload: str) -> tuple[int, int]:
     )
     provider_room = max(TOTAL_REQUEST_TOKEN_CEILING - input_tokens, 0)
     max_tokens = min(ANSWER_MAX_OUTPUT_TOKENS, provider_room)
-
     if max_tokens < ANSWER_MIN_OUTPUT_TOKENS:
         logger.warning(
             "answer_call_budget: input=%d leaves only %d completion tokens under "
@@ -113,7 +141,6 @@ def _completion_budget(payload: str) -> tuple[int, int]:
         PROVIDER_TPM_LIMIT,
     )
     return max_tokens, input_tokens
-
 _INLINE_CITATION = re.compile(r"\s?\[\d{1,3}\]")
 
 
@@ -129,7 +156,6 @@ def _answer_history(
 ) -> list[dict[str, str]]:
     """
     Keep only what is needed to interpret the current query.
-
     The planner has already resolved references and the answer facts come
     from validated current evidence, so earlier assistant answers are not
     resent. A self-contained (longer) query gets no history at all; a short,
@@ -137,21 +163,17 @@ def _answer_history(
     """
     try:
         from planner.services.history import is_correction_query
-
         if is_correction_query(query):
             return []
     except Exception:
         logger.exception("correction-query detection failed; continuing safely")
-
     if not history or len(str(query or "").split()) > HISTORY_MAX_QUERY_WORDS:
         return []
-
     try:
         bounded = _bound_history(history, query)
     except Exception:
         logger.exception("history bounding failed; sending no history")
         return []
-
     trimmed: list[dict[str, str]] = []
     for message in bounded[-HISTORY_MAX_MESSAGES:]:
         if not isinstance(message, dict):
@@ -166,7 +188,6 @@ def _answer_history(
             }
         )
     return trimmed
-
 _NUMERIC_ONLY = re.compile(r"^[\s\d.,%₹$€£+\-]+$")
 _NOTE_TYPES = {"evidence_note", "source_resolution", "retrieval_assessment"}
 
@@ -250,7 +271,6 @@ def _compact_table(item: dict[str, Any], content: dict[str, Any]) -> dict[str, A
             packed.append([_cell(v) for v in row])
         else:
             packed.append(row)
-
     if (
         columns
         and packed
@@ -350,7 +370,6 @@ def _compact_item(item: Any) -> dict[str, Any]:
             compact["scope"] = "querypilot_product"
             compact["authoritative"] = True
             return compact
-
         is_note = source_type in _NOTE_TYPES
         compact["content"] = str(content)[
             : MAX_NOTE_CHARS if is_note else MAX_TEXT_CHARS_PER_ITEM
@@ -395,12 +414,8 @@ def _compact_item(item: Any) -> dict[str, Any]:
             if k in {"message", "error"}
         } or str(content)[:300]
     return compact
-
-
 _compact_item_for_prompt = _compact_item
-
 _PRODUCT_SECTION_HEADER = re.compile(r"^[A-Z][A-Z0-9 /&'().\-]{2,60}$")
-
 _PRODUCT_QUERY_STOPWORDS = frozenset(
     {
         "about",
@@ -455,12 +470,10 @@ def _split_product_sections(content: str) -> list[tuple[str, str]]:
     sections: list[tuple[str, str]] = []
     header = ""
     body: list[str] = []
-
     def flush() -> None:
         text = "\n".join(body).strip("\n")
         if header or text:
             sections.append((header, text))
-
     for raw_line in str(content).splitlines():
         line = raw_line.strip()
         if line and _PRODUCT_SECTION_HEADER.match(line):
@@ -496,13 +509,11 @@ def _relevant_product_sections(content: str, query: str, max_chars: int) -> str:
     sections = _split_product_sections(content)
     if not sections:
         return content
-
     tokens = [
         token
         for token in re.findall(r"[a-z0-9]+", str(query or "").lower())
         if len(token) > 2 and token not in _PRODUCT_QUERY_STOPWORDS
     ]
-
     if tokens:
         ranked = sorted(
             range(len(sections)),
@@ -513,11 +524,9 @@ def _relevant_product_sections(content: str, query: str, max_chars: int) -> str:
         )
     else:
         ranked = list(range(len(sections)))
-
     def section_text(index: int) -> str:
         header, body = sections[index]
         return f"{header}\n\n{body}".strip() if header else body
-
     selected: list[int] = []
     used = 0
     for index in ranked:
@@ -526,10 +535,8 @@ def _relevant_product_sections(content: str, query: str, max_chars: int) -> str:
             continue
         selected.append(index)
         used += length
-
     if not selected:
         return content
-
     return "\n\n".join(section_text(index) for index in sorted(selected))
 
 
@@ -649,7 +656,6 @@ def _reduce_covered_tables(
         population, aggregate_text = entry
         if population < len(rows):
             continue
-
         if not any(str(c).lower() in aggregate_text for c in content["columns"]):
             continue
         flags = _anchored_rows(rows, anchors)
@@ -670,7 +676,6 @@ def _dedupe_rows_across_items(items: list[dict[str, Any]]) -> list[dict[str, Any
     left with nothing but duplicates is dropped unless it carries its own
     semantics (ranking/aggregate type, message); then it keeps that and points
     to the item that holds the rows.
-
     Ranking / positional execution results are never touched: their rows ARE
     the answer (an ordered, limited selection), not a redundant copy.
     """
@@ -703,8 +708,6 @@ def _dedupe_rows_across_items(items: list[dict[str, Any]]) -> list[dict[str, Any
         else:
             drop.add(pos)
     return [item for pos, item in enumerate(items) if pos not in drop]
-
-
 _QUESTION_FILLER = frozenset(
     {
         "a",
@@ -752,22 +755,50 @@ _QUESTION_FILLER = frozenset(
 
 
 def _word_roots(text: Any) -> set[str]:
-    """Lower-case words without plurals, filler words and bare numbers."""
+    """Normalize common column/query wording before matching schema terms."""
     spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(text or ""))
     words = re.findall(r"[a-z0-9]+", spaced.lower())
-    return {
-        word[:-1] if len(word) > 3 and word.endswith("s") else word
-        for word in words
-        if word not in _QUESTION_FILLER and not word.isdigit()
+    aliases = {
+        "monthly": "month",
+        "quarterly": "quarter",
+        "percentage": "percent",
+        "percentages": "percent",
+        "pct": "percent",
+        "avg": "average",
+        "q1": "quarter",
+        "q2": "quarter",
+        "q3": "quarter",
+        "q4": "quarter",
     }
+    roots: set[str] = set()
+    for word in words:
+        if word in _QUESTION_FILLER or word.isdigit():
+            continue
+        root = word[:-1] if len(word) > 3 and word.endswith("s") else word
+        roots.add(aliases.get(root, root))
+    return roots
 
 
 def _cell_is_mentioned(cell: Any, question: str) -> bool:
-    """A text cell value that the question itself names (a filter value)."""
+    """Match a complete cell value or a meaningful token within a named value.
+    The token fallback handles questions such as ``FrostLine's`` when a cell
+    contains ``FrostLine Systems``, and month values such as ``July 2025`` when
+    the question lists ``July to September 2025``.
+    """
     if not isinstance(cell, str) or len(cell.strip()) < 3:
         return False
-    pattern = rf"(?<![a-z0-9]){re.escape(cell.strip().lower())}(?![a-z0-9])"
-    return bool(re.search(pattern, question.lower()))
+    cell_text = cell.strip().lower()
+    question_text = str(question or "").lower()
+    pattern = rf"(?<![a-z0-9]){re.escape(cell_text)}(?![a-z0-9])"
+    if re.search(pattern, question_text):
+        return True
+    for token in re.findall(r"[a-z][a-z0-9&'-]*", cell_text):
+        if len(token) < 4 or token in _CELL_VALUE_STOPWORDS:
+            continue
+        token_pattern = rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])"
+        if re.search(token_pattern, question_text):
+            return True
+    return False
 
 
 def _columns_to_keep(
@@ -776,8 +807,20 @@ def _columns_to_keep(
     question: str,
     question_words: set[str],
 ) -> list[int]:
-    """Identifier and name columns, columns the question names, and columns
-    holding a value the question mentions."""
+    """Choose safe columns to retain during last-resort budget compaction.
+    Full-content requests retain every column. Calculation/decision queries
+    also retain numeric measure columns even when the user describes the
+    business rule (for example, an SLA breach) rather than the exact header
+    (for example, ``uptime_pct``).
+    """
+    full_content_request = bool(
+        _FULL_CONTENT_QUERY_RE.search(question)
+        and _TABLE_CONTENT_QUERY_RE.search(question)
+    )
+    schema_request = bool(_SCHEMA_QUERY_RE.search(question))
+    if full_content_request or schema_request:
+        return list(range(len(columns)))
+    analytic_query = bool(_ANALYTIC_QUERY_RE.search(question))
     keep: list[int] = []
     for position, column in enumerate(columns):
         roots = _word_roots(column)
@@ -786,7 +829,23 @@ def _columns_to_keep(
         has_mentioned_value = any(
             _cell_is_mentioned(row[position], question) for row in rows
         )
-        if is_key_or_identity or is_named or has_mentioned_value:
+        is_measure = bool(roots & _MEASURE_COLUMN_WORDS)
+        has_numeric_value = any(
+            (isinstance(row[position], (int, float)) and not isinstance(row[position], bool))
+            or (
+                isinstance(row[position], str)
+                and bool(_NUMERIC_ONLY.fullmatch(row[position].strip()))
+                and any(ch.isdigit() for ch in row[position])
+            )
+            for row in rows
+        )
+        keep_measure_for_calculation = analytic_query and is_measure and has_numeric_value
+        if (
+            is_key_or_identity
+            or is_named
+            or has_mentioned_value
+            or keep_measure_for_calculation
+        ):
             keep.append(position)
     return keep
 
@@ -803,11 +862,9 @@ def _project_columns(
     rows = content["rows"]
     if not all(isinstance(row, list) and len(row) == len(columns) for row in rows):
         return False
-
     keep = _columns_to_keep(columns, rows, question, question_words)
     if not keep or len(keep) == len(columns):
         return False
-
     content["columns_omitted_from_prompt"] = [
         c for j, c in enumerate(columns) if j not in keep
     ]
@@ -830,6 +887,26 @@ def _project_largest_table(items: list[dict[str, Any]], question: str) -> bool:
         if _project_columns(item, question, question_words):
             return True
     return False
+
+
+def _query_row_match_scores(
+    columns: list[str], rows: list[Any], question: str
+) -> list[int]:
+    """Score rows by how many explicit query values they contain.
+    This keeps a named entity and its requested period together when the final
+    budget fallback must remove unrelated rows from a large table.
+    """
+    if not question:
+        return [0] * len(rows)
+    scores: list[int] = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) != len(columns):
+            scores.append(0)
+            continue
+        scores.append(
+            sum(_cell_is_mentioned(value, question) for value in row)
+        )
+    return scores
 
 
 def _rows_that_fit(rows: list[Any], deficit: int) -> int:
@@ -875,7 +952,6 @@ def _fit_to_budget(
                 : int(len(biggest["content"]) * 0.7)
             ]
             continue
-
         products = [
             i
             for i in items
@@ -886,7 +962,6 @@ def _fit_to_budget(
         if products:
             biggest = max(products, key=lambda i: len(i["content"]))
             deficit = _size(items) - budget_chars
-
             target = max(len(biggest["content"]) - deficit - 160, 600)
             if target < len(biggest["content"]):
                 reduced = _relevant_product_sections(
@@ -913,9 +988,15 @@ def _fit_to_budget(
         content = biggest["content"]
         rows = content["rows"]
         flags = _anchored_rows(rows, anchors)
-        order = [i for i, f in enumerate(flags) if f] + [
-            i for i, f in enumerate(flags) if not f
-        ]
+        query_scores = _query_row_match_scores(
+            content.get("columns") or [], rows, query
+        )
+        # Existing evidence anchors remain strongest; within each group, keep
+        # rows matching the entity/period/value filters expressed by the query.
+        order = sorted(
+            range(len(rows)),
+            key=lambda i: (not flags[i], -query_scores[i], i),
+        )
         keep_count = _rows_that_fit(rows, deficit=_size(items) - budget_chars)
         keep_idx = sorted(order[:keep_count])
         content["source_rows"] = content.get("source_rows", len(rows))
@@ -929,7 +1010,6 @@ def _fit_to_budget(
             "answer evidence still over budget after compaction: chars=%d", _size(items)
         )
     return items
-
 _NOTE_SOURCE_TYPES = _NOTE_TYPES | {
     "evidence_note",
     "document_coverage",
@@ -983,9 +1063,6 @@ def _contradicted_note(item: Any, titles: set[str]) -> bool:
     return any(title in blob for title in titles)
 
 
-
-
-
 def _log_evidence_debug(stage: str, items: list[dict[str, Any]]) -> None:
     """One line per table: rows the answer model really receives."""
     for item in items:
@@ -1014,7 +1091,6 @@ def _canonical_answer_evidence(
 ) -> list[dict[str, Any]]:
     """
     Raw stored evidence -> compact canonical answer evidence.
-
     citation_index is the item's 1-based position in the stored evidence, set
     BEFORE any item is merged away, and never renumbered afterwards. It is an
     internal item id; the answer text itself carries no citation markers.
@@ -1041,7 +1117,6 @@ def _canonical_answer_evidence(
         items.append({"citation_index": position, **compact})
     items = _dedupe_notes(items)
     items = _dedupe_rows_across_items(items)
-
     if _size(items) > budget_chars:
         items = _reduce_covered_tables(items, anchors)
         items = _dedupe_rows_across_items(items)
@@ -1109,7 +1184,6 @@ def _missing_population_keys(answer: str, contract: dict[str, Any] | None) -> li
         return []
     text = str(answer or "")
     return [str(k) for k in contract.get("matched_keys", []) if str(k) not in text]
-
 _FOREIGN_CURRENCY = re.compile(r"(?:USD|US\$|\$\s?\d|EUR|€|£|GBP)")
 _CURRENCY_PREFIX = re.compile(r"(?<![A-Za-z])(?:US\$|\$|₹|Rs\.?|INR)\s?(?=\d)")
 
@@ -1117,7 +1191,6 @@ _CURRENCY_PREFIX = re.compile(r"(?<![A-Za-z])(?:US\$|\$|₹|Rs\.?|INR)\s?(?=\d)"
 def _default_currency_symbol() -> str | None:
     try:
         from django.conf import settings
-
         symbol = getattr(
             settings, "QUERYPILOT_CURRENCY_SYMBOL", DEFAULT_CURRENCY_SYMBOL
         )
@@ -1216,10 +1289,6 @@ def _prepare_request(
         items,
         contract,
     )
-
-
-
-
 _INTERNAL_MARKER = re.compile(r" ?【[^】]*】")
 
 
@@ -1229,7 +1298,6 @@ def _clean_answer(content: str) -> str:
     cleaned = "\n".join(line.rstrip() for line in cleaned.split("\n"))
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
-
 _MARKER = re.compile(r" ?\[(\d{1,3})\]")
 _GROUPED_MARKER = re.compile(r"\[(\d{1,3}(?:\s*,\s*\d{1,3})+)\]")
 _RANGE_MARKER = re.compile(r"\[(\d{1,3})\s*[-–]\s*(\d{1,3})\]")
@@ -1238,13 +1306,11 @@ _RANGE_MARKER = re.compile(r"\[(\d{1,3})\s*[-–]\s*(\d{1,3})\]")
 def _expand_grouped_markers(text: str) -> str:
     def expand_group(match: re.Match[str]) -> str:
         return "".join(f"[{int(n)}]" for n in match.group(1).split(","))
-
     def expand_range(match: re.Match[str]) -> str:
         start, end = int(match.group(1)), int(match.group(2))
         if start <= end and end - start <= 5:
             return "".join(f"[{n}]" for n in range(start, end + 1))
         return match.group(0)
-
     return _RANGE_MARKER.sub(expand_range, _GROUPED_MARKER.sub(expand_group, text))
 
 
@@ -1255,7 +1321,6 @@ def _parse_answer(
     items: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[int]]:
     """Accept the plain-text/Markdown answer returned by the model.
-
     No JSON and no citations are required. Any legacy inline markers are
     stripped. The second tuple value is always empty and only kept so
     existing callers keep working. `valid` and `items` are accepted for the
@@ -1275,7 +1340,6 @@ def _parse_answer_response(
     """Return the final plain-text Markdown answer."""
     answer_text, _ = _parse_answer(raw)
     return answer_text
-
 _EXHAUSTION_MARKERS = (
     "json_validate_failed",
     "max completion tokens reached",
@@ -1321,7 +1385,6 @@ def _failed_generation_text(exc: BaseException) -> str | None:
 
 def _router_options(effort: str | None, method: Any = None) -> dict[str, Any]:
     """Pass reasoning_effort only if the router method declares it explicitly.
-
     `method` defaults to router.generate; the streaming path passes
     router.generate_stream so its own signature is the one inspected.
     """
@@ -1340,7 +1403,6 @@ def _router_options(effort: str | None, method: Any = None) -> dict[str, Any]:
         getattr(target, "__qualname__", target),
     )
     return {}
-
 _CALCULATION_QUERY = re.compile(
     r"\b(?:calculat\w*|comput\w*|sum|average|mean|median|percent\w*|ratio|"
     r"differenc\w*|deduct\w*|net|gross|round\w*|monthly|annual\w*|yearly|"
@@ -1371,7 +1433,6 @@ def _evidence_document_ids(evidence: list[Any] | None) -> set[Any]:
 
 def _calculation_complexity(query: str, evidence: list[Any] | None = None) -> str:
     """Generic complexity class of the requested computation.
-
     Looks only at the question's arithmetic intent and at how many distinct
     source documents the evidence draws on; it knows nothing about any
     domain, column, file or format.
@@ -1381,8 +1442,6 @@ def _calculation_complexity(query: str, evidence: list[Any] | None = None) -> st
     if len(_evidence_document_ids(evidence)) >= 2:
         return "multi_step"
     return "arithmetic"
-
-
 _EFFORT_BY_COMPLEXITY = {
     "none": lambda: DEFAULT_REASONING_EFFORT,
     "arithmetic": lambda: CALCULATION_REASONING_EFFORT,
@@ -1468,7 +1527,6 @@ def generate_answer(
     conversation_history: list[dict[str, Any]] | None = None,
 ) -> str:
     """Generate the complete user-facing answer in one request.
-
     Normal path: exactly one call. A second call happens only after
     finish=length and only when the individual retry request has enough
     per-call provider room.
@@ -1509,7 +1567,6 @@ def generate_answer(
         logger.warning(
             "answer completion exhausted (%s); attempting recovery", type(exc).__name__
         )
-
         partial = _failed_generation_text(exc)
         partial_text = partial
         if partial:
