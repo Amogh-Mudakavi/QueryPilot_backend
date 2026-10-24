@@ -14,11 +14,14 @@ category_hint = metadata | structured | document | mixed | conversation | produc
 operation = describe | lookup | aggregate | calculate | filter | compare | list | overview | answer
 references = exact names/phrases the user actually refers to
 requested_fields = attributes explicitly requested
+data_sources_needed = exact workspace_catalog titles of OTHER sources that must also be read (see rules); [] when none
 reason = <=15 words
 
 Rules:
 - Copy references exactly; never invent canonical names. Keep ALL named sources.
 - Mixed = the answer needs both table data and document text: a calculation combining a rule/policy/formula in one source with data in another, OR a figure, rate, period or measurement that the named source may not itself contain. When unsure whether the needed data sits in a table elsewhere in workspace_catalog, choose mixed.
+- data_sources_needed: decide this first. Does the answer depend on recorded values (measurements, transactions, counts, dates, statuses for a particular period, entity or item) that the sources the user named cannot themselves contain? A rule, contract, policy or specification states what should hold; whether it held, or what follows from it, needs the records. If so, list the exact `title` of every workspace_catalog entry whose columns could hold those values, even when likely_relevant is false (that flag only reflects the wording of the question). Otherwise return []. Never list a title that is not in workspace_catalog, and never list a source merely because it exists.
+- If data_sources_needed is not empty, category_hint must be mixed.
 - Table content is structured; file/table catalog questions are metadata.
 - "first/second/last/nth" preserves position semantics. Deterministic resolution handles ambiguity later.
 - For contextual follow-ups, use history only when the subject is unambiguous; a self-contained query does not inherit prior topic/files.
@@ -35,6 +38,10 @@ ACTION_SCHEMA = {
         "schema": {
             "type": "object",
             "properties": {
+                "data_sources_needed": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
                 "category_hint": {
                     "type": "string",
                     "enum": [
@@ -71,6 +78,7 @@ ACTION_SCHEMA = {
                 "reason": {"type": "string"},
             },
             "required": [
+                "data_sources_needed",
                 "category_hint",
                 "operation",
                 "references",

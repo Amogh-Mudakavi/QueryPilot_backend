@@ -349,7 +349,10 @@ def build_execution_plan(
     if cross_document:
         capabilities: list[str] = []
         actions: list[str] = []
-        if has_structured_sources:
+        # A mixed request is defined as needing table data plus document
+        # text; it must schedule TABLE_QUERY even when the sources resolved
+        # so far have no extracted tables (the data source is discovered).
+        if has_structured_sources or category == "mixed":
             capabilities.append("TABLE_QUERY")
             actions.append("table_query")
 

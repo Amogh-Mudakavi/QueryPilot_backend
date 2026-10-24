@@ -545,6 +545,117 @@ def _apply_scope_route(state: AgentState, plan: dict[str, Any]) -> dict[str, Any
     }
 
 
+# --- SUPPORTING_SOURCE_DISCOVERY (patch) ----------------------------------
+# Reference resolution only finds sources the user NAMED. A contract/policy
+# can state a rule but never holds the records the rule is applied to, so a
+# question like "was X met in period P?" resolved only the rule document and
+# stayed document-only (cross_document=False). The planner already sees the
+# authorized workspace_catalog (titles + column digest); it now declares which
+# other catalog sources the answer needs (`data_sources_needed`). Code does not
+# trust the title: it is resolved with the same exact-match resolver used for
+# user-named sources, against the authorized catalog only.
+MAX_SUPPORTING_SOURCES = 3
+
+
+def _add_planner_supporting_sources(
+    *,
+    state: AgentState,
+    understanding: dict[str, Any],
+    resolution: dict[str, Any],
+    schema: list[dict[str, Any]],
+    catalog: list[dict[str, Any]],
+    authorized_ids: list[int] | None,
+) -> tuple[dict[str, Any], dict[str, Any], list[int]]:
+    """Add planner-declared supporting sources to the resolved sources.
+
+    Returns (understanding, resolution, added_document_ids); unchanged inputs
+    and [] when nothing applies."""
+    raw = understanding.get("data_sources_needed")
+    if not isinstance(raw, list) or state.get("scope_route") == "PRODUCT":
+        return understanding, resolution, []
+    hint = str(understanding.get("category_hint") or "").strip().lower()
+    if hint in {"conversation", "product", "metadata"}:
+        return understanding, resolution, []
+
+    titles: list[str] = []
+    for value in raw:
+        title = str(value or "").strip()
+        if title and title not in titles:
+            titles.append(title)
+    titles = titles[:MAX_SUPPORTING_SOURCES]
+    if not titles:
+        return understanding, resolution, []
+
+    already: set[int] = set()
+    for item in resolution.get("references", []) or []:
+        match = item.get("match") if isinstance(item, dict) else None
+        if (
+            isinstance(item, dict)
+            and item.get("status") == "RESOLVED"
+            and isinstance(match, dict)
+            and match.get("type") in {"document", "table"}
+        ):
+            document_id = _coerce_int(match.get("document_id"))
+            if document_id is not None:
+                already.add(document_id)
+
+    found = resolve_references(
+        workspace_id=state["workspace_id"],
+        references=titles,
+        category_hint="document",
+        schema=schema,
+        catalog=catalog,
+    )
+    allowed = None if authorized_ids is None else {int(v) for v in authorized_ids}
+
+    references = [dict(item) for item in resolution.get("references", []) or []]
+    added: list[int] = []
+    for item in found.get("references", []) or []:
+        match = item.get("match") if isinstance(item, dict) else None
+        if item.get("status") != "RESOLVED" or not isinstance(match, dict):
+            logger.info(
+                "supporting source %r not used: status=%s",
+                item.get("reference"),
+                item.get("status"),
+            )
+            continue
+        if match.get("type") not in {"document", "table"}:
+            continue
+        document_id = _coerce_int(match.get("document_id"))
+        if document_id is None or document_id in already or document_id in added:
+            continue
+        if allowed is not None and document_id not in allowed:
+            continue
+        references.append(
+            {
+                "reference": item.get("reference"),
+                "status": "RESOLVED",
+                "match": {**match, "origin": "planner_data_source"},
+            }
+        )
+        added.append(document_id)
+
+    if not added:
+        return understanding, resolution, []
+
+    new_understanding = dict(understanding)
+    if hint == "document":
+        # Same invariant the planner prompt states: needing recorded data from
+        # another source IS a mixed request.
+        new_understanding["category_hint"] = "mixed"
+    new_resolution = {**resolution, "references": references, "has_resolved": True}
+    logger.info(
+        "supporting sources added: document_ids=%s (category_hint %s -> %s)",
+        added,
+        hint,
+        new_understanding.get("category_hint"),
+    )
+    return new_understanding, new_resolution, added
+
+
+# --- END SUPPORTING_SOURCE_DISCOVERY ---------------------------------------
+
+
 def _log_planner_decision(plan: dict[str, Any]) -> None:
     """One concise line: what was chosen and why. Never logs prompt text."""
     decision = plan.get("decision") or {}
@@ -671,6 +782,20 @@ def agent_node(state: AgentState) -> dict[str, Any]:
             resolution = _resolve_contextual_references(state, resolution)
         except Exception:
             logger.exception("Contextual reference resolution failed; continuing")
+
+        try:
+            understanding, resolution, _supporting_ids = (
+                _add_planner_supporting_sources(
+                    state=state,
+                    understanding=understanding,
+                    resolution=resolution,
+                    schema=resolver_schema,
+                    catalog=resolver_catalog,
+                    authorized_ids=authorized_ids,
+                )
+            )
+        except Exception:
+            logger.exception("Supporting-source resolution failed; continuing")
 
         plan = _build_plan(state, understanding, resolution)
 
