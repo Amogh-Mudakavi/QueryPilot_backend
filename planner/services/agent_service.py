@@ -3762,6 +3762,11 @@ def _probe_stored_values(
             column = str(column)
             if '"' in column or table_name not in allowed:
                 continue
+            numeric_names = {
+                str(c) for c in by_name[table_name].get("numeric_columns") or []
+            }
+            if column in numeric_names:
+                continue  # numbers do not help fix a text/period filter
             budget_left -= 1
             try:
                 result = query_tables(
@@ -3777,6 +3782,8 @@ def _probe_stored_values(
                 if _is_infrastructure_error(str(exc)):
                     raise AgentRuntimeError(str(exc), code="DATABASE_ERROR") from exc
                 continue
+            if column in (result.get("date_columns") or {}):
+                continue  # shown converted, not as stored; sample_rows has the raw form
             values = [
                 r.get(column)
                 for r in result.get("rows", [])
