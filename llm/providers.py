@@ -31,7 +31,7 @@ import random
 import re
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator  # QP-FIX-1
 
 from groq import Groq
 
@@ -677,6 +677,7 @@ class GroqProvider:
         reasoning_effort: str | None = None,
         timeout: float | None = None,
         input_hint: int | None = None,
+        on_finish: Callable[[str | None], None] | None = None,  # QP-FIX-1
     ) -> Iterator[str]:
         """Yield plain text deltas; Groq chunk structures stay in this file.
 
@@ -696,13 +697,22 @@ class GroqProvider:
             timeout=timeout,
             input_hint=input_hint,
         )
+        finish_reason = None  # QP-FIX-1
         try:
             for chunk in response:
                 for choice in getattr(chunk, "choices", None) or []:
+                    reason = getattr(choice, "finish_reason", None)  # QP-FIX-1
+                    if reason is not None:
+                        finish_reason = reason
                     delta = getattr(choice, "delta", None)
                     content = getattr(delta, "content", None) if delta else None
                     if content:
                         yield content
+            if on_finish is not None:  # QP-FIX-1
+                try:
+                    on_finish(finish_reason)
+                except Exception:
+                    logger.exception("[LLM] on_finish callback failed")
         except Exception as exc:
             logger.exception(
                 "[LLM] stream failed after start: task=%s model=%s", task, model

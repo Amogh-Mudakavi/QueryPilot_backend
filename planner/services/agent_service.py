@@ -1049,6 +1049,53 @@ def _table_scope(state: AgentState) -> set[str] | None:
     return {str(name) for name in scope} if scope else None
 
 
+def _join_table_scope(state: AgentState) -> set[str] | None:  # QP-FIX-3
+    """Tables the key join may look up.
+
+    Table selection runs BEFORE any row is read, so it can skip a sibling
+    table that only becomes needed once a row shows a foreign key. The join
+    already searches tables by those key values, but it only searched the
+    selected ones. Here the scope is widened to every table of a document that
+    contributes at least one non-rule selected table. Rule-only documents stay
+    out. The join itself still limits tables to the request's documents and
+    returns only rows that match the keys.
+    """
+    scope = _table_scope(state)
+    if not scope:
+        return scope
+    roles = {
+        str(name): str(role or "").strip().lower()
+        for name, role in (state.get("table_roles") or {}).items()
+    }
+    try:
+        index = _resources(state).table_index()
+    except Exception:
+        logger.exception("join scope widening failed; using selected tables only")
+        return scope
+    document_of = {
+        str(item.get("table_name")): _coerce_int(item.get("document_id"))
+        for item in index
+    }
+    data_documents = {
+        document_of[name]
+        for name in scope
+        if document_of.get(name) is not None and roles.get(name) != "rule"
+    }
+    if not data_documents:
+        return scope
+    widened = set(scope) | {
+        name for name, doc_id in document_of.items() if doc_id in data_documents
+    }
+    added = sorted(widened - scope)
+    if added:
+        logger.info(
+            "cross-document join scope widened by %d sibling table(s): %s",
+            len(added),
+            added,
+        )
+    return widened
+
+
 def _in_table_scope(
     state: AgentState,
     items: list[dict[str, Any]],
@@ -2088,7 +2135,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
                     structured=structured,
                     documents=documents,
                     skip_text_document_ids=_documents_without_text(coverage_info),
-                    allowed_table_names=_table_scope(state),
+                    allowed_table_names=_join_table_scope(state),  # QP-FIX-3
                     table_roles=state.get("table_roles", {}),
                 )
             except Exception:
@@ -2323,6 +2370,16 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         }
 
 
+# QP-FIX-2: said to the user when even the fitted evidence cannot be answered
+# in one pass. Nothing is guessed from partial data.
+_EVIDENCE_TOO_LARGE_MESSAGE = (
+    "The evidence needed for this question is too large for me to answer "
+    "reliably in one pass, so I stopped instead of guessing from partial data. "
+    "Please ask about fewer items at a time (for example one record or one "
+    "category per question)."
+)
+
+
 def _stream_answer_with_fit(  # QP-PATCH
     *,
     query: str,
@@ -2350,11 +2407,18 @@ def _stream_answer_with_fit(  # QP-PATCH
         evidence=evidence,
         conversation_history=conversation_history,
     )
-    yield from generate_answer_stream(
-        query=query,
-        evidence=fitted,
-        conversation_history=conversation_history,
-    )
+    try:  # QP-FIX-2
+        yield from generate_answer_stream(
+            query=query,
+            evidence=fitted,
+            conversation_history=conversation_history,
+        )
+    except EvidenceTooLarge:
+        logger.error(
+            "answer_evidence_too_large_final: evidence does not fit even after "
+            "fitting; answering with an explicit notice, no partial data used"
+        )
+        yield _EVIDENCE_TOO_LARGE_MESSAGE
 
 
 def finish_node(state: AgentState) -> dict[str, Any]:
@@ -3695,6 +3759,109 @@ def _document_ids_from_text_evidence(items: list[Any]) -> set[int]:
     return result
 
 
+# QP-FIX-4: facts found in table ROWS drive extra text searches. A rule such
+# as "members get extra days" is written in prose and the question never says
+# it; only a row value ("<flag column> = Yes") reveals that it matters.
+_FACT_MIN_ROWS = 4  # tables smaller than this are not "populations"
+_FACT_MAX_DISTINCT = 6  # a column is a category/flag only if it has few values
+_FACT_MAX_VALUE_CHARS = 30
+_FACT_MAX_QUERIES = 3
+_FACT_INCLUDE_QUESTION = False  # True: append the question to each fact query
+_FACT_NUMERIC = re.compile(r"^[\s\d.,%+\-/:]+$")
+
+
+def _row_fact_phrases(state: AgentState, structured: list[Any]) -> list[str]:
+    """'<column name> <value> <value>' for low-variety text columns.
+
+    Skips rule tables, id-like columns, numbers, dates and long text. Columns
+    with the fewest distinct values (flags, tiers, statuses) come first.
+    """
+    from retrieval.services.keys import is_id_column
+
+    roles = {
+        str(name): str(role or "").strip().lower()
+        for name, role in (state.get("table_roles") or {}).items()
+    }
+    scored: list[tuple[int, str]] = []
+    for item in structured or []:
+        content = item.get("content") if isinstance(item, dict) else None
+        if not isinstance(content, dict):
+            continue
+        rows = [r for r in (content.get("rows") or []) if isinstance(r, dict)]
+        if len(rows) < _FACT_MIN_ROWS:
+            continue
+        names = {
+            str(s.get("table_name"))
+            for s in item.get("sources") or []
+            if isinstance(s, dict) and s.get("table_name")
+        }
+        if names and all(roles.get(name) == "rule" for name in names):
+            continue
+        columns = [str(c) for c in (content.get("columns") or list(rows[0]))]
+        for column in columns:
+            if is_id_column(column):
+                continue
+            values = [
+                str(r.get(column)).strip()
+                for r in rows
+                if r.get(column) not in (None, "")
+            ]
+            distinct = list(dict.fromkeys(values))
+            if len(distinct) < 2:
+                continue
+            if len(distinct) > min(_FACT_MAX_DISTINCT, max(2, len(rows) // 2)):
+                continue
+            if any(
+                len(v) > _FACT_MAX_VALUE_CHARS or _FACT_NUMERIC.match(v)
+                for v in distinct
+            ):
+                continue
+            label = re.sub(
+                r"[_\s]+", " ", re.sub(r"([a-z])([A-Z])", r"\1 \2", column)
+            ).strip()
+            scored.append((len(distinct), f"{label} {' '.join(distinct)}"))
+    scored.sort(key=lambda pair: pair[0])
+    phrases = list(dict.fromkeys(text for _, text in scored))
+    return phrases[:_FACT_MAX_QUERIES]
+
+
+def _search_row_facts(
+    state: AgentState,
+    phrases: list[str],
+    allowed_ids: Any,
+    base_query: str,
+    already_loaded: set[int],
+) -> list[Any]:
+    """Text chunks found through row facts, from documents NOT yet loaded."""
+    hits: list[Any] = []
+    seen: set[tuple[Any, Any]] = set()
+    for phrase in phrases:
+        text = f"{phrase} {base_query}" if _FACT_INCLUDE_QUESTION else phrase
+        try:
+            found = search_evidence(
+                query=text,
+                workspace_id=int(state["workspace_id"]),
+                allowed_document_ids=allowed_ids,
+            )
+        except Exception:
+            logger.exception("row-fact text search failed: %r", phrase)
+            continue
+        if found.get("error_code"):
+            continue
+        for item in found.get("evidence", []) or []:
+            if not isinstance(item, dict):
+                continue
+            if _document_ids_from_text_evidence([item]) & already_loaded:
+                continue
+            meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            ident = (item.get("document_id"), meta.get("chunk_index"))
+            if ident in seen:
+                continue
+            seen.add(ident)
+            hits.append(item)
+    return hits
+
+
 def _supplement_dependency_evidence(
     state: AgentState,
     document_result: dict[str, Any],
@@ -3739,6 +3906,27 @@ def _supplement_dependency_evidence(
 
     supplemental = _mark_success(list(discovered.get("evidence", []) or []))
     primary = list(document_result.get("evidence", []) or [])
+    coverage_query = query  # QP-FIX-4
+    _fact_phrases = _row_fact_phrases(state, list(structured or []))
+    if _fact_phrases:
+        _fact_hits = _mark_success(
+            _search_row_facts(
+                state,
+                _fact_phrases,
+                allowed_ids,
+                query,
+                _document_ids_from_text_evidence(primary),
+            )
+        )
+        logger.info(
+            "row-fact text search: phrases=%s new_chunks=%d new_document_ids=%s",
+            _fact_phrases,
+            len(_fact_hits),
+            sorted(_document_ids_from_text_evidence(_fact_hits)),
+        )
+        if _fact_hits:
+            supplemental = _fact_hits + supplemental
+            coverage_query = f"{query} {' '.join(_fact_phrases)}"
     if not supplemental:
         return {**document_result, "dependency_evidence_found": False}
 
@@ -3771,7 +3959,7 @@ def _supplement_dependency_evidence(
             covered = _run_documents_with_coverage(
                 state,
                 dependency_ids,
-                query,
+                coverage_query,
                 require_complete=False,
                 budget_chars=max(_dep_room, _DEPENDENCY_MIN_CHARS),
             )

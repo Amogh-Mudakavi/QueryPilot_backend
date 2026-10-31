@@ -32,6 +32,11 @@ MIN_EVIDENCE_CHARS = 4000
 RETURN_PARTIAL_ON_BUDGET_EXHAUSTION = True
 PARTIAL_ANSWER_MIN_CHARS = 120
 PARTIAL_ANSWER_NOTICE = "\n\n_Note: this answer was cut short and may be incomplete._"
+# QP-FIX-1: appended to a STREAMED answer that stopped on finish_reason=length.
+STREAM_TRUNCATED_NOTICE = (
+    "\n\n_Note: this answer was cut short because it reached its length limit "
+    "and is incomplete. Ask for fewer items at a time to get the full result._"
+)
 REQUEST_OVERHEAD_TOKENS = MESSAGE_OVERHEAD_TOKENS * 2 + 1
 CHARS_PER_TOKEN = CHARS_PER_TOKEN_ESTIMATE
 MAX_TEXT_CHARS_PER_ITEM = 1800
@@ -1674,6 +1679,7 @@ def generate_answer_stream(
         effort,
         options.get("reasoning_effort"),
     )
+    finish_seen: list[str | None] = []  # QP-FIX-1
     stream = router.generate_stream(
         task="answer_generation",
         messages=[
@@ -1683,6 +1689,7 @@ def generate_answer_stream(
         temperature=0.0,
         max_tokens=max_tokens,
         include_reasoning=False,
+        on_finish=finish_seen.append,
         **options,
     )
     yielded_any = False
@@ -1692,6 +1699,18 @@ def generate_answer_stream(
             yield delta
     if not yielded_any:
         raise ValueError("Answer LLM returned an empty streaming response.")
+    finish_reason = finish_seen[0] if finish_seen else None
+    logger.info("answer_stream_finish: finish_reason=%s", finish_reason)
+    if finish_reason == "length":
+        # The text is already with the user and cannot be taken back, so say
+        # plainly that it is incomplete instead of leaving a silent half answer.
+        logger.warning(
+            "answer_stream_truncated: finish_reason=length completion_cap=%d "
+            "payload_chars=%d",
+            max_tokens,
+            len(payload),
+        )
+        yield STREAM_TRUNCATED_NOTICE
 
 
 # ---------------------------------------------------------------------------

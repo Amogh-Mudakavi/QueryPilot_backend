@@ -116,6 +116,16 @@ TASK_PROFILES: dict[str, TaskProfile] = {
 
 TASK_MODELS = {name: profile.model for name, profile in TASK_PROFILES.items()}
 
+# QP-FIX-5: ordered fallbacks tried AFTER the task's own model. Used when the
+# model returns 429 on every key, is not found / rejected (a preview model can
+# disappear), or finishes with finish_reason=length (non-streaming calls).
+# Edit this dict only; no code change is needed to change the order.
+TASK_FALLBACK_MODELS: dict[str, tuple[str, ...]] = {
+    "planner": (MODEL_120B,),
+    "table_selection": (MODEL_120B,),
+    "sql_generation": (MODEL_120B,),
+}
+
 MAX_ATTEMPTS = 3
 RETRY_LIMITS = {
     "rate_limit": 2,  # hop to another key; the 429'd bucket is cooled
