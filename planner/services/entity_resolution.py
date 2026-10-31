@@ -188,11 +188,110 @@ def resolve_references(
                 }
             )
 
+    results = _narrow_ambiguous_by_resolved_context(results)  # QP-PATCH
+
     return {
         "references": results,
         "has_ambiguity": any(item["status"] == "AMBIGUOUS" for item in results),
         "has_resolved": any(item["status"] == "RESOLVED" for item in results),
     }
+
+
+_ID_LIKE_CELL = re.compile(r"^(?=.*\d)[a-z0-9][a-z0-9._\-]{2,39}$")  # QP-PATCH
+
+
+def _entity_row_cells(
+    connection,
+    table_name: str,
+    column: str,
+    value: str,
+    limit: int = 5,
+) -> set[str]:
+    """Lower-cased cells of the row(s) where `column` equals `value`."""
+    cells: set[str] = set()
+    try:
+        table_name = SQLiteManager.validate_identifier(table_name, "table name")
+        column = SQLiteManager.validate_identifier(column, "column name")
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT * FROM `{table_name}` "
+                f"WHERE LOWER(CAST(`{column}` AS CHAR)) = LOWER(%s) "
+                f"LIMIT {int(limit)}",
+                (value,),
+            )
+            for row in cursor.fetchall():
+                for cell in row:
+                    text = str(cell).strip().lower() if cell is not None else ""
+                    if text:
+                        cells.add(text)
+    except Exception:
+        return set()
+    return cells
+
+
+def _narrow_ambiguous_by_resolved_context(
+    results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Resolve an AMBIGUOUS entity reference using already-RESOLVED entities.
+
+    Example: 'laptop' matches two products, but order NM-10002 (RESOLVED) links
+    to exactly one of them through an identifier cell (e.g. P201). Narrowing
+    only happens when EXACTLY ONE candidate is linked; otherwise the reference
+    stays AMBIGUOUS and the user is asked, exactly as before.
+    """
+    resolved = [
+        item["match"]
+        for item in results
+        if item.get("status") == "RESOLVED"
+        and isinstance(item.get("match"), dict)
+        and item["match"].get("type") == "entity"
+        and item["match"].get("locations")
+    ]
+    ambiguous = [
+        item
+        for item in results
+        if item.get("status") == "AMBIGUOUS"
+        and any(m.get("type") == "entity" for m in item.get("matches", []))
+    ]
+    if not resolved or not ambiguous:
+        return results
+
+    connection = connections[STRUCTURED_READ_DB]
+    try:
+        context: set[str] = set()
+        for entity in resolved:
+            for loc in entity["locations"]:
+                context |= _entity_row_cells(
+                    connection, loc["table_name"], loc["column"], entity["value"]
+                )
+        if not context:
+            return results
+        context_norm = {normalize_text(c) for c in context}
+
+        for item in ambiguous:
+            linked: list[dict[str, Any]] = []
+            for match in item["matches"]:
+                if match.get("type") != "entity":
+                    continue
+                cells: set[str] = set()
+                for loc in match.get("locations", []):
+                    cells |= _entity_row_cells(
+                        connection, loc["table_name"], loc["column"], match["value"]
+                    )
+                id_overlap = {
+                    c for c in cells if _ID_LIKE_CELL.match(c) and c in context
+                }
+                name_hit = normalize_text(match.get("value", "")) in context_norm
+                if id_overlap or name_hit:
+                    linked.append(match)
+            if len(linked) == 1:
+                item["status"] = "RESOLVED"
+                item["match"] = linked[0]
+                item.pop("matches", None)
+    finally:
+        connection.close()
+
+    return results
 
 
 def _human_table_name(
@@ -541,7 +640,13 @@ def _match_name_values(
                     f"AND LOWER(CAST(`{column}` AS CHAR)) LIKE %s "
                     f"LIMIT 50"
                 )
-                params = (f"%{raw_query.lower()}%",)
+                _escaped = (  # QP-PATCH
+                    raw_query.lower()
+                    .replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
+                )
+                params = (f"%{_escaped}%",)
 
             specs.append((column, where, params))
 

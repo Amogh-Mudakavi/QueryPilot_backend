@@ -42,11 +42,12 @@ CALCULATIONS
 - A year is 12 months and a week is 7 days.
 - Do not add deductions, fees, taxes, exemptions, or conversions that the evidence does not state.
 - For sums, averages, and counts, include every row in scope exactly once.
-- Percent rules: x% of y = y x x / 100.
-- "A is what percent of B" = A / B x 100.
+- Percent rules: x% of y = y * x / 100.
+- "A is what percent of B" = A / B * 100.
 - Apply any filter or threshold to the value in the exact form the question names.
 - Sort only after every value is final.
 - Sort numerically and keep source order for ties.
+- Dates stated in the question (such as "today") are valid inputs for window and deadline checks.
 - Missing input, rule, or denominator means do not guess; state that the result cannot be established.
 
 FOLLOW-UP EXPLANATIONS

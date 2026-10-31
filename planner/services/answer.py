@@ -112,6 +112,27 @@ def _payload_char_budget() -> int:
     return max(int(provider_room * CHARS_PER_TOKEN), MIN_EVIDENCE_CHARS)
 
 
+class EvidenceTooLarge(ValueError):  # QP-PATCH
+    """Complete evidence + answer allowance exceeds the provider TPM reservation.
+
+    Subclasses ValueError so existing `except ValueError` handlers keep working.
+    """
+
+
+def answer_evidence_char_room(complexity: str = "normal") -> int:  # QP-PATCH
+    """Characters of evidence that REALLY fit one answer call.
+
+    Same arithmetic as _completion_budget (system prompt + overhead + the real
+    completion cap), so retrieval sizing and the final check cannot disagree.
+    A 10% margin covers the JSON wrapper and conversation history.
+    """
+    cap = ANSWER_OUTPUT_TOKEN_CAPS.get(complexity, ANSWER_OUTPUT_TOKEN_CAPS["normal"])
+    room_tokens = (
+        MODEL_TPM_LIMITS[MODEL_120B] - _system_tokens() - REQUEST_OVERHEAD_TOKENS - cap
+    )
+    return max(int(room_tokens * CHARS_PER_TOKEN * 0.9), MIN_EVIDENCE_CHARS)
+
+
 def _completion_budget(
     payload: str, *, query: str, evidence: list[Any]
 ) -> tuple[int, int]:
@@ -147,7 +168,7 @@ def _completion_budget(
             max_tokens,
             request_limit,
         )
-        raise ValueError(
+        raise EvidenceTooLarge(
             "The complete evidence is too large to send with a sufficient answer "
             "budget. No evidence was removed; narrow the question or reduce the "
             "amount of source data and try again."
@@ -1547,3 +1568,137 @@ def generate_answer_stream(
             yield delta
     if not yielded_any:
         raise ValueError("Answer LLM returned an empty streaming response.")
+
+
+# ---------------------------------------------------------------------------
+# QP-PATCH: last-resort fallback used only AFTER _completion_budget has already
+# failed closed. Never touches tables. Logged, and the model is told passages
+# were omitted so it does not claim a fact is absent from the documents.
+# ---------------------------------------------------------------------------
+_FIT_OMISSION_NOTE = (
+    "Some retrieved document passages were left out to fit the size limit. "
+    "If the answer needs content that is not in the provided passages, say it "
+    "was not found in the provided passages; never say it does not exist."
+)
+
+
+def _text_chunk_set(item: Any) -> tuple[Any, set[int]]:
+    if not isinstance(item, dict) or item.get("source_type") != "text_chunk":
+        return None, set()
+    meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    doc = item.get("document_id", meta.get("document_id"))
+    indexes = meta.get("chunk_indexes")
+    if not isinstance(indexes, list):
+        single = meta.get("chunk_index")
+        indexes = [single] if isinstance(single, int) else []
+    return doc, {i for i in indexes if isinstance(i, int)}
+
+
+def _fits_answer_budget(
+    query: str,
+    items: list[Any],
+    conversation_history: list[dict[str, Any]] | None,
+) -> bool:
+    try:
+        payload, _, _ = _prepare_request(
+            query=query, evidence=items, conversation_history=conversation_history
+        )
+    except Exception:
+        return False
+    complexity = _calculation_complexity(query, items)
+    cap_key = complexity if complexity in ANSWER_OUTPUT_TOKEN_CAPS else "normal"
+    reserved = (
+        _system_tokens()
+        + _estimate_tokens(payload)
+        + REQUEST_OVERHEAD_TOKENS
+        + ANSWER_OUTPUT_TOKEN_CAPS[cap_key]
+    )
+    return reserved <= MODEL_TPM_LIMITS[MODEL_120B]
+
+
+def fit_evidence_to_budget(
+    *,
+    query: str,
+    evidence: list[Any],
+    conversation_history: list[dict[str, Any]] | None = None,
+) -> list[Any]:
+    """Shrink evidence just enough to fit; returns the ORIGINAL list if it cannot.
+
+    Stage 1: drop text passages whose chunks are fully contained in another
+             passage of the same document (pure duplicates, nothing lost).
+    Stage 2: drop NOT_FOUND evidence notes (they only say "key not in doc X").
+    Stage 3: drop the lowest-scored text passages, always keeping at least one
+             passage per document. Tables and aggregates are never touched.
+    """
+    items = list(evidence)
+    if _fits_answer_budget(query, items, conversation_history):
+        return evidence
+
+    # Stage 1 - exact containment duplicates
+    order = sorted(
+        (i for i, it in enumerate(items) if _text_chunk_set(it)[1]),
+        key=lambda i: -len(_text_chunk_set(items[i])[1]),
+    )
+    covered: dict[Any, set[int]] = {}
+    drop: set[int] = set()
+    for i in order:
+        doc, chunks = _text_chunk_set(items[i])
+        if chunks and chunks <= covered.get(doc, set()):
+            drop.add(i)
+        else:
+            covered.setdefault(doc, set()).update(chunks)
+    items = [it for i, it in enumerate(items) if i not in drop]
+    if drop:
+        logger.warning("fit_evidence_to_budget: dropped %d duplicate passage(s)", len(drop))
+    if _fits_answer_budget(query, items, conversation_history):
+        return items
+
+    # Stage 2 - NOT_FOUND evidence notes
+    kept = [
+        it
+        for it in items
+        if not (
+            isinstance(it, dict)
+            and it.get("source_type") == "evidence_note"
+            and str(it.get("result_status") or "").upper() == "NOT_FOUND"
+        )
+    ]
+    removed_notes = len(items) - len(kept)
+    items = kept
+    note = {
+        "source_type": "evidence_note",
+        "result_status": "SUCCESS",
+        "content": _FIT_OMISSION_NOTE,
+    }
+    if removed_notes:
+        logger.warning("fit_evidence_to_budget: dropped %d NOT_FOUND note(s)", removed_notes)
+    if removed_notes and _fits_answer_budget(query, items + [note], conversation_history):
+        return items + [note]
+
+    # Stage 3 - lowest-scored passages first, keep >= 1 per document
+    per_doc: dict[Any, int] = {}
+    for it in items:
+        doc, chunks = _text_chunk_set(it)
+        if chunks:
+            per_doc[doc] = per_doc.get(doc, 0) + 1
+    candidates = sorted(
+        (i for i, it in enumerate(items) if _text_chunk_set(it)[1]),
+        key=lambda i: (float(items[i].get("score") or 0.0), -i),
+    )
+    removed: set[int] = set()
+    for i in candidates:
+        doc, _ = _text_chunk_set(items[i])
+        if per_doc.get(doc, 0) <= 1:
+            continue
+        removed.add(i)
+        per_doc[doc] -= 1
+        trial = [it for j, it in enumerate(items) if j not in removed] + [note]
+        if _fits_answer_budget(query, trial, conversation_history):
+            logger.warning(
+                "fit_evidence_to_budget: dropped %d low-ranked passage(s) to fit",
+                len(removed),
+            )
+            return trial
+
+    logger.error("fit_evidence_to_budget: could not fit evidence; keeping original")
+    return evidence

@@ -19,9 +19,11 @@ consistently labeled in diagnostics.
 
 from __future__ import annotations
 
+import contextvars
 import functools
 import json
 import logging
+import os
 import re
 import time
 from typing import Any
@@ -34,8 +36,11 @@ from llm.router import router
 from planner.prompts.agent import ACTION_SCHEMA, SYSTEM_PROMPT
 from planner.services.answer import (
     MAX_TEXT_CHARS_PER_ITEM,
+    EvidenceTooLarge,
     _parse_answer_response,
     _payload_char_budget,
+    answer_evidence_char_room,
+    fit_evidence_to_budget,
     generate_answer_stream,
 )
 from planner.services.cross_document_join import run_cross_document_join
@@ -1957,6 +1962,10 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
                 total_tool_calls += 1
 
         if "DOCUMENT_SEARCH" in capabilities and not skip_document_search:
+            _STRUCTURED_CHARS.set(  # QP-PATCH
+                len(json.dumps(structured, ensure_ascii=False, default=str))
+            )
+            _DOC_CHARS_USED.set(0)
             docs = _run_documents(state, budget)
             if requires_dependency_discovery(state):
                 docs = _supplement_dependency_evidence(state, docs)
@@ -2276,6 +2285,40 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         }
 
 
+def _stream_answer_with_fit(  # QP-PATCH
+    *,
+    query: str,
+    evidence: list[Any],
+    conversation_history: list[dict[str, Any]] | None,
+):
+    """generate_answer_stream, retried ONCE with a fitted evidence list.
+
+    EvidenceTooLarge is raised before the first token, so nothing has been
+    streamed to the user when we retry.
+    """
+    try:
+        yield from generate_answer_stream(
+            query=query,
+            evidence=evidence,
+            conversation_history=conversation_history,
+        )
+        return
+    except EvidenceTooLarge:
+        if os.environ.get("QUERYPILOT_ANSWER_FIT_FALLBACK", "1").strip() == "0":
+            raise
+        logger.warning("Answer evidence too large; retrying once with fitted evidence")
+    fitted = fit_evidence_to_budget(
+        query=query,
+        evidence=evidence,
+        conversation_history=conversation_history,
+    )
+    yield from generate_answer_stream(
+        query=query,
+        evidence=fitted,
+        conversation_history=conversation_history,
+    )
+
+
 def finish_node(state: AgentState) -> dict[str, Any]:
     route = state.get("route", "")
 
@@ -2381,7 +2424,7 @@ def finish_node(state: AgentState) -> dict[str, Any]:
         parts: list[str] = []
         answer_started = time.perf_counter()
         first_token_seen = False
-        for delta in generate_answer_stream(
+        for delta in _stream_answer_with_fit(
             # Use the same contextualized task that planning and retrieval used.
             # A short follow-up like "please explain" is not self-contained;
             # passing only the raw utterance here loses the subject/calculation
@@ -3305,6 +3348,27 @@ def _wants_exhaustive_read(state: AgentState) -> bool:
     return False
 
 
+# QP-PATCH: one evidence budget shared by every document pass in a request.
+_STRUCTURED_CHARS: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "qp_structured_chars", default=0
+)
+_DOC_CHARS_USED: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "qp_doc_chars_used", default=0
+)
+_MIN_DOC_BUDGET = 2000
+_NOTE_RESERVE_CHARS = 1500
+
+
+def _remaining_evidence_chars() -> int:
+    """Chars of document evidence still allowed for this answer call."""
+    return (
+        answer_evidence_char_room()
+        - _STRUCTURED_CHARS.get()
+        - _DOC_CHARS_USED.get()
+        - _NOTE_RESERVE_CHARS
+    )
+
+
 def _run_documents_with_coverage(
     state: AgentState,
     scope_ids: list[int],
@@ -3312,6 +3376,7 @@ def _run_documents_with_coverage(
     *,
     answer_sized: bool = False,
     require_complete: bool = False,
+    budget_chars: int | None = None,
 ) -> dict[str, Any] | None:
     """
     Question-agnostic multi-document evidence: whole documents when they
@@ -3351,14 +3416,16 @@ def _run_documents_with_coverage(
     # answer stage now preserves every evidence item it receives; if the full
     # serialized payload plus its output allowance cannot fit, it fails closed.
     share = EXHAUSTIVE_TEXT_SHARE if require_complete else OVERVIEW_TEXT_SHARE
+    _base_budget = max(int(_payload_char_budget() * share), 2000)
+    _room = budget_chars if budget_chars is not None else _remaining_evidence_chars()
     sizing: dict[str, Any] = {
-        "budget": max(int(_payload_char_budget() * share), 2000),
+        "budget": max(min(_base_budget, _room), _MIN_DOC_BUDGET),
         "segment_char_limit": max(
             MAX_TEXT_CHARS_PER_ITEM - OVERVIEW_SEGMENT_HEADER_ALLOWANCE, 800
         ),
     }
 
-    return build_document_evidence(
+    _built = build_document_evidence(
         workspace_id=workspace_id,
         document_ids=scope_ids,
         question=effective_planning_query(state),
@@ -3369,6 +3436,16 @@ def _run_documents_with_coverage(
         require_complete=require_complete,
         **sizing,
     )
+    if _built:  # QP-PATCH
+        _DOC_CHARS_USED.set(
+            _DOC_CHARS_USED.get()
+            + sum(
+                len(str(_i.get("content") or ""))
+                for _i in _built.get("evidence", []) or []
+                if isinstance(_i, dict)
+            )
+        )
+    return _built
 
 
 def _run_documents(
@@ -3629,15 +3706,18 @@ def _supplement_dependency_evidence(
     if allowed_ids is not None:
         authorized_set = {int(value) for value in allowed_ids}
         dependency_id_set.intersection_update(authorized_set)
-    dependency_ids = sorted(dependency_id_set)
+    # QP-PATCH: do not re-load documents the first pass already supplied, and
+    # do not force whole-document completeness (that took 85% of the budget).
+    already_loaded = _document_ids_from_text_evidence(primary)
+    dependency_ids = sorted(dependency_id_set - already_loaded)
     dependency_coverage: list[Any] = []
-    if dependency_ids:
+    if dependency_ids and _remaining_evidence_chars() >= _MIN_DOC_BUDGET:
         try:
             covered = _run_documents_with_coverage(
                 state,
                 dependency_ids,
                 query,
-                require_complete=True,
+                require_complete=False,
             )
         except Exception:
             logger.exception(
@@ -3651,12 +3731,25 @@ def _supplement_dependency_evidence(
     # Prefer coverage for documents it actually represented, avoiding duplicate
     # top-k chunks for the same document. Keep ranked results as a fallback if
     # full-document loading returned no usable passage for that source.
-    covered_ids = _document_ids_from_text_evidence(dependency_coverage)
+    covered_ids = _document_ids_from_text_evidence(dependency_coverage) | already_loaded
     remaining_supplemental = [
         item
         for item in supplemental
         if not (_document_ids_from_text_evidence([item]) & covered_ids)
     ]
+    # QP-PATCH: ranked fallback chunks must also fit the remaining room.
+    _room_left = max(_remaining_evidence_chars(), 0)
+    _fitted: list[Any] = []
+    _used = 0
+    for _item in remaining_supplemental:
+        _size = len(str(_item.get("content") or "")) if isinstance(_item, dict) else 0
+        if _used + _size > _room_left:
+            break
+        _fitted.append(_item)
+        _used += _size
+    if not _fitted and remaining_supplemental:
+        _fitted = [remaining_supplemental[0]]
+    remaining_supplemental = _fitted
     combined = _canonicalize_evidence(
         dependency_coverage + remaining_supplemental + primary
     )
