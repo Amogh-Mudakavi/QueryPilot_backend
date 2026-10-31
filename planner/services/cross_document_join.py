@@ -355,6 +355,7 @@ def run_cross_document_join(
     text_lookup: Callable[..., dict[str, Any]] | None = None,
     skip_text_document_ids: Iterable[int] | None = None,
     allowed_table_names: Iterable[str] | None = None,
+    table_roles: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     Returns {"keys", "tables", "documents", "notes", "anchors"}.
@@ -445,7 +446,48 @@ def run_cross_document_join(
     if allowed_table_names is not None:
         allowed = {str(n) for n in allowed_table_names}
         relevant = [t for t in relevant if str(t.get("table_name")) in allowed]
-    doc_tables = [t for t in relevant if _as_int(t.get("document_id")) in doc_ids]
+
+    # A table selector can identify sources that contribute governing rules
+    # rather than entity records. Do not search those rule tables for keys
+    # extracted from data rows, and do not run a document-level key lookup
+    # against a source whose in-scope tables are all explicitly rule tables.
+    # Unlabelled tables retain the previous behaviour for backward compatibility.
+    raw_roles = table_roles if isinstance(table_roles, dict) else {}
+    normalized_roles = {
+        str(name): str(role or "").strip().lower()
+        for name, role in raw_roles.items()
+    }
+    tables_by_document: dict[int, list[str]] = {}
+    for table in relevant:
+        did = _as_int(table.get("document_id"))
+        table_name = str(table.get("table_name") or "")
+        if did in doc_ids and table_name:
+            tables_by_document.setdefault(did, []).append(table_name)
+
+    rule_only_document_ids = {
+        did
+        for did, table_names in tables_by_document.items()
+        if table_names
+        and all(normalized_roles.get(name) == "rule" for name in table_names)
+    }
+    rule_table_names = {
+        name for name, role in normalized_roles.items() if role == "rule"
+    }
+    doc_tables = [
+        t
+        for t in relevant
+        if _as_int(t.get("document_id")) in doc_ids
+        and str(t.get("table_name") or "") not in rule_table_names
+    ]
+    lookup_document_ids = [
+        did for did in doc_ids if did not in rule_only_document_ids
+    ]
+    if rule_only_document_ids:
+        logger.info(
+            "cross-document join: skipping identifier lookup for rule-only "
+            "source document_ids=%s",
+            sorted(rule_only_document_ids),
+        )
 
     if not metadata_loaded:
         try:
@@ -511,12 +553,32 @@ def run_cross_document_join(
                 "value so they are present even if the sheet is large.",
             )
 
+    # Only data-bearing evidence should contribute companion lookup keys.
+    # Otherwise an identifier appearing in a policy example (or in a rule
+    # table) can be mistaken for an entity key from the requested records.
+    key_source_tables = [
+        item
+        for item in [*structured, *new_tables]
+        if not (
+            {
+                str(source.get("table_name"))
+                for source in item.get("sources", []) or []
+                if isinstance(source, dict) and source.get("table_name")
+            }
+            & rule_table_names
+        )
+    ]
+    key_source_documents = [
+        item
+        for item in documents
+        if _as_int(item.get("document_id")) not in rule_only_document_ids
+    ]
     keys = collect_keys(
         query=query,
         references=references,
         anchors=anchors,
-        table_items=[*structured, *new_tables],
-        documents=documents,
+        table_items=key_source_tables,
+        documents=key_source_documents,
         limit=MAX_JOIN_KEYS + 1,
     )
     if len(keys) > MAX_JOIN_KEYS:
@@ -566,7 +628,7 @@ def run_cross_document_join(
         d for d in (_as_int(x) for x in skip_text_document_ids or []) if d is not None
     }
     new_docs: list[dict[str, Any]] = []
-    for did in doc_ids:
+    for did in lookup_document_ids:
         if did in no_text:
             continue
         try:
@@ -687,12 +749,13 @@ def run_cross_document_join(
 
     usable = [k for k in keys if k not in non_identifying]
     if usable:
-        for did in doc_ids:
+        for did in lookup_document_ids:
             title = titles.get(did, f"document {did}")
             if did in lookup_failed:
                 outcome["notes"].append(
                     {
                         "source_type": "evidence_note",
+                        "note_kind": "identifier_lookup",
                         "result_status": "RETRIEVAL_ERROR",
                         "content": (
                             f"Searching '{title}' for identifier(s) "
@@ -706,6 +769,7 @@ def run_cross_document_join(
                 outcome["notes"].append(
                     {
                         "source_type": "evidence_note",
+                        "note_kind": "identifier_lookup",
                         "result_status": "NOT_FOUND",
                         "content": (
                             f"Identifier(s) {', '.join(usable)} were "

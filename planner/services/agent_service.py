@@ -1587,6 +1587,14 @@ def _reconcile_source_notes(
     for note in notes:
         if (
             isinstance(note, dict)
+            and str(note.get("note_kind") or "").lower() == "identifier_lookup"
+        ):
+            # A source can have valid rows yet still lack the requested key.
+            # Its unrelated rows do not contradict an exact identifier miss.
+            kept.append(note)
+            continue
+        if (
+            isinstance(note, dict)
             and str(note.get("source_type") or "").lower() in _NOTE_KINDS
             and str(note.get("result_status") or "").upper() in _NON_DATA_STATUSES
         ):
@@ -2081,6 +2089,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
                     documents=documents,
                     skip_text_document_ids=_documents_without_text(coverage_info),
                     allowed_table_names=_table_scope(state),
+                    table_roles=state.get("table_roles", {}),
                 )
             except Exception:
                 logger.exception("cross-document key join failed")
