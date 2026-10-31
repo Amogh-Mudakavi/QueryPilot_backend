@@ -28,6 +28,7 @@ if not all(GROQ_API_KEYS):
 MODEL_TPM_LIMITS = {
     "openai/gpt-oss-120b": 8000,
     "openai/gpt-oss-20b": 8000,
+    "qwen/qwen3.8-27b": 8000,
 }
 DEFAULT_TPM_LIMIT = 8000
 
@@ -41,6 +42,21 @@ MESSAGE_OVERHEAD_TOKENS = 4
 
 MODEL_20B = "openai/gpt-oss-20b"
 MODEL_120B = "openai/gpt-oss-120b"
+MODEL_QWEN_27B = "qwen/qwen3.8-27b"
+
+# One source of truth for task completion ceilings. Qwen reasoning tokens are
+# included in max_tokens, so these caps leave room for both reasoning and output.
+PLANNER_MAX_COMPLETION_TOKENS = 1800
+TABLE_SELECTION_MAX_COMPLETION_TOKENS = 1500
+SQL_GENERATION_MAX_COMPLETION_TOKENS = 1200
+ANSWER_OUTPUT_TOKEN_CAPS = {
+    "normal": 2000,
+    "arithmetic": 2600,
+    "multi_step": 3200,
+}
+# Maximum task ceiling also bounds the single retry after a length finish.
+ANSWER_MAX_OUTPUT_TOKENS = 4000
+ANSWER_RETRY_MULTIPLIER = 2
 
 REQUEST_TIMEOUT = 20.0
 DEFAULT_TEMPERATURE = 0.0
@@ -51,12 +67,11 @@ class TaskProfile:
     """Generation settings owned by one logical task.
 
     model            which tier runs it (the tier decides the quota pool)
-    max_tokens       completion ceiling, INCLUDING gpt-oss reasoning tokens.
-                     Fixed per task; never derived from other calls.
+    max_tokens       maximum completion ceiling for this task, including any
+                     reasoning tokens counted by the provider.
     timeout          per-attempt HTTP timeout in seconds
     reasoning_effort "low" / "medium" / "high", or None for the model default
-    input_hint       prompt size above which a warning is logged (observability
-                     only; also the number evidence compaction should aim for)
+    input_hint       prompt size above which an observability warning is logged.
     """
 
     model: str
@@ -74,14 +89,25 @@ TASK_PROFILES: dict[str, TaskProfile] = {
     "title": TaskProfile(
         MODEL_20B, max_tokens=200, reasoning_effort="low", input_hint=200
     ),
-    "sql_generation": TaskProfile(MODEL_20B, max_tokens=1200, input_hint=3000),
-    "planner": TaskProfile(MODEL_120B, max_tokens=700, input_hint=1500),
+    "sql_generation": TaskProfile(
+        MODEL_QWEN_27B,
+        max_tokens=SQL_GENERATION_MAX_COMPLETION_TOKENS,
+        input_hint=3000,
+    ),
+    "planner": TaskProfile(
+        MODEL_QWEN_27B,
+        max_tokens=PLANNER_MAX_COMPLETION_TOKENS,
+        input_hint=3000,
+    ),
     "table_selection": TaskProfile(
-        MODEL_120B, max_tokens=500, reasoning_effort="low", input_hint=1200
+        MODEL_QWEN_27B,
+        max_tokens=TABLE_SELECTION_MAX_COMPLETION_TOKENS,
+        reasoning_effort="low",
+        input_hint=2000,
     ),
     "answer_generation": TaskProfile(
         MODEL_120B,
-        max_tokens=3000,
+        max_tokens=ANSWER_MAX_OUTPUT_TOKENS,
         timeout=40.0,
         reasoning_effort="low",
         input_hint=3000,

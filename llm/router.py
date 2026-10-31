@@ -38,6 +38,20 @@ class LLMRouter:
         return self._profile(task).model
 
     @staticmethod
+    def _max_tokens(profile: TaskProfile, requested: int | None) -> int:
+        """Apply the centrally configured task ceiling to every request."""
+        value = profile.max_tokens if requested is None else int(requested)
+        if value <= 0:
+            raise ValueError("max_tokens must be a positive integer")
+        if value > profile.max_tokens:
+            logger.warning(
+                "Clamping requested max_tokens=%d to task cap=%d",
+                value,
+                profile.max_tokens,
+            )
+        return min(value, profile.max_tokens)
+
+    @staticmethod
     def _reasoning_effort(
         profile: TaskProfile,
         include_reasoning: bool | None,
@@ -66,16 +80,16 @@ class LLMRouter:
     ):
         """Execute a normal (or raw-streaming) LLM request.
 
-        `max_tokens` is an optional explicit override and is used verbatim;
-        otherwise the task profile's cap applies. `reasoning_effort` is an
-        optional explicit per-call override ("low" / "medium" / "high").
+        `max_tokens` may lower the task cap for complexity-aware calls, but the
+        router always clamps it to the centrally configured task ceiling.
+        `reasoning_effort` is an optional per-call override.
         """
         profile = self._profile(task)
         return self.provider.generate(
             task=task,
             model=profile.model,
             messages=messages,
-            max_tokens=profile.max_tokens if max_tokens is None else max_tokens,
+            max_tokens=self._max_tokens(profile, max_tokens),
             temperature=DEFAULT_TEMPERATURE if temperature is None else temperature,
             response_format=response_format,
             stream=stream,
@@ -102,7 +116,7 @@ class LLMRouter:
             task=task,
             model=profile.model,
             messages=messages,
-            max_tokens=profile.max_tokens if max_tokens is None else max_tokens,
+            max_tokens=self._max_tokens(profile, max_tokens),
             temperature=DEFAULT_TEMPERATURE if temperature is None else temperature,
             reasoning_effort=self._reasoning_effort(
                 profile, include_reasoning, reasoning_effort

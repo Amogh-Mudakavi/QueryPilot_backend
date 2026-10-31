@@ -12,6 +12,15 @@ from collections import Counter
 from collections.abc import Iterable, Iterator
 from typing import Any
 
+from llm.config import (
+    ANSWER_MAX_OUTPUT_TOKENS,
+    ANSWER_OUTPUT_TOKEN_CAPS,
+    ANSWER_RETRY_MULTIPLIER,
+    CHARS_PER_TOKEN_ESTIMATE,
+    MESSAGE_OVERHEAD_TOKENS,
+    MODEL_120B,
+    MODEL_TPM_LIMITS,
+)
 from llm.router import router
 from planner.prompts.answer_prompts import SYSTEM_PROMPT as BASE_SYSTEM_PROMPT
 from planner.services.history import bound_history_for_answer
@@ -19,18 +28,12 @@ from retrieval.services.keys import is_id_column
 
 logger = logging.getLogger(__name__)
 
-PROVIDER_TPM_LIMIT = 8000
-TOTAL_REQUEST_TOKEN_CEILING = 7400
-ANSWER_MAX_OUTPUT_TOKENS = 4000
-ANSWER_MIN_OUTPUT_TOKENS = 1400
 MIN_EVIDENCE_CHARS = 4000
-RETRY_MAX_OUTPUT_TOKENS = 1400
-RETRY_MIN_OUTPUT_TOKENS = 900
 RETURN_PARTIAL_ON_BUDGET_EXHAUSTION = True
 PARTIAL_ANSWER_MIN_CHARS = 120
 PARTIAL_ANSWER_NOTICE = "\n\n_Note: this answer was cut short and may be incomplete._"
-REQUEST_OVERHEAD_TOKENS = 120
-CHARS_PER_TOKEN = 4.0
+REQUEST_OVERHEAD_TOKENS = MESSAGE_OVERHEAD_TOKENS * 2 + 1
+CHARS_PER_TOKEN = CHARS_PER_TOKEN_ESTIMATE
 MAX_TEXT_CHARS_PER_ITEM = 1800
 MAX_NOTE_CHARS = 400
 MAX_CELL_CHARS = 120
@@ -102,44 +105,53 @@ def _system_tokens() -> int:
 
 
 def _payload_char_budget() -> int:
-    """Characters the user payload may take for one provider call.
-    This is a per-call provider-safety calculation only. It does not inspect
-    or depend on any earlier LLM calls from the same user request.
-    Required evidence is never trimmed merely to satisfy a request-wide
-    application budget.
-    """
+    """Retrieval sizing hint; answer-stage evidence is never trimmed to it."""
+    request_limit = MODEL_TPM_LIMITS[MODEL_120B]
     fixed = _system_tokens() + REQUEST_OVERHEAD_TOKENS + ANSWER_MAX_OUTPUT_TOKENS
-    provider_cap = max(TOTAL_REQUEST_TOKEN_CEILING - fixed, 0)
-    chars = int(provider_cap * CHARS_PER_TOKEN)
-    return max(min(chars, int(provider_cap * CHARS_PER_TOKEN)), MIN_EVIDENCE_CHARS)
+    provider_room = max(request_limit - fixed, 0)
+    return max(int(provider_room * CHARS_PER_TOKEN), MIN_EVIDENCE_CHARS)
 
 
-def _completion_budget(payload: str) -> tuple[int, int]:
-    """Return the fixed task output cap, constrained only by this call.
-    Earlier LLM calls cannot reduce Answer's generation allowance. The only
-    reduction possible is when this individual Answer request itself is too
-    large to fit the provider-safe per-call ceiling.
+def _completion_budget(
+    payload: str, *, query: str, evidence: list[Any]
+) -> tuple[int, int]:
+    """Choose a centrally configured answer cap without shrinking evidence.
+
+    If the complete evidence plus the required output allowance cannot fit the
+    provider's per-key TPM reservation, fail clearly rather than deleting rows,
+    columns, notes, or passages and answering from partial context.
     """
+    complexity = _calculation_complexity(query, evidence)
+    cap_key = complexity if complexity in ANSWER_OUTPUT_TOKEN_CAPS else "normal"
+    max_tokens = ANSWER_OUTPUT_TOKEN_CAPS[cap_key]
     input_tokens = (
         _system_tokens() + _estimate_tokens(payload) + REQUEST_OVERHEAD_TOKENS
     )
-    provider_room = max(TOTAL_REQUEST_TOKEN_CEILING - input_tokens, 0)
-    max_tokens = min(ANSWER_MAX_OUTPUT_TOKENS, provider_room)
-    if max_tokens < ANSWER_MIN_OUTPUT_TOKENS:
-        logger.warning(
-            "answer_call_budget: input=%d leaves only %d completion tokens under "
-            "the per-call provider ceiling; compact evidence further if possible",
-            input_tokens,
-            max_tokens,
-        )
+    request_limit = MODEL_TPM_LIMITS[MODEL_120B]
+    reserved_tokens = input_tokens + max_tokens
     logger.info(
-        "answer_call_budget: input~%d completion_cap=%d per_call_ceiling=%d "
-        "provider_limit=%d",
+        "answer_call_budget: complexity=%s input~%d completion_cap=%d "
+        "reserved~%d provider_tpm_limit=%d evidence_chars=%d",
+        complexity,
         input_tokens,
         max_tokens,
-        TOTAL_REQUEST_TOKEN_CEILING,
-        PROVIDER_TPM_LIMIT,
+        reserved_tokens,
+        request_limit,
+        len(payload),
     )
+    if reserved_tokens > request_limit:
+        logger.error(
+            "answer_evidence_too_large: input~%d + completion_cap=%d > model TPM limit=%d; "
+            "evidence preserved, no answer generated",
+            input_tokens,
+            max_tokens,
+            request_limit,
+        )
+        raise ValueError(
+            "The complete evidence is too large to send with a sufficient answer "
+            "budget. No evidence was removed; narrow the question or reduce the "
+            "amount of source data and try again."
+        )
     return max_tokens, input_tokens
 _INLINE_CITATION = re.compile(r"\s?\[\d{1,3}\]")
 
@@ -354,66 +366,9 @@ def _compact_metadata(content: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compact_item(item: Any) -> dict[str, Any]:
-    if not isinstance(item, dict):
-        return {"content": str(item)[:MAX_TEXT_CHARS_PER_ITEM]}
-    compact: dict[str, Any] = {}
-    source_type = item.get("source_type")
-    if source_type:
-        compact["source_type"] = source_type
-    status = str(item.get("result_status") or "").upper()
-    if status and status != "SUCCESS":
-        compact["result_status"] = status
-    content = item.get("content", "")
-    if not isinstance(content, dict):
-        if source_type == "product_knowledge":
-            compact["content"] = str(content)[:10000]
-            compact["scope"] = "querypilot_product"
-            compact["authoritative"] = True
-            return compact
-        is_note = source_type in _NOTE_TYPES
-        compact["content"] = str(content)[
-            : MAX_NOTE_CHARS if is_note else MAX_TEXT_CHARS_PER_ITEM
-        ]
-        title = item.get("document_title") or item.get("title")
-        if isinstance(title, str) and title and not is_note:
-            compact["document"] = title[:120]
-        return compact
-    role = content.get("evidence_role")
-    if source_type == "workspace_metadata" or role == "workspace_metadata":
-        compact["content"] = _compact_metadata(content)
-    elif role == "aggregate_result":
-        compact.pop("source_type", None)
-        compact["content"] = _slim(
-            {
-                "scope": "aggregate_result",
-                "document": content.get("document_title"),
-                "population_rows": content.get("population_rows"),
-                "aggregates": content.get("aggregates"),
-                "formulas": content.get("formulas"),
-                "relationships": content.get("relationships"),
-            }
-        )
-    elif role == "selection_result":
-        compact.pop("source_type", None)
-        compact["content"] = _slim(
-            {
-                "scope": "selection_result",
-                "document": content.get("document_title"),
-                "population_rows": content.get("population_rows"),
-                "selection_result": content.get("selection_result"),
-                "interpretation": content.get("interpretation"),
-            }
-        )
-    elif "rows" in content or "columns" in content:
-        compact.pop("source_type", None)
-        compact["content"] = _compact_table(item, content)
-    else:
-        compact["content"] = {
-            k: (str(v)[:300] if isinstance(v, str) else v)
-            for k, v in content.items()
-            if k in {"message", "error"}
-        } or str(content)[:300]
-    return compact
+    """Compatibility helper that preserves the complete evidence item."""
+    return dict(item) if isinstance(item, dict) else {"content": item}
+
 _compact_item_for_prompt = _compact_item
 _PRODUCT_SECTION_HEADER = re.compile(r"^[A-Z][A-Z0-9 /&'().\-]{2,60}$")
 _PRODUCT_QUERY_STOPWORDS = frozenset(
@@ -924,92 +879,15 @@ def _fit_to_budget(
     anchors: set[str],
     query: str = "",
 ) -> list[dict[str, Any]]:
-    """
-    Last resort, only when the semantically compact evidence still exceeds the
-    budget. Order of sacrifice: generic text passages (shortened), then
-    product knowledge (whole-section selection for the current query -
-    never a prefix cut), then COLUMNS the question does not need (every row
-    is kept; flagged with columns_omitted_from_prompt), and only then rows of
-    the largest table that are NOT anchored to the question. Row removal is
-    always flagged (truncated + rows_omitted_from_prompt) so it is never
-    mistaken for a complete population. Aggregates and notes are never trimmed.
-    """
-    guard = 0
-    text_floor = MIN_TEXT_CHARS_WHEN_TRIMMED
-    while _size(items) > budget_chars and guard < 200:
-        guard += 1
-        texts = [
-            i
-            for i in items
-            if isinstance(i.get("content"), str)
-            and len(i["content"]) > text_floor
-            and i.get("source_type") not in _NOTE_TYPES
-            and i.get("source_type") != "product_knowledge"
-        ]
-        if texts:
-            biggest = max(texts, key=lambda i: len(i["content"]))
-            biggest["content"] = biggest["content"][
-                : int(len(biggest["content"]) * 0.7)
-            ]
-            continue
-        products = [
-            i
-            for i in items
-            if i.get("source_type") == "product_knowledge"
-            and isinstance(i.get("content"), str)
-            and len(i["content"]) > 600
-        ]
-        if products:
-            biggest = max(products, key=lambda i: len(i["content"]))
-            deficit = _size(items) - budget_chars
-            target = max(len(biggest["content"]) - deficit - 160, 600)
-            if target < len(biggest["content"]):
-                reduced = _relevant_product_sections(
-                    biggest["content"],
-                    query,
-                    target,
-                )
-                if reduced and len(reduced) < len(biggest["content"]):
-                    biggest["content"] = reduced
-                    continue
-        if _project_largest_table(items, query):
-            continue
-        tables = [
-            i
-            for i in items
-            if _is_table(i) and len(i["content"]["rows"]) > MIN_ROWS_WHEN_TRIMMED
-        ]
-        if not tables:
-            if text_floor > MIN_TEXT_CHARS_LAST_RESORT:
-                text_floor = MIN_TEXT_CHARS_LAST_RESORT
-                continue
-            break
-        biggest = max(tables, key=lambda i: _size(i["content"]["rows"]))
-        content = biggest["content"]
-        rows = content["rows"]
-        flags = _anchored_rows(rows, anchors)
-        query_scores = _query_row_match_scores(
-            content.get("columns") or [], rows, query
-        )
-        # Existing evidence anchors remain strongest; within each group, keep
-        # rows matching the entity/period/value filters expressed by the query.
-        order = sorted(
-            range(len(rows)),
-            key=lambda i: (not flags[i], -query_scores[i], i),
-        )
-        keep_count = _rows_that_fit(rows, deficit=_size(items) - budget_chars)
-        keep_idx = sorted(order[:keep_count])
-        content["source_rows"] = content.get("source_rows", len(rows))
-        content["rows_omitted_from_prompt"] = (
-            int(content.get("rows_omitted_from_prompt", 0)) + len(rows) - len(keep_idx)
-        )
-        content["truncated"] = True
-        content["rows"] = [rows[i] for i in keep_idx]
+    """Compatibility no-op: answer evidence is never trimmed to a size hint."""
     if _size(items) > budget_chars:
         logger.warning(
-            "answer evidence still over budget after compaction: chars=%d", _size(items)
+            "answer_evidence_over_hint: chars=%d hint=%d; preserving all evidence",
+            _size(items),
+            budget_chars,
         )
     return items
+
 _NOTE_SOURCE_TYPES = _NOTE_TYPES | {
     "evidence_note",
     "document_coverage",
@@ -1086,43 +964,44 @@ def _log_evidence_debug(stage: str, items: list[dict[str, Any]]) -> None:
 def _canonical_answer_evidence(
     evidence: list[Any],
     *,
-    budget_chars: int,
+    budget_chars: int | None = None,
     query: str = "",
 ) -> list[dict[str, Any]]:
+    """Preserve every supplied evidence item, row, column and text value.
+
+    The stored evidence list is authoritative. This stage only attaches the
+    stable 1-based evidence index and adds harmless aliases used by the answer
+    helpers; it does not compact, deduplicate, project, or truncate evidence.
     """
-    Raw stored evidence -> compact canonical answer evidence.
-    citation_index is the item's 1-based position in the stored evidence, set
-    BEFORE any item is merged away, and never renumbered afterwards. It is an
-    internal item id; the answer text itself carries no citation markers.
-    """
-    anchors = _anchor_strings(evidence)
-    available = _available_source_titles(evidence)
     items: list[dict[str, Any]] = []
     for position, raw in enumerate(evidence, start=1):
-        stored = raw.get("citation_index") if isinstance(raw, dict) else None
-        if stored is not None and stored != position:
-            logger.warning(
-                "evidence citation_index=%r differs from stored position %d; "
-                "using the stored position",
-                stored,
-                position,
-            )
-        if _contradicted_note(raw, available):
-            logger.info(
-                "answer evidence: dropped note contradicted by source rows (n=%d)",
-                position,
-            )
-            continue
-        compact = _compact_item(raw)
-        items.append({"citation_index": position, **compact})
-    items = _dedupe_notes(items)
-    items = _dedupe_rows_across_items(items)
-    if _size(items) > budget_chars:
-        items = _reduce_covered_tables(items, anchors)
-        items = _dedupe_rows_across_items(items)
-    _log_evidence_debug("before_fit_to_budget", items)
-    items = _fit_to_budget(items, budget_chars, anchors, query=query)
-    _log_evidence_debug("after_fit_to_budget", items)
+        item = dict(raw) if isinstance(raw, dict) else {"content": raw}
+        content = item.get("content")
+        if isinstance(content, dict):
+            content = dict(content)
+            if "document" not in content and content.get("document_title"):
+                content["document"] = content["document_title"]
+            role = content.get("evidence_role")
+            if "scope" not in content and role in {
+                "aggregate_result",
+                "selection_result",
+                "entity_row",
+                "key_joined",
+                "query_result",
+            }:
+                content["scope"] = role
+            item["content"] = content
+        item["citation_index"] = position
+        items.append(item)
+
+    _log_evidence_debug("preserved_for_answer", items)
+    total_chars = _size(items)
+    if budget_chars is not None and total_chars > budget_chars:
+        logger.warning(
+            "answer_evidence_over_hint: chars=%d hint=%d; preserving complete evidence",
+            total_chars,
+            budget_chars,
+        )
     return items
 
 
@@ -1235,7 +1114,7 @@ def _partial_evidence_notice(items: list[dict[str, Any]]) -> dict[str, Any] | No
 
 
 def _payload_item(item: dict[str, Any]) -> dict[str, Any]:
-    """Serialized form of a canonical item: citation_index -> compact "n"."""
+    """Serialized form of an evidence item with its stable index."""
     out: dict[str, Any] = {"n": item.get("citation_index")}
     out.update({k: v for k, v in item.items() if k != "citation_index"})
     return out
@@ -1259,13 +1138,9 @@ def _prepare_request(
     symbol = _currency_symbol_for(evidence)
     if symbol:
         extras["presentation"] = {"currency_symbol": symbol}
-    evidence_budget = max(
-        _payload_char_budget() - _size(extras) - len(query) - 200,
-        2500,
-    )
-    items = _canonical_answer_evidence(
-        evidence, budget_chars=evidence_budget, query=query
-    )
+    # Keep the entire evidence payload. _completion_budget validates the full
+    # request against the provider reservation limit and fails closed if needed.
+    items = _canonical_answer_evidence(evidence, query=query)
     has_aggregate = any(
         isinstance(i.get("content"), dict)
         and i["content"].get("scope") == "aggregate_result"
@@ -1495,17 +1370,16 @@ def _request_answer(
     return (content or ""), (str(finish) if finish is not None else None)
 
 
-def _retry_budget(payload: str) -> int:
-    """Completion allowance for one compact retry, based only on this call."""
+def _retry_budget(payload: str, initial_cap: int) -> int:
+    """One larger retry, bounded by the central task cap and provider room."""
     input_tokens = (
         _estimate_tokens(RETRY_SYSTEM_PROMPT)
         + _estimate_tokens(payload)
         + REQUEST_OVERHEAD_TOKENS
     )
-    provider_room = max(TOTAL_REQUEST_TOKEN_CEILING - input_tokens, 0)
-    if provider_room < RETRY_MIN_OUTPUT_TOKENS:
-        return 0
-    return min(RETRY_MAX_OUTPUT_TOKENS, provider_room)
+    provider_room = max(MODEL_TPM_LIMITS[MODEL_120B] - input_tokens, 0)
+    doubled_cap = initial_cap * ANSWER_RETRY_MULTIPLIER
+    return min(doubled_cap, ANSWER_MAX_OUTPUT_TOKENS, provider_room)
 
 
 def _partial_answer(
@@ -1543,7 +1417,7 @@ def generate_answer(
         len(indices),
         len(payload),
     )
-    max_tokens, _ = _completion_budget(payload)
+    max_tokens, _ = _completion_budget(payload, query=query, evidence=evidence)
     effort = _answer_effort(query, evidence)
     logger.info(
         "answer_effort: complexity=%s requested=%s",
@@ -1578,8 +1452,8 @@ def generate_answer(
             except ValueError:
                 pass
     if exhausted or not content.strip():
-        retry_tokens = _retry_budget(payload)
-        if retry_tokens < RETRY_MIN_OUTPUT_TOKENS:
+        retry_tokens = _retry_budget(payload, max_tokens)
+        if retry_tokens <= max_tokens:
             logger.warning(
                 "answer_retry skipped: this retry cannot fit the per-call provider "
                 "ceiling with a usable completion allowance",
@@ -1643,7 +1517,7 @@ def generate_answer_stream(
         len(indices),
         len(payload),
     )
-    max_tokens, _ = _completion_budget(payload)
+    max_tokens, _ = _completion_budget(payload, query=query, evidence=evidence)
     # Same effort rule as generate_answer(): chosen by complexity class.
     effort = _answer_effort(query, evidence)
     options = _router_options(effort, router.generate_stream)

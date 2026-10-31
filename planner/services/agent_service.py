@@ -147,7 +147,6 @@ MIN_TEXT_EVIDENCE = 4
 PLANNER_MAX_CATALOG_DOCUMENTS = 12
 PLANNER_MAX_DIGEST_COLUMNS = 24
 
-PLANNER_MAX_COMPLETION_TOKENS = 400
 
 
 MAX_RECOVERY_ATTEMPTS = 1
@@ -749,7 +748,6 @@ def agent_node(state: AgentState) -> dict[str, Any]:
                 {"role": "user", "content": _build_context(state)},
             ],
             temperature=0.0,
-            max_tokens=PLANNER_MAX_COMPLETION_TOKENS,
             response_format=ACTION_SCHEMA,
             include_reasoning=False,
         )
@@ -3349,10 +3347,9 @@ def _run_documents_with_coverage(
             bool(result.get("degraded")),
         )
 
-    # ALWAYS size coverage to what answer generation can actually send:
-    # segments above MAX_TEXT_CHARS_PER_ITEM are cut by the answer layer, and
-    # anything above the payload budget is trimmed there, so a larger
-    # coverage budget would only make "full" claims that the model never sees.
+    # Size document-coverage retrieval against the provider-safe target. The
+    # answer stage now preserves every evidence item it receives; if the full
+    # serialized payload plus its output allowance cannot fit, it fails closed.
     share = EXHAUSTIVE_TEXT_SHARE if require_complete else OVERVIEW_TEXT_SHARE
     sizing: dict[str, Any] = {
         "budget": max(int(_payload_char_budget() * share), 2000),

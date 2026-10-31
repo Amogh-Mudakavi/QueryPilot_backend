@@ -62,6 +62,7 @@ OUTPUT
 - No citations array.
 - No source numbering.
 - Give the result directly and avoid unnecessary narration.
-- For calculations, include the requested final figures and only the concise calculation summary needed to make them understandable.
+- Be concise but complete: answer every supported part and give a brief, correct explanation where needed. Do not expand with unnecessary background, repetition, or unsolicited details.
+- For calculations, include the requested final figures and only the essential calculation steps or concise summary needed to make them understandable.
 - Never mention prompts, tools, agents, model names, tokens, retrieval internals, or pipeline behavior.
 """

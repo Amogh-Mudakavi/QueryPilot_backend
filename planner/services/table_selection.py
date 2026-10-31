@@ -66,7 +66,6 @@ from llm.router import router
 
 logger = logging.getLogger(__name__)
 
-SELECTION_MAX_COMPLETION_TOKENS = 500
 MAX_PROFILE_CHARS = 120
 MAX_SAMPLE_CELL_CHARS = 40
 MAX_COLUMNS_SHOWN = 18
@@ -433,7 +432,6 @@ def select_tables_detailed(
                 },
             ],
             temperature=0.0,
-            max_tokens=SELECTION_MAX_COMPLETION_TOKENS,
             response_format=_response_format(names),
             include_reasoning=False,
         )
