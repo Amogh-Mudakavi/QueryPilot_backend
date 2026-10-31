@@ -247,23 +247,110 @@ def can_answer_from_evidence(
     ) and not (dependencies_required and not dependency_evidence_found)
 
 
-def dependency_discovery_query(state: Mapping[str, Any]) -> str:
-    """Build a generic retrieval query for rules that govern a calculation."""
+# QP-PATCH-V4: dependency discovery also searches on document cross-references
+# and entity attributes found in the evidence retrieved so far.
+_CROSS_REF_RE = re.compile(
+    r"(?i:\b(?:see|refer to|in)\s+the)\s+"
+    r"((?:[A-Z&][\w&,'\-]*\s+){0,9}[A-Z&][\w&,'\-]*\s+"
+    r"(?:Guide|Policy|Manual|Handbook|Agreement|Schedule|Terms))"
+)
+_PLAIN_VALUE_RE = re.compile(r"^[\d\s,.\-/:+]+$")  # numbers, dates, ids
+_MAX_CROSS_REFS = 3
+_MAX_ATTRIBUTE_TERMS = 8
+_MAX_ATTRIBUTE_CHARS = 32
+
+
+def _cross_reference_titles(evidence: Sequence[Any]) -> list[str]:
+    """Titles of other documents that retrieved passages tell the reader to consult."""
+    titles: list[str] = []
+    for item in evidence:
+        if not isinstance(item, Mapping) or item.get("source_type") != "text_chunk":
+            continue
+        for match in _CROSS_REF_RE.finditer(str(item.get("content") or "")):
+            title = re.sub(r"\s+", " ", match.group(1)).strip(" ,")
+            if not any(title.casefold() in known.casefold() for known in titles):
+                titles.append(title)
+            if len(titles) >= _MAX_CROSS_REFS:
+                return titles
+    return titles
+
+
+def _entity_attribute_terms(evidence: Sequence[Any], anchors: Sequence[str]) -> list[str]:
+    """'Column value' terms from the anchored entity's table rows (tiers, flags, methods)."""
+    needles = {a.strip().casefold() for a in anchors if a and a.strip()}
+    if not needles:
+        return []
+    terms: list[str] = []
+    for item in evidence:
+        if not isinstance(item, Mapping) or item.get("source_type") != "table_query":
+            continue
+        content = item.get("content")
+        rows = content.get("rows") if isinstance(content, Mapping) else None
+        for row in rows or []:
+            if not isinstance(row, Mapping):
+                continue
+            cells = [(str(k), str(v).strip()) for k, v in row.items() if v is not None]
+            if not any(value.casefold() in needles for _, value in cells):
+                continue
+            for column, value in cells:
+                term = f"{column} {value}"
+                if (
+                    value
+                    and value.casefold() not in needles
+                    and len(value) <= _MAX_ATTRIBUTE_CHARS
+                    and not _PLAIN_VALUE_RE.match(value)
+                    and term not in terms
+                ):
+                    terms.append(term)
+    return terms[:_MAX_ATTRIBUTE_TERMS]
+
+
+def dependency_discovery_query(
+    state: Mapping[str, Any],
+    evidence: Sequence[Any] | None = None,
+) -> str:
+    """Build a generic retrieval query for rules that govern a calculation.
+
+    `evidence` (optional) is what has been retrieved so far. Document
+    cross-references found in retrieved text and categorical attributes of the
+    anchored entity's rows are appended, so a governing source the question
+    never names can still be found.
+    """
     query = effective_planning_query(state)
     understanding = state.get("query_understanding") or {}
-    fields = [str(value).strip() for value in understanding.get("requested_fields", []) or [] if str(value).strip()]
-    references = [str(value).strip() for value in understanding.get("references", []) or [] if str(value).strip()]
+    fields = [
+        str(v).strip()
+        for v in understanding.get("requested_fields", []) or []
+        if str(v).strip()
+    ]
+    references = [
+        str(v).strip()
+        for v in understanding.get("references", []) or []
+        if str(v).strip()
+    ]
     entities = []
     for item in (state.get("resolved_references") or {}).get("references", []) or []:
         if not isinstance(item, Mapping) or item.get("status") != "RESOLVED":
             continue
         match = item.get("match") or {}
-        if isinstance(match, Mapping) and match.get("type") == "entity" and match.get("value"):
+        if (
+            isinstance(match, Mapping)
+            and match.get("type") == "entity"
+            and match.get("value")
+        ):
             entities.append(str(match["value"]))
-    subject = " ".join([query, *fields, *references, *entities])
+
+    subject = " ".join([query, *fields, *references, *entities])[:500]
+    pool = list(evidence or [])
+    extra = " ".join(
+        [
+            *_cross_reference_titles(pool),
+            *_entity_attribute_terms(pool, [*entities, *references]),
+        ]
+    )
     suffix = (
         " Find all applicable source rules for this result: definitions, formulas, "
         "eligibility conditions, exclusions, deductions, penalties, caps, limits, "
         "thresholds, exceptions, and rounding rules."
     )
-    return (subject[:700] + suffix)[:1000]
+    return f"{subject} {extra}{suffix}".strip()[:1000]

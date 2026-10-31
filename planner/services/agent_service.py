@@ -37,6 +37,7 @@ from planner.prompts.agent import ACTION_SCHEMA, SYSTEM_PROMPT
 from planner.services.answer import (
     MAX_TEXT_CHARS_PER_ITEM,
     EvidenceTooLarge,
+    _narrow_spreadsheet_tables_v3,
     _parse_answer_response,
     _payload_char_budget,
     answer_evidence_char_room,
@@ -1777,6 +1778,33 @@ def _join_adds_nothing(
     return None
 
 
+def _narrow_structured_to_request(
+    state: AgentState, structured: list[Any]
+) -> list[Any]:  # QP-PATCH-V4
+    """Keep only the spreadsheet rows the question names, before documents are budgeted.
+
+    Whole business tables otherwise consume the evidence budget and leave the
+    governing rule documents a handful of passages. Population questions
+    (totals, rankings, comparisons, "all"...) are never narrowed.
+    """
+    query = effective_planning_query(state)
+    operation = str((state.get("query_understanding") or {}).get("operation") or "")
+    if _query_requires_population_context(query, operation):
+        return structured
+    try:
+        narrowed, count = _narrow_spreadsheet_tables_v3(structured, query)
+    except Exception:
+        logger.exception("structured row narrowing failed; keeping all rows")
+        return structured
+    if count:
+        logger.info(
+            "structured narrowing: %d spreadsheet table(s) reduced to the rows "
+            "the question names",
+            count,
+        )
+    return narrowed
+
+
 def dispatch_node(state: AgentState) -> dict[str, Any]:
     plan = state.get("execution_plan", {})
 
@@ -1962,13 +1990,14 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
                 total_tool_calls += 1
 
         if "DOCUMENT_SEARCH" in capabilities and not skip_document_search:
+            structured = _narrow_structured_to_request(state, structured)  # QP-PATCH-V4
             _STRUCTURED_CHARS.set(  # QP-PATCH
                 len(json.dumps(structured, ensure_ascii=False, default=str))
             )
             _DOC_CHARS_USED.set(0)
             docs = _run_documents(state, budget)
             if requires_dependency_discovery(state):
-                docs = _supplement_dependency_evidence(state, docs)
+                docs = _supplement_dependency_evidence(state, docs, structured)
                 dependency_evidence_found = bool(
                     docs.get("dependency_evidence_found")
                 )
@@ -3656,6 +3685,7 @@ def _document_ids_from_text_evidence(items: list[Any]) -> set[int]:
 def _supplement_dependency_evidence(
     state: AgentState,
     document_result: dict[str, Any],
+    structured: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Search the authorized corpus for governing rules omitted by initial scope.
 
@@ -3669,7 +3699,10 @@ def _supplement_dependency_evidence(
     if not requires_dependency_discovery(state):
         return document_result
 
-    query = dependency_discovery_query(state)
+    query = dependency_discovery_query(  # QP-PATCH-V4
+        state,
+        evidence=list(structured or []) + list(document_result.get("evidence") or []),
+    )
     if not query.strip():
         return {**document_result, "dependency_evidence_found": False}
 

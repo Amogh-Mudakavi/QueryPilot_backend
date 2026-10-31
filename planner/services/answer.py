@@ -1286,6 +1286,9 @@ def _prepare_request(
         payload["partial_evidence"] = partial
     _log_evidence_debug("final_payload", items)
     payload.update(extras)
+    # QP-PATCH-V4: guidance for calculation questions
+    if _calculation_complexity(query, evidence) != "none":
+        payload["guidance"] = _CALCULATION_GUIDANCE
     return (
         json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":")),
         items,
@@ -1455,6 +1458,21 @@ def _answer_effort(query: str, evidence: list[Any] | None = None) -> str:
     """Reasoning effort for the first answer attempt."""
     complexity = _calculation_complexity(query, evidence)
     return _EFFORT_BY_COMPLEXITY[complexity]()
+
+
+# QP-PATCH-V4: generic guidance attached to calculation questions.
+_CALCULATION_GUIDANCE = (
+    "Calculation rules: base every figure on the records of the entity the question "
+    "names. Sample rows, worked examples and illustrations inside rule documents "
+    "describe other, made-up cases; never take dates, amounts or names from them. "
+    "Compute each end date as start date + the stated number of days and recheck it "
+    "against the start date before using it. If a rule says extra days, fees or "
+    "conditions depend on an attribute of the entity (for example a membership flag) "
+    "or on another document, look for that rule in the evidence; if it is absent, say "
+    "exactly what is missing and give the result for each plausible case instead of a "
+    "flat yes or no. Answer every part of the question."
+)
+
 
 RETRY_SYSTEM_PROMPT = (
     "You are QueryPilot's Answer Generator. Answer the CURRENT user query "
@@ -1806,6 +1824,17 @@ def _id_cells(row: Any) -> set[str]:
     }
 
 
+def _exact_id_mentioned(row: Any, query: str) -> bool:  # QP-PATCH-V4
+    """An identifier-like cell (letters + digits) appears verbatim in the question."""
+    text = str(query or "").lower()
+    for cell in _row_cell_values(row):
+        if isinstance(cell, str) and _ID_LIKE_CELL_V3.match(cell.strip()):
+            pattern = rf"(?<![a-z0-9]){re.escape(cell.strip().lower())}(?![a-z0-9])"
+            if re.search(pattern, text):
+                return True
+    return False
+
+
 def _narrow_spreadsheet_tables_v3(
     items: list[Any], query: str
 ) -> tuple[list[Any], int]:
@@ -1841,7 +1870,9 @@ def _narrow_spreadsheet_tables_v3(
     named: dict[int, set[int]] = {}
     for pos in candidates:
         rows = items[pos]["content"]["rows"]
-        named[pos] = {
+        # QP-PATCH-V4: an identifier named verbatim beats loose token matches
+        strong = {i for i, row in enumerate(rows) if _exact_id_mentioned(row, query)}
+        named[pos] = strong or {
             i
             for i, row in enumerate(rows)
             if any(_cell_is_mentioned(c, query) for c in _row_cell_values(row))
