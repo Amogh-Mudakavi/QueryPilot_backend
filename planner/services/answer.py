@@ -1157,6 +1157,96 @@ def _payload_item(item: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# QP-PATCH-V3: lossless, generic compaction of the MODEL-FACING payload.
+# Removes repetition only: nothing about the evidence itself changes.
+# ---------------------------------------------------------------------------
+_PAYLOAD_DROP_CONTENT_KEYS = frozenset({"success", "tables_used"})
+_PAYLOAD_DROP_ITEM_KEYS = frozenset({"workspace_id"})
+
+
+def _lossless_cell(value: Any) -> Any:
+    if (
+        isinstance(value, float)
+        and math.isfinite(value)
+        and value.is_integer()
+        and abs(value) < 1e15
+    ):
+        return int(value)
+    return value
+
+
+def _compact_table_content(content: dict[str, Any]) -> dict[str, Any]:
+    """Columns once + list rows; same values, fewer repeated keys."""
+    out = {k: v for k, v in content.items() if k not in _PAYLOAD_DROP_CONTENT_KEYS}
+    columns = [str(c) for c in content.get("columns") or []]
+    rows = content.get("rows")
+    if not columns or not isinstance(rows, list):
+        return out
+    known = set(columns)
+    packed: list[list[Any]] = []
+    for row in rows:
+        if isinstance(row, dict):
+            if any(str(k) not in known for k in row):
+                return out  # unexpected shape: leave rows exactly as they are
+            by_name = {str(k): v for k, v in row.items()}
+            packed.append([_lossless_cell(by_name.get(c)) for c in columns])
+        elif isinstance(row, (list, tuple)) and len(row) == len(columns):
+            packed.append([_lossless_cell(v) for v in row])
+        else:
+            return out
+    if packed:
+        keep = [j for j in range(len(columns)) if any(not _empty(r[j]) for r in packed)]
+        if len(keep) != len(columns):
+            columns = [columns[j] for j in keep]
+            packed = [[r[j] for j in keep] for r in packed]
+    out["columns"] = columns
+    out["rows"] = packed
+    if out.get("row_count") == len(packed):
+        out.pop("row_count", None)
+    return out
+
+
+def _compact_payload_item(payload: dict[str, Any], seen_text: set[str]) -> dict[str, Any]:
+    item = {k: v for k, v in payload.items() if k not in _PAYLOAD_DROP_ITEM_KEYS}
+    metadata = item.get("metadata")
+    if isinstance(metadata, dict) and "workspace_id" in metadata:
+        item["metadata"] = {k: v for k, v in metadata.items() if k != "workspace_id"}
+    content = item.get("content")
+    if (
+        isinstance(content, dict)
+        and content.get("scope") != "aggregate_result"
+        and isinstance(content.get("columns"), list)
+        and isinstance(content.get("rows"), list)
+    ):
+        content = _compact_table_content(content)
+        note = content.get("interpretation")
+        if isinstance(note, str) and note.strip():
+            if note in seen_text:
+                content.pop("interpretation", None)  # identical boilerplate, said once
+            else:
+                seen_text.add(note)
+        item["content"] = content
+    return item
+
+
+def _payload_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    raw = [_payload_item(item) for item in items]
+    if os.environ.get("QUERYPILOT_COMPACT_TABLES", "1").strip() == "0":
+        return raw
+    seen_text: set[str] = set()
+    compact = [_compact_payload_item(p, seen_text) for p in raw]
+    before, after = _size(raw), _size(compact)
+    if after < before:
+        logger.info(
+            "payload_compaction: evidence chars %d -> %d (lossless, %d%% smaller)",
+            before,
+            after,
+            round(100 * (before - after) / max(before, 1)),
+        )
+    return compact
+
+
 def _prepare_request(
     *,
     query: str,
@@ -1186,7 +1276,7 @@ def _prepare_request(
     contract = _population_contract(evidence=evidence)
     payload: dict[str, Any] = {
         "user_query": query,
-        "evidence": [_payload_item(item) for item in items],
+        "evidence": _payload_items(items),
     }
     hint = _population_hint(contract, has_aggregate)
     if hint:
@@ -1703,6 +1793,97 @@ def _narrow_spreadsheet_tables(
     return out, changed
 
 
+_ID_LIKE_CELL_V3 = re.compile(  # QP-PATCH-V3
+    r"^(?=.*\d)(?=.*[A-Za-z])[A-Za-z0-9][A-Za-z0-9._\-]{2,39}$"
+)
+
+
+def _id_cells(row: Any) -> set[str]:
+    return {
+        c.strip().lower()
+        for c in _row_cell_values(row)
+        if isinstance(c, str) and _ID_LIKE_CELL_V3.match(c.strip())
+    }
+
+
+def _narrow_spreadsheet_tables_v3(
+    items: list[Any], query: str
+) -> tuple[list[Any], int]:
+    """Generic row narrowing for big spreadsheet tables.
+
+    1. A row is "named" when one of its cells is mentioned in the question.
+    2. The spreadsheet table with the FEWEST named rows is the anchor; the
+       identifier-like cells of its named rows (codes that mix letters and digits)
+       are collected.
+    3. In every OTHER big spreadsheet table, rows sharing one of those identifiers
+       are kept (if any); otherwise its own named rows are kept.
+    Skipped for population questions; document tables (pdf/docx) are never touched;
+    a table is only narrowed when the result is selective. Narrowed tables are marked
+    truncated so the answer prompt treats them as partial samples.
+    """
+    if _POPULATION_CUE.search(query or ""):
+        return items, 0
+    candidates: list[int] = []
+    for pos, item in enumerate(items):
+        if not (isinstance(item, dict) and _is_table(item)):
+            continue
+        content = item["content"]
+        title = str(content.get("document") or content.get("document_title") or "")
+        if (
+            _SPREADSHEET_TITLE.search(title)
+            and len(content["rows"]) > _NARROW_MIN_ROWS
+            and content.get("query_type") not in {"ranking", "positional"}
+        ):
+            candidates.append(pos)
+    if not candidates:
+        return items, 0
+
+    named: dict[int, set[int]] = {}
+    for pos in candidates:
+        rows = items[pos]["content"]["rows"]
+        named[pos] = {
+            i
+            for i, row in enumerate(rows)
+            if any(_cell_is_mentioned(c, query) for c in _row_cell_values(row))
+        }
+
+    def selective(pos: int, keep: set[int]) -> bool:
+        return bool(keep) and len(keep) <= max(3, len(items[pos]["content"]["rows"]) // 2)
+
+    usable = [p for p in candidates if selective(p, named[p])]
+    anchor = min(usable, key=lambda p: len(named[p])) if usable else None
+    anchor_ids: set[str] = set()
+    if anchor is not None:
+        anchor_rows = items[anchor]["content"]["rows"]
+        for i in named[anchor]:
+            anchor_ids |= _id_cells(anchor_rows[i])
+
+    out = list(items)
+    changed = 0
+    for pos in candidates:
+        content = items[pos]["content"]
+        rows = content["rows"]
+        keep: set[int] = set()
+        if anchor_ids and pos != anchor:
+            keep = {i for i, row in enumerate(rows) if _id_cells(row) & anchor_ids}
+        if not keep and selective(pos, named[pos]):
+            keep = set(named[pos])
+        if not keep or len(keep) > max(3, len(rows) // 2):
+            continue
+        new_content = dict(content)
+        new_content["rows"] = [rows[i] for i in sorted(keep)]
+        new_content["source_rows"] = content.get("source_rows", len(rows))
+        new_content["rows_omitted_from_prompt"] = len(rows) - len(keep)
+        new_content["truncated"] = True
+        if "row_count" in new_content:
+            new_content["row_count"] = len(keep)
+        new_item = dict(items[pos])
+        new_item["content"] = new_content
+        out[pos] = new_item
+        changed += 1
+    return out, changed
+
+
 def fit_evidence_to_budget(
     *,
     query: str,
@@ -1741,7 +1922,7 @@ def fit_evidence_to_budget(
         return items
 
     # Stage 1b - narrow big spreadsheet tables to the rows the question names
-    items, narrowed = _narrow_spreadsheet_tables(items, query)  # QP-PATCH-V2
+    items, narrowed = _narrow_spreadsheet_tables_v3(items, query)  # QP-PATCH-V3
     if narrowed:
         logger.warning(
             "fit_evidence_to_budget: narrowed %d spreadsheet table(s) to named rows",
@@ -1797,5 +1978,30 @@ def fit_evidence_to_budget(
             )
             return trial
 
-    logger.error("fit_evidence_to_budget: could not fit evidence; keeping original")
+    _largest = sorted(
+        (
+            (
+                _size(it),
+                str(it.get("source_type") if isinstance(it, dict) else type(it).__name__),
+                str(
+                    (it.get("content") or {}).get("document_title")
+                    or (it.get("content") or {}).get("document")
+                    or it.get("document_name")
+                    or ""
+                )
+                if isinstance(it, dict) and isinstance(it.get("content", {}), dict)
+                else "",
+                len((it.get("content") or {}).get("rows") or [])
+                if isinstance(it, dict) and isinstance(it.get("content", {}), dict)
+                else 0,
+            )
+            for it in evidence
+        ),
+        reverse=True,
+    )[:5]
+    logger.error(
+        "fit_evidence_to_budget: could not fit evidence; keeping original. "
+        "Largest items (chars, type, document, rows): %s",
+        _largest,
+    )
     return evidence
