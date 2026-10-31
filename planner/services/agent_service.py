@@ -4140,9 +4140,11 @@ def _apply_table_scope(
     scope = _table_scope(state)
     if not scope:
         return schema
-    scoped = [item for item in schema if str(item.get("table_name")) in scope]
-
-    return scoped or schema
+    # An explicit table scope is authoritative. If none of the supplied
+    # schema entries match it, return no tables rather than silently widening
+    # back to the full schema (which defeats selection and can overflow the
+    # answer context).
+    return [item for item in schema if str(item.get("table_name")) in scope]
 
 
 def _resolved_table_names(state: AgentState) -> set[str]:
