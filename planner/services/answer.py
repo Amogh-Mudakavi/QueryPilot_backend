@@ -112,6 +112,12 @@ def _payload_char_budget() -> int:
     return max(int(provider_room * CHARS_PER_TOKEN), MIN_EVIDENCE_CHARS)
 
 
+# QP-PATCH-V2: smallest completion allowance worth sending an answer call with.
+MIN_ANSWER_COMPLETION_TOKENS = int(
+    os.environ.get("QUERYPILOT_MIN_ANSWER_TOKENS", "1500")
+)
+
+
 class EvidenceTooLarge(ValueError):  # QP-PATCH
     """Complete evidence + answer allowance exceeds the provider TPM reservation.
 
@@ -150,6 +156,16 @@ def _completion_budget(
     )
     request_limit = MODEL_TPM_LIMITS[MODEL_120B]
     reserved_tokens = input_tokens + max_tokens
+    if reserved_tokens > MODEL_TPM_LIMITS[MODEL_120B]:  # QP-PATCH-V2
+        _room = MODEL_TPM_LIMITS[MODEL_120B] - input_tokens
+        if _room >= MIN_ANSWER_COMPLETION_TOKENS:
+            logger.warning(
+                "answer_call_budget: completion cap lowered %d -> %d to fit TPM limit",
+                max_tokens,
+                _room,
+            )
+            max_tokens = _room
+            reserved_tokens = input_tokens + max_tokens
     logger.info(
         "answer_call_budget: complexity=%s input~%d completion_cap=%d "
         "reserved~%d provider_tpm_limit=%d evidence_chars=%d",
@@ -1599,21 +1615,92 @@ def _fits_answer_budget(
     items: list[Any],
     conversation_history: list[dict[str, Any]] | None,
 ) -> bool:
+    _previous_level = logger.level  # QP-PATCH-V2: keep the evidence debug spam out
+    logger.setLevel(logging.WARNING)
     try:
         payload, _, _ = _prepare_request(
             query=query, evidence=items, conversation_history=conversation_history
         )
     except Exception:
         return False
+    finally:
+        logger.setLevel(_previous_level)
     complexity = _calculation_complexity(query, items)
     cap_key = complexity if complexity in ANSWER_OUTPUT_TOKEN_CAPS else "normal"
     reserved = (
         _system_tokens()
         + _estimate_tokens(payload)
         + REQUEST_OVERHEAD_TOKENS
-        + ANSWER_OUTPUT_TOKEN_CAPS[cap_key]
+        + min(ANSWER_OUTPUT_TOKEN_CAPS[cap_key], 2000)
     )
     return reserved <= MODEL_TPM_LIMITS[MODEL_120B]
+
+
+_SPREADSHEET_TITLE = re.compile(r"\.(xlsx|xlsm|xls|csv|tsv)$", re.IGNORECASE)  # QP-PATCH-V2
+_POPULATION_CUE = re.compile(
+    r"\b(all|every|each|everyone|list|total|sum|average|avg|mean|count|how many|"
+    r"rank|ranking|top|highest|lowest|most|least|compare|which)\b",
+    re.IGNORECASE,
+)
+_NARROW_MIN_ROWS = 6
+
+
+def _row_cell_values(row: Any) -> list[Any]:
+    if isinstance(row, dict):
+        return list(row.values())
+    if isinstance(row, (list, tuple)):
+        return list(row)
+    return [row]
+
+
+def _narrow_spreadsheet_tables(
+    items: list[Any], query: str
+) -> tuple[list[Any], int]:
+    """Keep only the rows of big SPREADSHEET tables that the question names.
+
+    Business-data tables (xlsx/csv) are narrowed when the question mentions
+    specific cell values; document-extracted policy/rule tables (pdf, docx) are
+    never touched. Skipped for population questions. A narrowed table is marked
+    truncated, so the answer prompt treats it as a partial sample (no counting).
+    """
+    if _POPULATION_CUE.search(query or ""):
+        return items, 0
+    out: list[Any] = []
+    changed = 0
+    for item in items:
+        if not (isinstance(item, dict) and _is_table(item)):
+            out.append(item)
+            continue
+        content = item["content"]
+        title = str(content.get("document") or content.get("document_title") or "")
+        rows = content["rows"]
+        if (
+            not _SPREADSHEET_TITLE.search(title)
+            or len(rows) <= _NARROW_MIN_ROWS
+            or content.get("query_type") in {"ranking", "positional"}
+        ):
+            out.append(item)
+            continue
+        scores = [
+            sum(_cell_is_mentioned(cell, query) for cell in _row_cell_values(row))
+            for row in rows
+        ]
+        keep = [i for i, score in enumerate(scores) if score > 0]
+        if not keep or len(keep) > max(3, len(rows) // 2):
+            out.append(item)
+            continue
+        new_content = dict(content)
+        new_content["rows"] = [rows[i] for i in keep]
+        new_content["source_rows"] = content.get("source_rows", len(rows))
+        new_content["rows_omitted_from_prompt"] = len(rows) - len(keep)
+        new_content["truncated"] = True
+        if "row_count" in new_content:
+            new_content["row_count"] = len(keep)
+        new_item = dict(item)
+        new_item["content"] = new_content
+        out.append(new_item)
+        changed += 1
+    return out, changed
 
 
 def fit_evidence_to_budget(
@@ -1652,6 +1739,16 @@ def fit_evidence_to_budget(
         logger.warning("fit_evidence_to_budget: dropped %d duplicate passage(s)", len(drop))
     if _fits_answer_budget(query, items, conversation_history):
         return items
+
+    # Stage 1b - narrow big spreadsheet tables to the rows the question names
+    items, narrowed = _narrow_spreadsheet_tables(items, query)  # QP-PATCH-V2
+    if narrowed:
+        logger.warning(
+            "fit_evidence_to_budget: narrowed %d spreadsheet table(s) to named rows",
+            narrowed,
+        )
+        if _fits_answer_budget(query, items, conversation_history):
+            return items
 
     # Stage 2 - NOT_FOUND evidence notes
     kept = [
