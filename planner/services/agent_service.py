@@ -3385,6 +3385,10 @@ _DOC_CHARS_USED: contextvars.ContextVar[int] = contextvars.ContextVar(
     "qp_doc_chars_used", default=0
 )
 _MIN_DOC_BUDGET = 2000
+# QP-PATCH-DEPENDENCY-FLOOR: a document the dependency search identified always gets at
+# least this much room (chosen by relevance), even when structured
+# evidence has used up the leftover answer budget.
+_DEPENDENCY_MIN_CHARS = 4000
 _NOTE_RESERVE_CHARS = 1500
 
 
@@ -3744,13 +3748,23 @@ def _supplement_dependency_evidence(
     already_loaded = _document_ids_from_text_evidence(primary)
     dependency_ids = sorted(dependency_id_set - already_loaded)
     dependency_coverage: list[Any] = []
-    if dependency_ids and _remaining_evidence_chars() >= _MIN_DOC_BUDGET:
+    dependency_notes: list[Any] = []  # QP-PATCH-DEPENDENCY-FLOOR
+    dependency_cov_info: list[Any] = []
+    _dep_room = _remaining_evidence_chars()
+    logger.info(
+        "Supplemental dependency load: ids=%s remaining_chars=%d floor=%d",
+        dependency_ids,
+        _dep_room,
+        _DEPENDENCY_MIN_CHARS,
+    )
+    if dependency_ids:
         try:
             covered = _run_documents_with_coverage(
                 state,
                 dependency_ids,
                 query,
                 require_complete=False,
+                budget_chars=max(_dep_room, _DEPENDENCY_MIN_CHARS),
             )
         except Exception:
             logger.exception(
@@ -3760,6 +3774,8 @@ def _supplement_dependency_evidence(
             covered = None
         if covered is not None:
             dependency_coverage = list(covered.get("evidence", []) or [])
+            dependency_notes = list(covered.get("notes") or [])
+            dependency_cov_info = list(covered.get("coverage") or [])
 
     # Prefer coverage for documents it actually represented, avoiding duplicate
     # top-k chunks for the same document. Keep ranked results as a fallback if
@@ -3796,9 +3812,26 @@ def _supplement_dependency_evidence(
         len(dependency_coverage),
         found_ids,
     )
+    if dependency_ids and not dependency_coverage:  # QP-PATCH-DEPENDENCY-FLOOR
+        dependency_notes.append(
+            {
+                "source_type": "evidence_note",
+                "result_status": "SUCCESS",
+                "content": (
+                    "Document coverage. Source document(s) "
+                    + ", ".join(str(i) for i in dependency_ids)
+                    + " were identified as relevant, but only a few ranked "
+                    "passages of them could be included. If the answer needs "
+                    "content that is not in the provided passages, say it was "
+                    "not found in the provided passages; do not guess."
+                ),
+            }
+        )
     return {
         **document_result,
         "evidence": combined,
+        "notes": list(document_result.get("notes") or []) + dependency_notes,
+        "coverage": list(document_result.get("coverage") or []) + dependency_cov_info,
         "confidence": max(old_confidence, new_confidence),
         "error": None if combined else document_result.get("error"),
         "degraded": bool(document_result.get("degraded"))
