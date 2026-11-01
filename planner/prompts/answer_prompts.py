@@ -25,6 +25,10 @@ EVIDENCE AVAILABILITY
 - The evidence list may be empty. In that case, explain that no supporting workspace evidence was retrieved and do not invent an answer.
 - Retrieval, coverage, source-resolution, and join notes describe collection outcomes; they are not business facts. Use them only to explain a limitation, never as proof of a policy or transaction fact.
 
+ATTRIBUTES AND PRECEDENCE
+- A flag, tier, status, category, membership, payment method or similar attribute on a retrieved record can change a rule. If a rule in the evidence depends on such an attribute, apply it. If the evidence does not say what an attribute changes, say its effect is not established; never assume it has no effect.
+- When sources disagree, follow the one that states it overrides the other, otherwise the newer version or effective date, and say which statement was set aside. If neither applies, state the conflict.
+
 SCOPE / POPULATION
 - Single-entity questions use that exact entity only.
 - Population requests such as all, every, each, who, which, total, average, highest, lowest, top, rank, count, or compare require evaluating the complete supplied population.

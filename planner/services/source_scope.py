@@ -284,6 +284,49 @@ def _entity_attribute_terms(evidence: Sequence[Any], anchors: Sequence[str]) -> 
     return terms[:_MAX_ATTRIBUTE_TERMS]
 
 
+_FALLBACK_MAX_ROWS = 3  # QP-GEN-6a
+_FLAG_WORDS = {"yes", "no", "true", "false", "y", "n"}
+
+
+def _entity_attribute_terms_with_fallback(
+    evidence: Sequence[Any], anchors: Sequence[str]
+) -> list[str]:
+    """Anchored attribute terms; else the attributes of a very small table result.
+
+    A table result with only a few rows is already scoped to the entity the
+    question is about, so its categorical/flag values are valid discovery terms
+    even when the planner's reference text matches no cell exactly. Yes/no style
+    flags come first because they most often point at a conditional rule.
+    """
+    terms = _entity_attribute_terms(evidence, anchors)
+    if terms:
+        return terms
+    collected: list[str] = []
+    for item in evidence or []:
+        if not isinstance(item, Mapping) or item.get("source_type") != "table_query":
+            continue
+        content = item.get("content")
+        rows = content.get("rows") if isinstance(content, Mapping) else None
+        rows = [row for row in rows or [] if isinstance(row, Mapping)]
+        if not rows or len(rows) > _FALLBACK_MAX_ROWS:
+            continue
+        for row in rows:
+            for column, value in row.items():
+                if value is None:
+                    continue
+                text = str(value).strip()
+                term = f"{column} {text}"
+                if (
+                    text
+                    and len(text) <= _MAX_ATTRIBUTE_CHARS
+                    and not _PLAIN_VALUE_RE.match(text)
+                    and term not in collected
+                ):
+                    collected.append(term)
+    collected.sort(key=lambda t: 0 if t.rsplit(" ", 1)[-1].casefold() in _FLAG_WORDS else 1)
+    return collected[:_MAX_ATTRIBUTE_TERMS]
+
+
 def dependency_discovery_query(
     state: Mapping[str, Any],
     evidence: Sequence[Any] | None = None,
@@ -324,7 +367,7 @@ def dependency_discovery_query(
     extra = " ".join(
         [
             *_cross_reference_titles(pool),
-            *_entity_attribute_terms(pool, [*entities, *references]),
+            *_entity_attribute_terms_with_fallback(pool, [*entities, *references]),  # QP-GEN-6b
         ]
     )
     suffix = (

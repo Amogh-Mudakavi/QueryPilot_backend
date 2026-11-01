@@ -2177,6 +2177,8 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
                 dependency_evidence_found = bool(
                     docs.get("dependency_evidence_found")
                 )
+            else:  # QP-GEN-3b
+                docs = _supplement_row_fact_evidence(state, docs, structured)
             retrieval_calls = max(1, int(docs.get("calls", 1)))
             for _ in range(retrieval_calls):
                 total_tool_calls = _count_tool_call(total_tool_calls)
@@ -3766,8 +3768,12 @@ def _search_evidence_variants(
     degraded = False
     calls = 0
 
+    # QP-GEN-1c: share the call budget fairly between documents so a later
+    # document is never starved by the queries spent on an earlier one.
+    _call_cap = max(0, min(MAX_TOOL_CALLS_PER_QUERY, int(max_calls)))
+    _per_target = max(1, min(_MAX_RETRIEVAL_QUERIES, _call_cap // max(1, len(targets))))
     for document_id in targets:
-        for query in queries[:3]:
+        for query in queries[:_per_target]:
             if calls >= max(0, min(MAX_TOOL_CALLS_PER_QUERY, int(max_calls))):
                 logger.warning("document retrieval query budget reached; stopping variants")
                 break
@@ -3822,6 +3828,11 @@ def _search_evidence_variants(
     }
 
 
+# QP-GEN-1a: the planner's per-requirement queries (rules, exceptions, fees)
+# used to be cut off after the raw question + effective question + one more.
+_MAX_RETRIEVAL_QUERIES = 6
+
+
 def _retrieval_queries_for_state(state: AgentState) -> list[str]:
     original = str(state.get("query") or "").strip()
     effective = effective_planning_query(state)
@@ -3838,7 +3849,7 @@ def _retrieval_queries_for_state(state: AgentState) -> list[str]:
         value = str(candidate or "").strip()
         if value and value.casefold() not in {item.casefold() for item in queries}:
             queries.append(value)
-        if len(queries) >= 3:
+        if len(queries) >= _MAX_RETRIEVAL_QUERIES:  # QP-GEN-1b
             break
     return queries or [effective] if effective else queries
 
@@ -4148,18 +4159,78 @@ def _doc_and_chunk_indexes(item: Any) -> tuple[int | None, set[int]]:  # QP-FIX-
     return doc, {i for i in indexes if isinstance(i, int)}
 
 
+# QP-GEN-2a: a row value only matters if some prose says what it changes, so
+# the search text asks for rules/conditions, not just for the value itself.
+_FACT_RULE_SUFFIX = "rules conditions benefits exceptions"
+
+
+def _structured_columns_for_log(structured: Any) -> list[list[str]]:  # QP-GEN-7b
+    columns: list[list[str]] = []
+    for item in structured or []:
+        content = item.get("content") if isinstance(item, dict) else None
+        if isinstance(content, dict) and content.get("columns"):
+            columns.append([str(c) for c in content.get("columns") or []][:25])
+    return columns[:5]
+
+_FACT_MAX_HITS_PER_PHRASE = 2
+_FACT_MAX_HITS = 5
+
+
+def _loaded_chunk_map(items: list[Any]) -> dict[int, set[int] | None]:
+    """doc id -> chunk indexes already in the evidence (None = whole document)."""
+    loaded: dict[int, set[int] | None] = {}
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        doc, indexes = _doc_and_chunk_indexes(item)
+        if doc is None:
+            continue
+        if str(meta.get("retrieval_method") or "") == "full_document":
+            loaded[doc] = None
+            continue
+        if doc in loaded and loaded[doc] is None:
+            continue
+        loaded.setdefault(doc, set()).update(indexes)
+    return loaded
+
+
+def _row_fact_hit_already_loaded(
+    item: Any,
+    already_loaded: set[int],
+    loaded_chunks: dict[int, set[int] | None] | None,
+) -> bool:
+    """True when this exact passage (not merely its document) is already present."""
+    doc, indexes = _doc_and_chunk_indexes(item)
+    if doc is None:
+        return False
+    if doc in (already_loaded or set()):
+        return True
+    if loaded_chunks and doc in loaded_chunks:
+        seen = loaded_chunks[doc]
+        if seen is None or not indexes:
+            return True
+        return indexes <= seen
+    return False
+
+
 def _search_row_facts(
     state: AgentState,
     phrases: list[str],
     allowed_ids: Any,
     base_query: str,
     already_loaded: set[int],
+    loaded_chunks: dict[int, set[int] | None] | None = None,
 ) -> list[Any]:
-    """Text chunks found through row facts, from documents NOT yet loaded."""
+    """Passages found through row facts that are not already in the evidence."""
     hits: list[Any] = []
     seen: set[tuple[Any, Any]] = set()
     for phrase in phrases:
+        if len(hits) >= _FACT_MAX_HITS:
+            break
+        _phrase_hits = 0
         text = f"{phrase} {base_query}" if _FACT_INCLUDE_QUESTION else phrase
+        text = f"{text} {_FACT_RULE_SUFFIX}"
         try:
             found = search_evidence(
                 query=text,
@@ -4174,13 +4245,16 @@ def _search_row_facts(
         for item in found.get("evidence", []) or []:
             if not isinstance(item, dict):
                 continue
-            if _document_ids_from_text_evidence([item]) & already_loaded:
+            if _row_fact_hit_already_loaded(item, already_loaded, loaded_chunks):  # QP-GEN-2b
                 continue
             meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
             ident = (item.get("document_id"), meta.get("chunk_index"))
             if ident in seen:
                 continue
+            if _phrase_hits >= _FACT_MAX_HITS_PER_PHRASE or len(hits) >= _FACT_MAX_HITS:
+                break
             seen.add(ident)
+            _phrase_hits += 1
             hits.append(item)
     return hits
 
@@ -4231,6 +4305,11 @@ def _supplement_dependency_evidence(
     primary = list(document_result.get("evidence", []) or [])
     coverage_query = query  # QP-FIX-4
     _fact_phrases = _row_fact_phrases(state, list(structured or []))
+    if not _fact_phrases:  # QP-GEN-7a
+        logger.info(
+            "row-fact text search: no attribute phrases; structured columns=%s",
+            _structured_columns_for_log(structured),
+        )
     _fact_chunk_map: dict[int, set[int]] = {}  # QP-FIX-5: doc id -> chunks found via row facts
     if _fact_phrases:
         _fact_hits = _mark_success(
@@ -4239,7 +4318,8 @@ def _supplement_dependency_evidence(
                 _fact_phrases,
                 allowed_ids,
                 query,
-                _document_ids_from_text_evidence(primary),
+                set(),
+                loaded_chunks=_loaded_chunk_map(primary),  # QP-GEN-2c
             )
         )
         logger.info(
@@ -4328,10 +4408,17 @@ def _supplement_dependency_evidence(
     # top-k chunks for the same document. Keep ranked results as a fallback if
     # full-document loading returned no usable passage for that source.
     covered_ids = _document_ids_from_text_evidence(dependency_coverage) | already_loaded
+    # QP-GEN-2d: a passage found through a row fact is kept when THAT passage
+    # is missing, even if other passages of its document are already loaded.
+    _covered_map = _loaded_chunk_map(list(dependency_coverage) + list(primary))
     remaining_supplemental = [
         item
         for item in supplemental
-        if not (_document_ids_from_text_evidence([item]) & covered_ids)
+        if (
+            not _row_fact_hit_already_loaded(item, set(), _covered_map)
+            if isinstance(item, dict) and item.get("protect_from_trim")
+            else not (_document_ids_from_text_evidence([item]) & covered_ids)
+        )
     ]
     # QP-PATCH: ranked fallback chunks must also fit the remaining room.
     _room_left = max(_remaining_evidence_chars(), 0)
@@ -4339,7 +4426,8 @@ def _supplement_dependency_evidence(
     _used = 0
     for _item in remaining_supplemental:
         _size = len(str(_item.get("content") or "")) if isinstance(_item, dict) else 0
-        if _used + _size > _room_left:
+        _is_protected = isinstance(_item, dict) and bool(_item.get("protect_from_trim"))
+        if _used + _size > _room_left and not _is_protected:  # QP-GEN-2e
             break
         _fitted.append(_item)
         _used += _size
@@ -4385,6 +4473,60 @@ def _supplement_dependency_evidence(
         or bool(discovered.get("degraded")),
         "dependency_evidence_found": True,
     }
+
+
+def _supplement_row_fact_evidence(
+    state: AgentState,
+    document_result: dict[str, Any],
+    structured: list[Any] | None = None,
+) -> dict[str, Any]:
+    """QP-GEN-3a: let table rows pull in the prose rules that depend on them.
+
+    Runs for requests that were routed to document search but are not
+    "calculation" requests (those use _supplement_dependency_evidence). It
+    takes yes/no or low-variety attributes of the matched rows and searches the
+    authorized documents for what those attributes change. Bounded, protected
+    from trimming, and a no-op when no such attribute exists.
+    """
+    try:
+        phrases = _row_fact_phrases(state, list(structured or []))
+        if not phrases:
+            return document_result
+        primary = list(document_result.get("evidence") or [])
+        hits = _mark_success(
+            _search_row_facts(
+                state,
+                phrases,
+                authorized_document_ids(state),
+                effective_planning_query(state),
+                set(),
+                loaded_chunks=_loaded_chunk_map(primary),
+            )
+        )
+        logger.info(
+            "row-fact text search (non-calculation): phrases=%s new_chunks=%d "
+            "document_ids=%s",
+            phrases,
+            len(hits),
+            sorted(_document_ids_from_text_evidence(hits)),
+        )
+        if not hits:
+            return document_result
+        for hit in hits:
+            if isinstance(hit, dict):
+                hit["protect_from_trim"] = True
+        _DOC_CHARS_USED.set(
+            _DOC_CHARS_USED.get()
+            + sum(len(str(h.get("content") or "")) for h in hits if isinstance(h, dict))
+        )
+        return {
+            **document_result,
+            "evidence": _canonicalize_evidence(hits + primary),
+            "row_fact_evidence_found": True,
+        }
+    except Exception:
+        logger.exception("row-fact supplement failed; keeping existing evidence")
+        return document_result
 
 
 def _tables_used_by_table_query(table: dict[str, Any] | None) -> set[str]:
