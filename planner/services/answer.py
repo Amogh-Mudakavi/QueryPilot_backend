@@ -1252,17 +1252,59 @@ def _payload_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return compact
 
 
+def _planner_requirements_for_answer(
+    requirements: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Build a bounded checklist for the answer model; never assess completion."""
+    if not isinstance(requirements, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for item in requirements[:12]:
+        if not isinstance(item, dict):
+            continue
+        requirement_id = str(item.get("id") or "").strip()[:32]
+        description = str(item.get("description") or "").strip()[:700]
+        if not requirement_id or not description:
+            continue
+
+        entry: dict[str, Any] = {
+            "id": requirement_id,
+            "description": description,
+        }
+        for key, limit in (("kind", 16), ("type", 24)):
+            value = str(item.get(key) or "").strip()[:limit]
+            if value:
+                entry[key] = value
+
+        for key in ("entities", "depends_on"):
+            raw_values = item.get(key)
+            if not isinstance(raw_values, list):
+                continue
+            values = list(
+                dict.fromkeys(
+                    str(value).strip()[:160]
+                    for value in raw_values
+                    if isinstance(value, (str, int)) and str(value).strip()
+                )
+            )[:8]
+            if values or key == "depends_on":
+                entry[key] = values
+        normalized.append(entry)
+
+    return normalized
+
+
 def _prepare_request(
     *,
     query: str,
     evidence: list[Any],
     conversation_history: list[dict[str, Any]] | None,
+    planner_requirements: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
     """Returns (payload_json, canonical_items, population_contract)."""
     if not query.strip():
         raise ValueError("Answer generation query cannot be empty.")
-    if not evidence:
-        raise ValueError("Answer generation requires evidence.")
     extras: dict[str, Any] = {}
     history = _answer_history(conversation_history, query)
     if history:
@@ -1283,6 +1325,15 @@ def _prepare_request(
         "user_query": query,
         "evidence": _payload_items(items),
     }
+    answer_requirements = _planner_requirements_for_answer(planner_requirements)
+    if answer_requirements:
+        payload["planner_requirements"] = answer_requirements
+    if not items:
+        payload["evidence_status"] = (
+            "No source evidence items were returned by workspace retrieval. "
+            "Do not infer workspace facts; explain that the requested facts "
+            "could not be established from retrieved sources."
+        )
     hint = _population_hint(contract, has_aggregate)
     if hint:
         payload["population"] = hint
@@ -1659,12 +1710,14 @@ def generate_answer_stream(
     query: str,
     evidence: list[Any],
     conversation_history: list[dict[str, Any]] | None = None,
+    planner_requirements: list[dict[str, Any]] | None = None,
 ) -> Iterator[str]:
     """True provider-level plain-text Markdown stream."""
     payload, canon_items, _ = _prepare_request(
         query=query,
         evidence=evidence,
         conversation_history=conversation_history,
+        planner_requirements=planner_requirements,
     )
     indices = [item["citation_index"] for item in canon_items]
     logger.info(

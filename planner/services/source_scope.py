@@ -226,27 +226,6 @@ def requires_document_evidence(
     return (not has_structured_document_evidence) or requires_dependency_discovery(state)
 
 
-def can_answer_from_evidence(
-    state: Mapping[str, Any],
-    *,
-    has_structured_evidence: bool,
-    documents_usable: bool,
-    skip_document_search: bool = False,
-    has_structured_document_evidence: bool = False,
-    dependency_evidence_found: bool = False,
-) -> bool:
-    """Fail closed when a mixed calculation lacks its required rule evidence."""
-    rules_required = requires_document_evidence(
-        state,
-        skip_document_search=skip_document_search,
-        has_structured_document_evidence=has_structured_document_evidence,
-    )
-    dependencies_required = requires_dependency_discovery(state)
-    return (has_structured_evidence or documents_usable) and not (
-        rules_required and not documents_usable
-    ) and not (dependencies_required and not dependency_evidence_found)
-
-
 # QP-PATCH-V4: dependency discovery also searches on document cross-references
 # and entity attributes found in the evidence retrieved so far.
 _CROSS_REF_RE = re.compile(

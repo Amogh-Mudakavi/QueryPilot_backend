@@ -68,7 +68,6 @@ from planner.services.intent import (
 )
 from planner.services.source_scope import (
     authorized_document_ids,
-    can_answer_from_evidence,
     candidate_document_ids,
     contextual_planning_query,
     dependency_discovery_query,
@@ -86,12 +85,7 @@ from planner.services.sql_generation import generate_sql
 from planner.services.state import AgentState
 from planner.services.requirements import normalize_requirements
 from planner.services.query_trace import QueryTrace, current_trace
-from planner.services.requirement_assessment import assess_requirements
-from planner.services.sufficiency import (
-    assess_evidence,
-    documents_insufficient,
-    insufficiency_note,
-)
+from planner.services.sufficiency import documents_insufficient
 from planner.services.table_selection import (
     select_tables,
     select_tables_detailed,
@@ -2336,43 +2330,11 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             trace.increment("structured_evidence_items", len(structured))
             trace.increment("recovery_attempts", budget.used)
 
-        assessment = assess_evidence(
-            wants_table=("TABLE_QUERY" in capabilities and not document_fallback_used),
-            table_result_status=table_status,
-            wants_documents=requires_document_evidence(
-                state,
-                skip_document_search=skip_document_search,
-                has_structured_document_evidence=has_structured_document_evidence,
-            ),
-            document_chunk_count=len(documents) + len(document_tables),
-            retrieval_confidence=retrieval_confidence,
-            min_retrieval_confidence=MIN_RETRIEVAL_CONFIDENCE,
-        )
-
-        documents_usable = bool(documents) and not documents_insufficient(
-            len(documents),
-            retrieval_confidence,
-            MIN_RETRIEVAL_CONFIDENCE,
-        )
-
-        # A successful table query is not proof that applicable textual rules
-        # were found. Do not let partial structured evidence authorize a
-        # numerical mixed/calculation answer when its rule-evidence channel is
-        # missing or unusable.
-        answerable = can_answer_from_evidence(
-            state,
-            has_structured_evidence=bool(structured),
-            documents_usable=documents_usable,
-            skip_document_search=skip_document_search,
-            has_structured_document_evidence=has_structured_document_evidence,
-            dependency_evidence_found=dependency_evidence_found,
-        )
-
+        # Evidence collection is complete. Do not run a second semantic or
+        # deterministic completeness gate here: the answer model receives the
+        # collected evidence and planner checklist, then answers every supported
+        # part while explicitly identifying unsupported facts.
         notes: list[Any] = []
-
-        note = insufficiency_note(assessment["reasons"])
-        if note is not None and (structured or documents):
-            notes.append(note)
 
         if requires_dependency_discovery(state) and not dependency_evidence_found:
             notes.append(
@@ -2446,39 +2408,6 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             assign_citation_indexes(structured + documents[:room_for_documents] + notes)
         )
 
-        requirement_assessment = None
-        requirements = state.get("evidence_requirements") or []
-        if requirements:
-            trace = current_trace()
-            if trace is not None:
-                trace.increment("llm_calls_requirement_assessment")
-            requirement_assessment = assess_requirements(
-                requirements=requirements,
-                evidence=evidence,
-            )
-            if requirement_assessment is not None:
-                statuses = [item["status"] for item in requirement_assessment["requirements"]]
-                if trace is not None:
-                    trace.increment("requirements_satisfied", statuses.count("satisfied"))
-                    trace.increment("requirements_partial", statuses.count("partial"))
-                    trace.increment("requirements_missing", statuses.count("missing"))
-                    trace.increment("requirements_conflict", statuses.count("conflict"))
-                incomplete = [
-                    item for item in requirement_assessment["requirements"]
-                    if item["status"] != "satisfied"
-                ]
-                if incomplete:
-                    answerable = False
-                    gap_text = "; ".join(
-                        f"{item['id']}: {item['status']} — {item['reason']}"
-                        for item in incomplete[:8]
-                    )
-                    evidence.append({
-                        "source_type": "requirement_assessment",
-                        "result_status": "REQUIREMENTS_INCOMPLETE",
-                        "content": "Evidence completeness check: " + gap_text,
-                    })
-
         logger.info(
             "evidence_manifest: %s",
             json.dumps(
@@ -2491,11 +2420,10 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         return {
             "evidence": evidence,
             "final_evidence": evidence,
-            "evidence_sufficient": assessment["sufficient"] and (requirement_assessment is None or requirement_assessment["complete"]),
-            "answerable": answerable,
-            "requirement_assessment": requirement_assessment or {},
+            # This compatibility flag reports whether any actual source data
+            # was collected. It is not a completeness judgment or an answer gate.
+            "evidence_sufficient": bool(structured or documents),
             "dependency_evidence_found": dependency_evidence_found,
-            "insufficient_reasons": assessment["reasons"],
             "retrieval_confidence": retrieval_confidence,
             "recovery_attempts": budget.used,
             "total_tool_calls": total_tool_calls,
@@ -2553,6 +2481,7 @@ def _stream_answer_with_fit(  # QP-PATCH
     query: str,
     evidence: list[Any],
     conversation_history: list[dict[str, Any]] | None,
+    planner_requirements: list[dict[str, Any]] | None = None,
 ):
     """generate_answer_stream, retried ONCE with a fitted evidence list.
 
@@ -2564,6 +2493,7 @@ def _stream_answer_with_fit(  # QP-PATCH
             query=query,
             evidence=evidence,
             conversation_history=conversation_history,
+            planner_requirements=planner_requirements,
         )
         return
     except EvidenceTooLarge:
@@ -2580,6 +2510,7 @@ def _stream_answer_with_fit(  # QP-PATCH
             query=query,
             evidence=fitted,
             conversation_history=conversation_history,
+            planner_requirements=planner_requirements,
         )
     except EvidenceTooLarge:
         logger.error(
@@ -2614,77 +2545,12 @@ def finish_node(state: AgentState) -> dict[str, Any]:
             "route": "ERROR",
         }
 
+    # Empty, partial, conflicting, and NOT_FOUND evidence all go through the
+    # answer model. Retrieval status notes are context, not a reason to bypass
+    # answer generation. The model must state limitations without inventing.
     evidence = list(state.get("final_evidence") or state.get("evidence") or [])
-    if not evidence:
-        return {
-            "final_evidence": [],
-            "evidence_sufficient": False,
-            "answer": "I could not find enough evidence in the available workspace data.",
-            "grounding_passed": None,
-            "error": "",
-            "error_code": "NO_EVIDENCE",
-            "route": "NO_EVIDENCE",
-        }
-
-    if state.get("answerable") is False:
-        requirement_assessment = state.get("requirement_assessment") or {}
-        incomplete = [
-            item for item in requirement_assessment.get("requirements", [])
-            if item.get("status") != "satisfied"
-        ]
-        if incomplete:
-            details = "; ".join(
-                f"{item.get('id')}: {item.get('reason') or item.get('status')}"
-                for item in incomplete[:5]
-            )
-            answer_text = (
-                "I couldn't verify every fact needed to answer reliably. "
-                "The unresolved evidence requirements are: " + details + "."
-            )
-        else:
-            answer_text = (
-                "I found some passages, but they don't clearly answer your "
-                "question, so I'd rather not guess. Try rephrasing it, or "
-                "name the document you mean."
-            )
-        return {
-            "final_evidence": [],
-            "evidence_sufficient": False,
-            "answer": answer_text,
-            "grounding_passed": None,
-            "error": "",
-            "error_code": "INSUFFICIENT_EVIDENCE",
-            "route": "NO_EVIDENCE",
-        }
-
-    statuses = {
-        str(item.get("result_status", "")).upper()
-        for item in evidence
-        if isinstance(item, dict)
-    }
-
-    if "RETRIEVAL_ERROR" in statuses and statuses.issubset(
-        {"RETRIEVAL_ERROR", "NOT_FOUND", ""}
-    ):
-        return {
-            "final_evidence": evidence,
-            "evidence_sufficient": False,
-            "answer": (
-                "I couldn't retrieve the data needed to answer that. "
-                "Please try again in a moment."
-            ),
-            "grounding_passed": None,
-            "error": "",
-            "error_code": "RETRIEVAL_ERROR",
-            "route": "ERROR",
-        }
-
-    if statuses and statuses.issubset({"NOT_FOUND", ""}):
-        top_level_route = "NOT_FOUND"
-        top_level_error_code = "NOT_FOUND"
-    else:
-        top_level_route = "ANSWER"
-        top_level_error_code = ""
+    top_level_route = "ANSWER"
+    top_level_error_code = ""
 
     if _past_deadline(state):
         return {
@@ -2725,6 +2591,7 @@ def finish_node(state: AgentState) -> dict[str, Any]:
             query=effective_planning_query(state),
             evidence=evidence,
             conversation_history=state.get("conversation_history", []),
+            planner_requirements=state.get("evidence_requirements") or [],
         ):
             if not first_token_seen:
                 first_token_seen = True

@@ -105,11 +105,6 @@ TASK_PROFILES: dict[str, TaskProfile] = {
         reasoning_effort="low",
         input_hint=3000,
     ),
-    # Evidence auditing is part of the planner lane and shares its key budget.
-    "requirement_assessment": TaskProfile(
-        MODEL_120B, max_tokens=1600, timeout=40.0,
-        reasoning_effort="low", input_hint=5000,
-    ),
     # Keep the existing specialized table-selection model and its own rotating
     # key pool; it is not allowed to spill into the dedicated 120B lanes.
     "table_selection": TaskProfile(
@@ -132,7 +127,6 @@ TASK_PROFILES: dict[str, TaskProfile] = {
 # an assignment use the model's round-robin key pool.
 TASK_API_KEY_INDEX: dict[str, int] = {
     "planner": 0,
-    "requirement_assessment": 0,
     "sql_generation": 1,
     "answer_generation": 2,
 }
