@@ -93,7 +93,7 @@ def assess_requirements(
     }
     try:
         response = router.generate(
-            task="planner",
+            task="requirement_assessment",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},

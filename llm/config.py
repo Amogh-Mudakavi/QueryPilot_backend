@@ -44,11 +44,11 @@ MODEL_20B = "openai/gpt-oss-20b"
 MODEL_120B = "openai/gpt-oss-120b"
 MODEL_QWEN_27B = "qwen/qwen3.8-27b"
 
-# One source of truth for task completion ceilings. Qwen reasoning tokens are
-# included in max_tokens, so these caps leave room for both reasoning and output.
-PLANNER_MAX_COMPLETION_TOKENS = 1800
+# One source of truth for task completion ceilings. Reasoning tokens are
+# included in max_tokens, so these caps leave room for reasoning and output.
+PLANNER_MAX_COMPLETION_TOKENS = 3400
 TABLE_SELECTION_MAX_COMPLETION_TOKENS = 1500
-SQL_GENERATION_MAX_COMPLETION_TOKENS = 1200
+SQL_GENERATION_MAX_COMPLETION_TOKENS = 1800
 ANSWER_OUTPUT_TOKEN_CAPS = {
     "normal": 2000,
     "arithmetic": 2600,
@@ -82,6 +82,8 @@ class TaskProfile:
 
 
 TASK_PROFILES: dict[str, TaskProfile] = {
+    # The 120B tasks are deliberately isolated onto separate API-key lanes.
+    # See TASK_API_KEY_INDEX below; an idle lane is not borrowed by another task.
     "scope_guard": TaskProfile(MODEL_20B, max_tokens=500, input_hint=1200),
     "chitchat": TaskProfile(
         MODEL_20B, max_tokens=500, reasoning_effort="low", input_hint=600
@@ -90,15 +92,26 @@ TASK_PROFILES: dict[str, TaskProfile] = {
         MODEL_20B, max_tokens=200, reasoning_effort="low", input_hint=200
     ),
     "sql_generation": TaskProfile(
-        MODEL_QWEN_27B,
+        MODEL_120B,
         max_tokens=SQL_GENERATION_MAX_COMPLETION_TOKENS,
+        timeout=REQUEST_TIMEOUT,
+        reasoning_effort="low",
         input_hint=3000,
     ),
     "planner": TaskProfile(
-        MODEL_QWEN_27B,
+        MODEL_120B,
         max_tokens=PLANNER_MAX_COMPLETION_TOKENS,
+        timeout=40.0,
+        reasoning_effort="low",
         input_hint=3000,
     ),
+    # Evidence auditing is part of the planner lane and shares its key budget.
+    "requirement_assessment": TaskProfile(
+        MODEL_120B, max_tokens=1600, timeout=40.0,
+        reasoning_effort="low", input_hint=5000,
+    ),
+    # Keep the existing specialized table-selection model and its own rotating
+    # key pool; it is not allowed to spill into the dedicated 120B lanes.
     "table_selection": TaskProfile(
         MODEL_QWEN_27B,
         max_tokens=TABLE_SELECTION_MAX_COMPLETION_TOKENS,
@@ -114,23 +127,39 @@ TASK_PROFILES: dict[str, TaskProfile] = {
     ),
 }
 
+# Zero-based indices into GROQ_API_KEYS (GROQ_API_KEY_1 is index 0).
+# These assignments apply only to the corresponding 120B work. Calls without
+# an assignment use the model's round-robin key pool.
+TASK_API_KEY_INDEX: dict[str, int] = {
+    "planner": 0,
+    "requirement_assessment": 0,
+    "sql_generation": 1,
+    "answer_generation": 2,
+}
+
+if len(GROQ_API_KEYS) < 3:
+    raise ValueError(
+        "The 120B task lanes require GROQ_API_KEY_1, GROQ_API_KEY_2, and GROQ_API_KEY_3."
+    )
+if any(index < 0 or index >= len(GROQ_API_KEYS) for index in TASK_API_KEY_INDEX.values()):
+    raise ValueError("TASK_API_KEY_INDEX references a missing Groq API key.")
+
 TASK_MODELS = {name: profile.model for name, profile in TASK_PROFILES.items()}
 
-# QP-FIX-5: ordered fallbacks tried AFTER the task's own model. Used when the
-# model returns 429 on every key, is not found / rejected (a preview model can
-# disappear), or finishes with finish_reason=length (non-streaming calls).
-# Edit this dict only; no code change is needed to change the order.
+# Cross-model fallback is intentionally disabled for the dedicated 120B task
+# lanes. Table selection may fall back to the rotating 20B pool; it may never
+# consume a planner, SQL, or answer-generation 120B key lane.
 TASK_FALLBACK_MODELS: dict[str, tuple[str, ...]] = {
-    "planner": (MODEL_120B,),
-    "table_selection": (MODEL_120B,),
-    "sql_generation": (MODEL_120B,),
+    "table_selection": (MODEL_20B,),
 }
 
 MAX_ATTEMPTS = 3
 RETRY_LIMITS = {
-    "rate_limit": 2,  # hop to another key; the 429'd bucket is cooled
-    "authentication": 2,  # disable that key, hop to another
-    "timeout": 1,  # a slow model rarely recovers; one more try on another key
+    # Unpinned calls may rotate to another key. Dedicated lanes retry only on
+    # their assigned key and fail closed rather than borrowing another lane.
+    "rate_limit": 2,
+    "authentication": 2,
+    "timeout": 1,
     "connection": 2,
     "provider_5xx": 2,
 }

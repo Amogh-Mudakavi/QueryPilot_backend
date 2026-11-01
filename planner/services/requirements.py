@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from typing import Any, Mapping
 
-MAX_REQUIREMENTS = 8
+MAX_REQUIREMENTS = 12
 MAX_QUERIES_PER_REQUIREMENT = 3
 MAX_QUERY_CHARS = 500
 MAX_DEPENDENCY_DEPTH = 3
@@ -49,9 +49,14 @@ def normalize_requirements(raw: Any) -> list[dict[str, Any]]:
         if not description:
             raise ValueError(f"requirement {requirement_id} has no description")
 
+        raw_queries = item.get("queries", [])
+        if not isinstance(raw_queries, (list, tuple)):
+            raw_queries = []
         queries: list[str] = []
-        for query in item.get("queries", []) or []:
+        for query in raw_queries:
             value = str(query or "").strip()[:MAX_QUERY_CHARS]
+            if value.casefold().startswith(("select ", "with ", "insert ", "update ", "delete ")):
+                continue
             if value and value.casefold() not in {q.casefold() for q in queries}:
                 queries.append(value)
             if len(queries) >= MAX_QUERIES_PER_REQUIREMENT:
@@ -59,14 +64,20 @@ def normalize_requirements(raw: Any) -> list[dict[str, Any]]:
         if not queries:
             queries = [description[:MAX_QUERY_CHARS]]
 
+        raw_entities = item.get("entities", [])
+        if not isinstance(raw_entities, (list, tuple)):
+            raw_entities = []
         entities = []
-        for entity in item.get("entities", []) or []:
+        for entity in raw_entities:
             value = str(entity or "").strip()[:200]
             if value and value not in entities:
                 entities.append(value)
 
+        raw_dependencies = item.get("depends_on", [])
+        if not isinstance(raw_dependencies, (list, tuple)):
+            raw_dependencies = []
         dependencies = []
-        for dependency in item.get("depends_on", []) or []:
+        for dependency in raw_dependencies:
             value = str(dependency or "").strip()
             if value and value not in dependencies:
                 dependencies.append(value)

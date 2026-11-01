@@ -26,6 +26,8 @@ import logging
 import os
 import re
 import time
+
+from jsonschema import Draft202012Validator
 from typing import Any
 
 from langgraph.config import get_stream_writer
@@ -33,7 +35,7 @@ from langgraph.graph import END, START, StateGraph
 
 from llm.exceptions import InvalidResponseError
 from llm.router import router
-from planner.prompts.agent import ACTION_SCHEMA, SYSTEM_PROMPT
+from planner.prompts.agent import ACTION_SCHEMA, PLANNER_RESPONSE_FORMAT, SYSTEM_PROMPT
 from planner.services.answer import (
     MAX_TEXT_CHARS_PER_ITEM,
     EvidenceTooLarge,
@@ -102,6 +104,7 @@ from planner.tools.source_metadata import source_metadata
 from utils.timing import timed
 
 logger = logging.getLogger(__name__)
+_PLANNER_VALIDATOR = Draft202012Validator(ACTION_SCHEMA["json_schema"]["schema"])
 
 
 def _timed_call(stage, fn):
@@ -123,9 +126,17 @@ def _timed_node(name, fn):
     @functools.wraps(fn)
     def wrapper(state):
         trace = state.get("query_trace") or current_trace()
-        if trace is not None and current_trace() is not trace:
-            trace.activate()
+        if trace is None and name == "agent":
+            trace = QueryTrace(
+                query=str(state.get("query", "")),
+                workspace_id=state.get("workspace_id"),
+            )
+            state = {**state, "query_trace": trace}
+
+        bound_here = bool(trace is not None and trace.activate())
         started = time.monotonic()
+        result = None
+        failed = False
         try:
             with timed(f"node.{name}"):
                 result = fn(state)
@@ -133,16 +144,36 @@ def _timed_node(name, fn):
             if active_trace is not None and isinstance(result, dict):
                 result.setdefault("query_trace", active_trace)
             return result
+        except BaseException:
+            failed = True
+            raise
         finally:
             active_trace = current_trace() or trace
             if active_trace is not None:
                 active_trace.record_stage(f"node.{name}", time.monotonic() - started)
                 if name == "finish":
-                    result_route = (result or {}).get("route", state.get("route", "unknown")) if "result" in locals() else state.get("route", "error")
-                    result_code = (result or {}).get("error_code", state.get("error_code", "")) if "result" in locals() else state.get("error_code", "EXECUTION_ERROR")
+                    result_route = (
+                        (result or {}).get("route", state.get("route", "unknown"))
+                        if isinstance(result, dict)
+                        else state.get("route", "unknown")
+                    )
+                    result_code = (
+                        (result or {}).get("error_code", state.get("error_code", ""))
+                        if isinstance(result, dict)
+                        else state.get("error_code", "")
+                    )
                     active_trace.close(route=result_route, error_code=result_code)
-                else:
-                    active_trace.deactivate()
+                elif failed:
+                    # LangGraph may retry a failed node. Record the failed
+                    # attempt without closing the request trace prematurely.
+                    active_trace.increment("node_errors")
+                    logger.error(
+                        "[QUERY_TRACE_NODE_ERROR] trace_id=%s node=%s",
+                        active_trace.trace_id,
+                        str(name)[:80],
+                    )
+            if bound_here and active_trace is not None:
+                active_trace.deactivate()
 
     return wrapper
 
@@ -724,9 +755,6 @@ def _log_planner_decision(plan: dict[str, Any]) -> None:
 
 def agent_node(state: AgentState) -> dict[str, Any]:
     original_query = str(state.get("query", "")).strip()
-    if current_trace() is None:
-        trace = QueryTrace(query=original_query, workspace_id=state.get("workspace_id"))
-        trace.activate()
     if not state.get("deadline_monotonic"):
         state = {**state, "deadline_monotonic": time.monotonic() + MAX_QUERY_EXECUTION_SECONDS}
     planning_query = original_query
@@ -800,21 +828,30 @@ def agent_node(state: AgentState) -> dict[str, Any]:
         if trace is not None:
             trace.increment("llm_calls_planner")
         try:
-            response = router.generate(
-                task="planner",
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": _build_context(state)},
-                ],
-                temperature=0.0,
-                response_format=ACTION_SCHEMA,
-                include_reasoning=False,
-            )
+            try:
+                response = router.generate(
+                    task="planner",
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": _build_context(state)},
+                    ],
+                    temperature=0.0,
+                    response_format=PLANNER_RESPONSE_FORMAT,
+                    include_reasoning=False,
+                )
+                understanding = _parse_understanding_with_repair(response)
+            except Exception:
+                # Planner/provider/schema failures must not take down the chat.
+                # Continue with the raw user query as a retrieval safety net.
+                logger.exception(
+                    "Planner generation failed; continuing with raw-query retrieval"
+                )
+                understanding = _safe_planner_fallback(
+                    "Planner generation failed; raw-query retrieval only."
+                )
         finally:
             if trace is not None:
                 trace.record_stage("llm.planner", time.monotonic() - planner_started)
-
-        understanding = _parse_understanding_with_repair(response)
         if understanding.pop("_safe_fallback", False):
             fallback_plan = {
                 "status": "OK",
@@ -2856,11 +2893,44 @@ def _build_context(state: AgentState) -> str:
     )
 
 
+def _safe_planner_fallback(reason: str) -> dict[str, Any]:
+    return {
+        "data_sources_needed": [],
+        "category_hint": "document",
+        "operation": "answer",
+        "references": [],
+        "requested_fields": [],
+        "needs_instance_data": False,
+        "requirements": [],
+        "reason": str(reason or "Planner unavailable; raw-query retrieval only.")[:240],
+        "_safe_fallback": True,
+    }
+
+
+def _planner_string_list(value: Any, *, limit: int, max_chars: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, (str, int, float)):
+            continue
+        text = str(item).strip()[:max_chars]
+        marker = text.casefold()
+        if text and marker not in seen:
+            seen.add(marker)
+            result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
 def _parse_understanding(response: Any) -> dict[str, Any]:
     try:
-        content = response.choices[0].message.content
+        choice = response.choices[0]
+        content = choice.message.content
         data = json.loads(content)
-    except (AttributeError, IndexError, json.JSONDecodeError) as exc:
+    except (AttributeError, IndexError, TypeError, json.JSONDecodeError) as exc:
         raise AgentRuntimeError(
             "Query understanding returned invalid JSON.",
             code="PLANNING_ERROR",
@@ -2872,17 +2942,70 @@ def _parse_understanding(response: Any) -> dict[str, Any]:
             code="PLANNING_ERROR",
         )
 
-    return data
+    validation_error = next(iter(_PLANNER_VALIDATOR.iter_errors(data)), None)
+    if validation_error is not None:
+        path = "/".join(str(part) for part in validation_error.absolute_path)
+        logger.warning(
+            "Planner JSON failed local schema validation at %s: %s",
+            path or "<root>",
+            validation_error.message[:240],
+        )
+        raise AgentRuntimeError(
+            "Query understanding did not match the planner schema.",
+            code="PLANNING_SCHEMA_ERROR",
+        )
+
+    allowed_categories = {
+        "metadata", "structured", "document", "mixed", "conversation", "product"
+    }
+    allowed_operations = {
+        "describe", "lookup", "aggregate", "calculate", "filter", "compare",
+        "list", "overview", "answer",
+    }
+    data_sources = _planner_string_list(
+        data.get("data_sources_needed"), limit=20, max_chars=240
+    )
+    category = str(data.get("category_hint") or "document").strip().lower()
+    operation = str(data.get("operation") or "answer").strip().lower()
+    requirements = data.get("requirements")
+    if not isinstance(requirements, list):
+        requirements = []
+
+    return {
+        "data_sources_needed": data_sources,
+        "category_hint": (
+            category if category in allowed_categories
+            else ("mixed" if data_sources else "document")
+        ),
+        "operation": operation if operation in allowed_operations else "answer",
+        "references": _planner_string_list(
+            data.get("references"), limit=30, max_chars=240
+        ),
+        "requested_fields": _planner_string_list(
+            data.get("requested_fields"), limit=40, max_chars=240
+        ),
+        "needs_instance_data": data.get("needs_instance_data") is True,
+        "requirements": requirements,
+        "reason": str(data.get("reason") or "")[:240],
+    }
 
 
 def _parse_understanding_with_repair(response: Any) -> dict[str, Any]:
     """Parse one planner response, allow one constrained repair, then fail safe."""
     try:
+        choice = response.choices[0]
+        if getattr(choice, "finish_reason", None) == "length":
+            logger.warning(
+                "Planner output reached its completion-token limit; using raw-query retrieval"
+            )
+            return _safe_planner_fallback(
+                "Planner output was truncated; raw-query retrieval only."
+            )
         return _parse_understanding(response)
     except AgentRuntimeError:
         try:
             malformed = response.choices[0].message.content
-        except (AttributeError, IndexError):
+        except (AttributeError, IndexError, TypeError):
             malformed = ""
         trace = current_trace()
         if trace is not None:
@@ -2895,31 +3018,32 @@ def _parse_understanding_with_repair(response: Any) -> dict[str, Any]:
                     {
                         "role": "system",
                         "content": (
-                            "Repair the supplied planner output into the exact required JSON schema. "
-                            "Do not add facts, sources, entities, SQL or requirements that are not supported "
-                            "by the supplied output. Return only the schema-conforming JSON object."
+                            "Repair the supplied planner output into valid QueryPilot planner JSON. "
+                            "Use only these requirement type values: rule, fact, numeric, entity, "
+                            "status, date, comparison, other. Use kind text, table, or either. "
+                            "Never add facts, sources, entities, SQL or requirements. "
+                            "Return a compact JSON object only."
                         ),
                     },
-                    {"role": "user", "content": str(malformed or "")[:12000]},
+                    {"role": "user", "content": str(malformed or "")[:10000]},
                 ],
                 temperature=0.0,
-                response_format=ACTION_SCHEMA,
+                max_tokens=1400,
+                response_format=PLANNER_RESPONSE_FORMAT,
                 include_reasoning=False,
             )
+            if getattr(repaired.choices[0], "finish_reason", None) == "length":
+                return _safe_planner_fallback(
+                    "Planner repair output was truncated; raw-query retrieval only."
+                )
             return _parse_understanding(repaired)
         except Exception:
-            logger.exception("Planner response repair failed; using safe document-only fallback")
-            return {
-                "data_sources_needed": [],
-                "category_hint": "document",
-                "operation": "answer",
-                "references": [],
-                "requested_fields": [],
-                "needs_instance_data": False,
-                "requirements": [],
-                "reason": "Planner output could not be validated; raw-query retrieval only.",
-                "_safe_fallback": True,
-            }
+            logger.exception(
+                "Planner response repair failed; using raw-query retrieval fallback"
+            )
+            return _safe_planner_fallback(
+                "Planner output could not be validated; raw-query retrieval only."
+            )
 
 
 _GENERIC_CATALOG_REFERENCES = {

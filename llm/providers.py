@@ -53,6 +53,7 @@ from .config import (
     RETRY_LIMITS,
     TPM_ADMISSION_RATIO,
     TPM_WINDOW_SECONDS,
+    TASK_API_KEY_INDEX,
 )
 from .exceptions import (
     AuthenticationError,
@@ -307,17 +308,18 @@ class GroqProvider:
         avoid: set[int],
         started: float,
     ) -> float:
-        """Log, apply side effects, then return a sleep time or raise."""
+        """Log and apply bounded failure policy without breaking task key affinity."""
         kind = _classify(exc)
         status = _status_code(exc)
         text = _exception_text(exc)
 
         logger.warning(
-            "[LLM_FAILURE] task=%s model=%s key=%s attempt=%s/%s status=%s "
+            "[LLM_FAILURE] task=%s model=%s key=%s assigned_key=%s attempt=%s/%s status=%s "
             "failure_type=%s reserved_tokens=%s latency_seconds=%.3f error=%s",
             task,
             model,
             lease.key_index,
+            TASK_API_KEY_INDEX.get(task),
             attempt,
             MAX_ATTEMPTS,
             status,
@@ -521,7 +523,10 @@ class GroqProvider:
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                lease = self.scheduler.acquire(model, reserved, avoid)
+                assigned_key = TASK_API_KEY_INDEX.get(task)
+                lease = self.scheduler.acquire(
+                    model, reserved, avoid, key_index=assigned_key
+                )
             except LLMError as exc:
                 logger.error(
                     "[LLM_FAILURE] task=%s model=%s attempt=%s/%s failure_type=%s "
@@ -537,12 +542,13 @@ class GroqProvider:
                 raise
             started = time.monotonic()
             logger.info(
-                "[LLM_REQUEST] task=%s model=%s key=%s attempt=%s/%s "
+                "[LLM_REQUEST] task=%s model=%s key=%s assigned_key=%s attempt=%s/%s "
                 "estimated_input=%s max_tokens=%s reserved=%s bucket_window_used=%s "
                 "queue_wait_seconds=%.3f stream=%s reasoning_effort=%s",
                 task,
                 model,
                 lease.key_index,
+                TASK_API_KEY_INDEX.get(task),
                 attempt,
                 MAX_ATTEMPTS,
                 estimated_input,

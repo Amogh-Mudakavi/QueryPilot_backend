@@ -11,6 +11,8 @@ Design rules:
   a counter, so one tier cannot block the other.
 * Admission is atomic: choosing the bucket and reserving tokens in it happen
   under one lock, so concurrent callers cannot both claim the same headroom.
+* Unpinned calls rotate strictly across available keys. Task-pinned lanes use
+  only their assigned key and never borrow another lane's idle capacity.
 * A reservation (input estimate + max_tokens, which is what Groq itself counts
   as "requested") is a scheduling device for ONE bucket. It is replaced by the
   actual usage when the call settles. It is never a per-user-request budget and
@@ -71,12 +73,13 @@ class _Bucket:
 
 
 class _Waiter:
-    """A call inside acquire(); `bypassed` counts younger calls admitted ahead."""
+    """A queued call; pinned lanes only contend with the same key lane."""
 
-    __slots__ = ("bypassed",)
+    __slots__ = ("bypassed", "key_index")
 
-    def __init__(self):
+    def __init__(self, key_index: int | None = None):
         self.bypassed = 0
+        self.key_index = key_index
 
 
 class _Pool:
@@ -86,6 +89,7 @@ class _Pool:
         self.cond = threading.Condition()
         self.buckets = [_Bucket(i) for i in range(key_count)]
         self.waiters: list[_Waiter] = []  # arrival order, oldest first
+        self.next_key_index = 0
 
 
 @dataclass(frozen=True)
@@ -111,6 +115,8 @@ class QuotaScheduler:
         max_wait: float = 20.0,
         max_bypass: int = 3,
     ):
+        if not isinstance(key_count, int) or isinstance(key_count, bool) or key_count < 1:
+            raise ValueError("key_count must be a positive integer")
         self._key_count = key_count
         self._limit_for = limit_for
         self._ratio = admission_ratio
@@ -166,19 +172,18 @@ class QuotaScheduler:
     # --------------------------------------------------------------- acquire
 
     def acquire(
-        self, model: str, tokens: int, avoid: Iterable[int] = ()
+        self,
+        model: str,
+        tokens: int,
+        avoid: Iterable[int] = (),
+        *,
+        key_index: int | None = None,
     ) -> Lease:
-        """Pick a bucket for `tokens` and reserve them there.
+        """Reserve quota from one API-key bucket.
 
-        Least-loaded admissible bucket wins; ties go to the one assigned longest
-        ago, which degenerates to round-robin on an idle pool. Buckets in
-        `avoid` are chosen only when nothing else admits.
-
-        When nothing admits, wait (bounded) for the earliest opening, in fair
-        order (see module docstring). After the bound: if some bucket is merely
-        full by our own estimate, use the least-loaded one and let Groq be the
-        authority; if every bucket is cooling or disabled, raise instead of
-        hammering a key that told us to back off.
+        ``key_index`` pins the task to a dedicated key. Without it, calls use
+        strict round-robin selection across available keys. Dedicated lanes do
+        not borrow one another's keys, even when another lane is idle.
         """
         limit = self._limit_for(model)
         if tokens > limit:
@@ -186,12 +191,21 @@ class QuotaScheduler:
                 f"Request of ~{tokens} tokens exceeds the {limit} tokens-per-minute "
                 f"limit of {model}; no key can serve it."
             )
+        if key_index is not None:
+            if not isinstance(key_index, int) or isinstance(key_index, bool):
+                raise ValueError("key_index must be an integer or None")
+            if key_index < 0 or key_index >= self._key_count:
+                raise ValueError(
+                    f"key_index {key_index} is outside the configured key pool."
+                )
+
         ceiling = limit * self._ratio
         avoid = frozenset(avoid)
         pool = self._pool(model)
+        candidates = [pool.buckets[key_index]] if key_index is not None else pool.buckets
         started = time.monotonic()
         deadline = started + self._max_wait
-        me = _Waiter()
+        me = _Waiter(key_index)
 
         with pool.cond:
             pool.waiters.append(me)
@@ -201,70 +215,81 @@ class QuotaScheduler:
                     remaining = deadline - now
 
                     if remaining > 0 and self._older_waiter_starving(pool, me):
-                        # Stand in line; woken when that waiter leaves.
                         pool.cond.wait(timeout=remaining)
                         continue
 
-                    chosen = self._pick(pool, tokens, avoid, now, ceiling, limit)
+                    chosen = self._pick(
+                        pool, tokens, avoid, now, ceiling, limit, candidates
+                    )
                     if chosen is not None:
-                        return self._admit(pool, me, chosen, model, tokens, now, started)
+                        return self._admit(
+                            pool, me, chosen, model, tokens, now, started,
+                            rotate=(key_index is None),
+                        )
 
                     usable = [
-                        b
-                        for b in pool.buckets
-                        if self._key_disabled_until[b.key_index] <= now
+                        bucket for bucket in candidates
+                        if self._key_disabled_until[bucket.key_index] <= now
                     ]
                     if not usable:
+                        if key_index is not None:
+                            raise AuthenticationError(
+                                f"Assigned Groq key {key_index} is disabled."
+                            )
                         raise AuthenticationError(
                             f"No usable Groq key for {model}: all keys are disabled."
                         )
 
                     soonest = min(
-                        self._time_until_fit(b, tokens, now, ceiling, limit)
-                        for b in usable
+                        self._time_until_fit(bucket, tokens, now, ceiling, limit)
+                        for bucket in usable
                     )
-                    open_buckets = [b for b in usable if b.cooldown_until <= now]
+                    open_buckets = [
+                        bucket for bucket in usable if bucket.cooldown_until <= now
+                    ]
 
                     if soonest <= remaining:
                         logger.info(
-                            "[LLM_SCHEDULER] model=%s all buckets full/cooling; "
-                            "waiting %.2fs requested=%s",
-                            model,
-                            soonest,
-                            tokens,
+                            "[LLM_SCHEDULER] model=%s all eligible buckets full/cooling; "
+                            "waiting %.2fs requested=%s pinned_key=%s",
+                            model, soonest, tokens, key_index,
                         )
                         pool.cond.wait(timeout=max(soonest, 0.005) + 0.01)
                         continue
                     if not open_buckets:
-                        # Cooldowns are not freed by in-flight calls finishing, so
-                        # waiting would only delay the failure.
                         raise RateLimitError(
-                            f"All {model} buckets are cooling down; earliest "
-                            f"opening in {soonest:.1f}s."
+                            f"No eligible {model} key is available; earliest opening "
+                            f"in {soonest:.1f}s."
                         )
                     if remaining > 0:
-                        # Windows will not expire in time, but a call settling
-                        # with less usage than it reserved can free capacity
-                        # sooner; the condition is notified when that happens.
                         pool.cond.wait(timeout=remaining)
                         continue
 
-                    chosen = min(
-                        open_buckets,
-                        key=lambda b: (self._used(b, now), b.last_assigned, b.key_index),
-                    )
+                    # Capacity is merely our estimate; after the bounded wait,
+                    # let Groq be authoritative on the next request. Preserve
+                    # the lane pin and rotation semantics when choosing a key.
+                    if key_index is not None:
+                        chosen = open_buckets[0]
+                    else:
+                        chosen = min(
+                            open_buckets,
+                            key=lambda bucket: (
+                                bucket.key_index in avoid,
+                                (bucket.key_index - pool.next_key_index) % self._key_count,
+                            ),
+                        )
                     logger.warning(
-                        "[LLM_SCHEDULER] model=%s no bucket admits requested=%s "
-                        "within %.0fs; forcing key=%s and deferring to the provider",
-                        model,
-                        tokens,
-                        self._max_wait,
-                        chosen.key_index,
+                        "[LLM_SCHEDULER] model=%s no eligible bucket admits requested=%s "
+                        "within %.0fs; selecting key=%s pinned_key=%s",
+                        model, tokens, self._max_wait, chosen.key_index, key_index,
                     )
-                    return self._admit(pool, me, chosen, model, tokens, now, started)
+                    return self._admit(
+                        pool, me, chosen, model, tokens, now, started,
+                        rotate=(key_index is None),
+                    )
             finally:
                 pool.waiters.remove(me)
-                pool.cond.notify_all()  # the next in line may now proceed
+                pool.cond.notify_all()
 
     def _pick(
         self,
@@ -274,26 +299,49 @@ class QuotaScheduler:
         now: float,
         ceiling: float,
         limit: int,
+        candidates: list[_Bucket],
     ) -> _Bucket | None:
-        """Least-loaded admissible, non-blocked bucket, or None. Pool lock held."""
-        best = None
-        best_rank = None
-        for bucket in pool.buckets:
+        """Pick the next round-robin eligible bucket, respecting lane pins."""
+        ordered = sorted(
+            candidates,
+            key=lambda bucket: (
+                (bucket.key_index - pool.next_key_index) % self._key_count
+            ),
+        )
+        eligible = []
+        for bucket in ordered:
             if self._blocked_until(bucket) > now:
                 continue
             used = self._used(bucket, now)
-            if not self._fits(used, tokens, ceiling, limit):
-                continue
-            rank = (bucket.key_index in avoid, used, bucket.last_assigned, bucket.key_index)
-            if best_rank is None or rank < best_rank:
-                best, best_rank = bucket, rank
-        return best
+            if self._fits(used, tokens, ceiling, limit):
+                eligible.append(bucket)
+        if not eligible:
+            return None
+        # A retry prefers a different key where the task is not pinned; normal
+        # requests rotate strictly in key-index order.
+        return min(
+            eligible,
+            key=lambda bucket: (
+                bucket.key_index in avoid,
+                (bucket.key_index - pool.next_key_index) % self._key_count,
+            ),
+        )
+
+    @staticmethod
+    def _waiters_overlap(left: _Waiter, right: _Waiter) -> bool:
+        # Unpinned round-robin traffic can use every key; pinned traffic only
+        # contends with the same assigned key.
+        return (
+            left.key_index is None
+            or right.key_index is None
+            or left.key_index == right.key_index
+        )
 
     def _older_waiter_starving(self, pool: _Pool, me: _Waiter) -> bool:
         for waiter in pool.waiters:
             if waiter is me:
                 return False
-            if waiter.bypassed >= self._max_bypass:
+            if self._waiters_overlap(waiter, me) and waiter.bypassed >= self._max_bypass:
                 return True
         return False
 
@@ -306,12 +354,18 @@ class QuotaScheduler:
         tokens: int,
         now: float,
         started: float,
+        *,
+        rotate: bool,
     ) -> Lease:
-        for waiter in pool.waiters:  # everyone older than `me` was just bypassed
+        for waiter in pool.waiters:
             if waiter is me:
                 break
-            waiter.bypassed += 1
-        return self._reserve(pool, bucket, model, tokens, now, started)
+            if self._waiters_overlap(waiter, me):
+                waiter.bypassed += 1
+        lease = self._reserve(pool, bucket, model, tokens, now, started)
+        if rotate:
+            pool.next_key_index = (bucket.key_index + 1) % self._key_count
+        return lease
 
     def _reserve(
         self,
