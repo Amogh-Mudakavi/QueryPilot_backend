@@ -82,6 +82,9 @@ from planner.services.schema_registry import (
 )
 from planner.services.sql_generation import generate_sql
 from planner.services.state import AgentState
+from planner.services.requirements import normalize_requirements
+from planner.services.query_trace import QueryTrace, current_trace
+from planner.services.requirement_assessment import assess_requirements
 from planner.services.sufficiency import (
     assess_evidence,
     documents_insufficient,
@@ -104,8 +107,14 @@ logger = logging.getLogger(__name__)
 def _timed_call(stage, fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        with timed(stage):
-            return fn(*args, **kwargs)
+        started = time.monotonic()
+        try:
+            with timed(stage):
+                return fn(*args, **kwargs)
+        finally:
+            trace = current_trace()
+            if trace is not None:
+                trace.record_stage(stage, time.monotonic() - started)
 
     return wrapper
 
@@ -113,10 +122,42 @@ def _timed_call(stage, fn):
 def _timed_node(name, fn):
     @functools.wraps(fn)
     def wrapper(state):
-        with timed(f"node.{name}"):
-            return fn(state)
+        trace = state.get("query_trace") or current_trace()
+        if trace is not None and current_trace() is not trace:
+            trace.activate()
+        started = time.monotonic()
+        try:
+            with timed(f"node.{name}"):
+                result = fn(state)
+            active_trace = current_trace() or trace
+            if active_trace is not None and isinstance(result, dict):
+                result.setdefault("query_trace", active_trace)
+            return result
+        finally:
+            active_trace = current_trace() or trace
+            if active_trace is not None:
+                active_trace.record_stage(f"node.{name}", time.monotonic() - started)
+                if name == "finish":
+                    result_route = (result or {}).get("route", state.get("route", "unknown")) if "result" in locals() else state.get("route", "error")
+                    result_code = (result or {}).get("error_code", state.get("error_code", "")) if "result" in locals() else state.get("error_code", "EXECUTION_ERROR")
+                    active_trace.close(route=result_route, error_code=result_code)
+                else:
+                    active_trace.deactivate()
 
     return wrapper
+
+
+def _count_tool_call(current_count: int) -> int:
+    next_count = int(current_count) + 1
+    trace = current_trace()
+    if trace is not None:
+        trace.increment("tool_calls")
+    if next_count > MAX_TOOL_CALLS_PER_QUERY:
+        raise AgentRuntimeError(
+            "The request reached its tool-call budget.",
+            code="TOOL_BUDGET_EXCEEDED",
+        )
+    return next_count
 
 resolve_references = _timed_call("resolve_references", resolve_references)
 resolve_entities_from_query = _timed_call(
@@ -155,7 +196,9 @@ PLANNER_MAX_DIGEST_COLUMNS = 24
 
 
 
-MAX_RECOVERY_ATTEMPTS = 1
+MAX_RECOVERY_ATTEMPTS = 2
+MAX_TOOL_CALLS_PER_QUERY = 12
+MAX_QUERY_EXECUTION_SECONDS = 60
 
 OVERVIEW_TEXT_SHARE = 0.6
 OVERVIEW_SEGMENT_HEADER_ALLOWANCE = 200
@@ -681,6 +724,11 @@ def _log_planner_decision(plan: dict[str, Any]) -> None:
 
 def agent_node(state: AgentState) -> dict[str, Any]:
     original_query = str(state.get("query", "")).strip()
+    if current_trace() is None:
+        trace = QueryTrace(query=original_query, workspace_id=state.get("workspace_id"))
+        trace.activate()
+    if not state.get("deadline_monotonic"):
+        state = {**state, "deadline_monotonic": time.monotonic() + MAX_QUERY_EXECUTION_SECONDS}
     planning_query = original_query
 
     carry: dict[str, Any] = {}
@@ -747,18 +795,56 @@ def agent_node(state: AgentState) -> dict[str, Any]:
     )
 
     try:
-        response = router.generate(
-            task="planner",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": _build_context(state)},
-            ],
-            temperature=0.0,
-            response_format=ACTION_SCHEMA,
-            include_reasoning=False,
-        )
+        planner_started = time.monotonic()
+        trace = current_trace()
+        if trace is not None:
+            trace.increment("llm_calls_planner")
+        try:
+            response = router.generate(
+                task="planner",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": _build_context(state)},
+                ],
+                temperature=0.0,
+                response_format=ACTION_SCHEMA,
+                include_reasoning=False,
+            )
+        finally:
+            if trace is not None:
+                trace.record_stage("llm.planner", time.monotonic() - planner_started)
 
-        understanding = _parse_understanding(response)
+        understanding = _parse_understanding_with_repair(response)
+        if understanding.pop("_safe_fallback", False):
+            fallback_plan = {
+                "status": "OK",
+                "capabilities": ["DOCUMENT_SEARCH"],
+                "actions": [],
+                "fallback_capabilities": [],
+                "clarification_options": [],
+                "cross_document": False,
+            }
+            return {
+                "resource_context": resources,
+                "planning_query": planning_query,
+                "query_understanding": understanding,
+                "evidence_requirements": [],
+                "resolved_references": {"references": []},
+                "execution_plan": fallback_plan,
+                "pending_clarification": False,
+                "clarification_options": [],
+                "tool_history": list(state.get("tool_history", [])) + [{"stage": "planner_safe_fallback"}],
+            }
+        try:
+            evidence_requirements = normalize_requirements(understanding.get("requirements", []))
+        except ValueError as exc:
+            logger.warning("Planner requirements rejected; retaining raw-query retrieval: %s", exc)
+            evidence_requirements = []
+        understanding["requirements"] = evidence_requirements
+        understanding["needs_instance_data"] = bool(understanding.get("needs_instance_data"))
+        trace = current_trace()
+        if trace is not None:
+            trace.increment("planner_requirements", len(evidence_requirements))
         # Source/entity resolution must operate inside the same conversation
         # allow-list enforced by retrieval. Scope Guard's relevance list is
         # intentionally narrower, so use all authorized documents here and
@@ -918,6 +1004,7 @@ def agent_node(state: AgentState) -> dict[str, Any]:
         "resource_context": resources,
         "planning_query": planning_query,
         "query_understanding": understanding,
+        "evidence_requirements": evidence_requirements,
         "resolved_references": resolution,
         "execution_plan": plan,
         "pending_clarification": clarification,
@@ -1861,6 +1948,8 @@ def _narrow_structured_to_request(
 
 
 def dispatch_node(state: AgentState) -> dict[str, Any]:
+    if not state.get("deadline_monotonic"):
+        state = {**state, "deadline_monotonic": time.monotonic() + MAX_QUERY_EXECUTION_SECONDS}
     plan = state.get("execution_plan", {})
 
     if plan.get("status") == "NEEDS_CLARIFICATION":
@@ -1939,17 +2028,17 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             product = get_product_knowledge()
             product["result_status"] = "SUCCESS"
             structured.append(product)
-            total_tool_calls += 1
+            total_tool_calls = _count_tool_call(total_tool_calls)
 
         if "SOURCE_METADATA" in capabilities:
             structured.append(_run_source_metadata(state))
-            total_tool_calls += 1
+            total_tool_calls = _count_tool_call(total_tool_calls)
 
         if "TABLE_QUERY" in capabilities:
             table_result = _run_table(state, budget)
             structured.extend(table_result["evidence"])
             table_status = table_result["status"]
-            total_tool_calls += 1
+            total_tool_calls = _count_tool_call(total_tool_calls)
 
             # The plan started from a structured guess about a named document
             # (no entity, no named table). If that path found nothing, the
@@ -1983,7 +2072,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
                     },
                 }
             )
-            total_tool_calls += 1
+            total_tool_calls = _count_tool_call(total_tool_calls)
 
         table_not_found = table_status == "NOT_FOUND"
 
@@ -2042,7 +2131,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             )
             if document_tables:
                 structured.extend(document_tables)
-                total_tool_calls += 1
+                total_tool_calls = _count_tool_call(total_tool_calls)
 
         if "DOCUMENT_SEARCH" in capabilities and not skip_document_search:
             structured = _narrow_structured_to_request(state, structured)  # QP-PATCH-V4
@@ -2050,13 +2139,16 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
                 len(json.dumps(structured, ensure_ascii=False, default=str))
             )
             _DOC_CHARS_USED.set(0)
+            state = {**state, "tool_calls_used": total_tool_calls}
             docs = _run_documents(state, budget)
             if requires_dependency_discovery(state):
                 docs = _supplement_dependency_evidence(state, docs, structured)
                 dependency_evidence_found = bool(
                     docs.get("dependency_evidence_found")
                 )
-            total_tool_calls += 1
+            retrieval_calls = max(1, int(docs.get("calls", 1)))
+            for _ in range(retrieval_calls):
+                total_tool_calls = _count_tool_call(total_tool_calls)
             retrieval_confidence = docs["confidence"]
 
             if docs["error"] is not None:
@@ -2147,7 +2239,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
 
                 if join["tables"]:
                     structured.extend(join["tables"])
-                    total_tool_calls += 1
+                    total_tool_calls = _count_tool_call(total_tool_calls)
 
                 if join["documents"]:
                     documents = join["documents"] + list(documents)
@@ -2201,6 +2293,11 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         )
 
         has_structured_document_evidence = _has_document_table_evidence(structured)
+        trace = current_trace()
+        if trace is not None:
+            trace.increment("text_evidence_items", len(documents))
+            trace.increment("structured_evidence_items", len(structured))
+            trace.increment("recovery_attempts", budget.used)
 
         assessment = assess_evidence(
             wants_table=("TABLE_QUERY" in capabilities and not document_fallback_used),
@@ -2312,6 +2409,39 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             assign_citation_indexes(structured + documents[:room_for_documents] + notes)
         )
 
+        requirement_assessment = None
+        requirements = state.get("evidence_requirements") or []
+        if requirements:
+            trace = current_trace()
+            if trace is not None:
+                trace.increment("llm_calls_requirement_assessment")
+            requirement_assessment = assess_requirements(
+                requirements=requirements,
+                evidence=evidence,
+            )
+            if requirement_assessment is not None:
+                statuses = [item["status"] for item in requirement_assessment["requirements"]]
+                if trace is not None:
+                    trace.increment("requirements_satisfied", statuses.count("satisfied"))
+                    trace.increment("requirements_partial", statuses.count("partial"))
+                    trace.increment("requirements_missing", statuses.count("missing"))
+                    trace.increment("requirements_conflict", statuses.count("conflict"))
+                incomplete = [
+                    item for item in requirement_assessment["requirements"]
+                    if item["status"] != "satisfied"
+                ]
+                if incomplete:
+                    answerable = False
+                    gap_text = "; ".join(
+                        f"{item['id']}: {item['status']} — {item['reason']}"
+                        for item in incomplete[:8]
+                    )
+                    evidence.append({
+                        "source_type": "requirement_assessment",
+                        "result_status": "REQUIREMENTS_INCOMPLETE",
+                        "content": "Evidence completeness check: " + gap_text,
+                    })
+
         logger.info(
             "evidence_manifest: %s",
             json.dumps(
@@ -2324,8 +2454,9 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         return {
             "evidence": evidence,
             "final_evidence": evidence,
-            "evidence_sufficient": assessment["sufficient"],
+            "evidence_sufficient": assessment["sufficient"] and (requirement_assessment is None or requirement_assessment["complete"]),
             "answerable": answerable,
+            "requirement_assessment": requirement_assessment or {},
             "dependency_evidence_found": dependency_evidence_found,
             "insufficient_reasons": assessment["reasons"],
             "retrieval_confidence": retrieval_confidence,
@@ -2422,6 +2553,10 @@ def _stream_answer_with_fit(  # QP-PATCH
 
 
 def finish_node(state: AgentState) -> dict[str, Any]:
+    trace = current_trace()
+    if trace is not None:
+        trace.increment("final_evidence_items", len(state.get("final_evidence") or state.get("evidence") or []))
+        trace.increment("tool_calls_from_state", int(state.get("total_tool_calls") or 0))
     route = state.get("route", "")
 
     if state.get("answer") and route in {"NEEDS_CLARIFICATION", "CHITCHAT"}:
@@ -2455,14 +2590,30 @@ def finish_node(state: AgentState) -> dict[str, Any]:
         }
 
     if state.get("answerable") is False:
-        return {
-            "final_evidence": [],
-            "evidence_sufficient": False,
-            "answer": (
+        requirement_assessment = state.get("requirement_assessment") or {}
+        incomplete = [
+            item for item in requirement_assessment.get("requirements", [])
+            if item.get("status") != "satisfied"
+        ]
+        if incomplete:
+            details = "; ".join(
+                f"{item.get('id')}: {item.get('reason') or item.get('status')}"
+                for item in incomplete[:5]
+            )
+            answer_text = (
+                "I couldn't verify every fact needed to answer reliably. "
+                "The unresolved evidence requirements are: " + details + "."
+            )
+        else:
+            answer_text = (
                 "I found some passages, but they don't clearly answer your "
                 "question, so I'd rather not guess. Try rephrasing it, or "
                 "name the document you mean."
-            ),
+            )
+        return {
+            "final_evidence": [],
+            "evidence_sufficient": False,
+            "answer": answer_text,
             "grounding_passed": None,
             "error": "",
             "error_code": "INSUFFICIENT_EVIDENCE",
@@ -2526,6 +2677,9 @@ def finish_node(state: AgentState) -> dict[str, Any]:
         parts: list[str] = []
         answer_started = time.perf_counter()
         first_token_seen = False
+        answer_trace = current_trace()
+        if answer_trace is not None:
+            answer_trace.increment("llm_calls_answer")
         for delta in _stream_answer_with_fit(
             # Use the same contextualized task that planning and retrieval used.
             # A short follow-up like "please explain" is not self-contained;
@@ -2548,11 +2702,14 @@ def finish_node(state: AgentState) -> dict[str, Any]:
                 message="",
                 data={"delta": delta},
             )
+        answer_elapsed = time.perf_counter() - answer_started
         logger.info(
             "[TIMING] stage=answer_stream_total seconds=%.3f chars=%d",
-            time.perf_counter() - answer_started,
+            answer_elapsed,
             sum(len(p) for p in parts),
         )
+        if answer_trace is not None:
+            answer_trace.record_stage("llm.answer_stream", answer_elapsed)
         answer = _parse_answer_response(
             "".join(parts),
             evidence_count=len(evidence),
@@ -2716,6 +2873,53 @@ def _parse_understanding(response: Any) -> dict[str, Any]:
         )
 
     return data
+
+
+def _parse_understanding_with_repair(response: Any) -> dict[str, Any]:
+    """Parse one planner response, allow one constrained repair, then fail safe."""
+    try:
+        return _parse_understanding(response)
+    except AgentRuntimeError:
+        try:
+            malformed = response.choices[0].message.content
+        except (AttributeError, IndexError):
+            malformed = ""
+        trace = current_trace()
+        if trace is not None:
+            trace.increment("planner_repair_attempts")
+            trace.increment("llm_calls_planner_repair")
+        try:
+            repaired = router.generate(
+                task="planner",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Repair the supplied planner output into the exact required JSON schema. "
+                            "Do not add facts, sources, entities, SQL or requirements that are not supported "
+                            "by the supplied output. Return only the schema-conforming JSON object."
+                        ),
+                    },
+                    {"role": "user", "content": str(malformed or "")[:12000]},
+                ],
+                temperature=0.0,
+                response_format=ACTION_SCHEMA,
+                include_reasoning=False,
+            )
+            return _parse_understanding(repaired)
+        except Exception:
+            logger.exception("Planner response repair failed; using safe document-only fallback")
+            return {
+                "data_sources_needed": [],
+                "category_hint": "document",
+                "operation": "answer",
+                "references": [],
+                "requested_fields": [],
+                "needs_instance_data": False,
+                "requirements": [],
+                "reason": "Planner output could not be validated; raw-query retrieval only.",
+                "_safe_fallback": True,
+            }
 
 
 _GENERIC_CATALOG_REFERENCES = {
@@ -3554,6 +3758,100 @@ def _run_documents_with_coverage(
     return _built
 
 
+def _search_evidence_variants(
+    *,
+    queries: list[str],
+    workspace_id: int,
+    document_ids: list[int] | None,
+    max_calls: int = MAX_TOOL_CALLS_PER_QUERY,
+) -> dict[str, Any]:
+    """Search bounded planner queries and merge evidence without widening scope."""
+    from hashlib import sha256
+
+    targets = list(document_ids) if document_ids else [None]
+    collected: dict[str, dict[str, Any]] = {}
+    confidences: list[float] = []
+    errors: list[tuple[str, str]] = []
+    degraded = False
+    calls = 0
+
+    for document_id in targets:
+        for query in queries[:3]:
+            if calls >= max(0, min(MAX_TOOL_CALLS_PER_QUERY, int(max_calls))):
+                logger.warning("document retrieval query budget reached; stopping variants")
+                break
+            kwargs = {
+                "query": query,
+                "workspace_id": workspace_id,
+                "allowed_document_ids": [document_id] if document_id is not None else None,
+            }
+            try:
+                result = search_evidence(**kwargs)
+            except Exception as exc:
+                logger.exception("Requirement retrieval failed for document_id=%s", document_id)
+                errors.append(("RETRIEVAL_ERROR", str(exc)))
+                calls += 1
+                continue
+            calls += 1
+            if result.get("error_code"):
+                errors.append((str(result.get("error_code")), str(result.get("error") or "Retrieval failed")))
+                continue
+            degraded = degraded or bool(result.get("degraded"))
+            confidences.append(float(result.get("confidence") or 0.0))
+            for item in result.get("evidence", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+                identity = (
+                    f"{metadata.get('document_id', item.get('document_id'))}:"
+                    f"{metadata.get('chunk_index', '')}"
+                )
+                if identity == ":":
+                    identity = sha256(str(item.get("content") or "").encode("utf-8")).hexdigest()
+                previous = collected.get(identity)
+                if previous is None or float(item.get("score") or 0.0) > float(previous.get("score") or 0.0):
+                    collected[identity] = item
+        if calls >= max(0, min(MAX_TOOL_CALLS_PER_QUERY, int(max_calls))):
+            break
+
+    evidence = sorted(
+        collected.values(),
+        key=lambda item: float(item.get("score") or 0.0),
+        reverse=True,
+    )[:MAX_EVIDENCE_CROSS_DOCUMENT]
+    error = errors[0] if errors and not evidence else None
+    return {
+        "error_code": error[0] if error else None,
+        "error": error[1] if error else None,
+        "evidence": evidence,
+        "confidence": max(confidences) if confidences else 0.0,
+        "candidate_count": len(collected),
+        "degraded": degraded,
+        "calls": calls,
+    }
+
+
+def _retrieval_queries_for_state(state: AgentState) -> list[str]:
+    original = str(state.get("query") or "").strip()
+    effective = effective_planning_query(state)
+    requirements = state.get("evidence_requirements") or []
+    candidates = [original, effective]
+    candidates.extend(
+        query
+        for requirement in requirements
+        if requirement.get("kind") in {"text", "either"}
+        for query in requirement.get("queries", [])
+    )
+    queries: list[str] = []
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value and value.casefold() not in {item.casefold() for item in queries}:
+            queries.append(value)
+        if len(queries) >= 3:
+            break
+    return queries or [effective] if effective else queries
+
+
 def _run_documents(
     state: AgentState,
     budget: _RecoveryBudget,
@@ -3605,68 +3903,39 @@ def _run_documents(
                 "notes": covered["notes"],
                 "coverage": covered["coverage"],
                 "complete": covered.get("complete"),
+                "calls": 1,
             }
 
+    queries = _retrieval_queries_for_state(state)
+
     if multi_source:
-        per_document = primary_ids
-        collected: list[Any] = []
-        confidences: list[float] = []
-        errors: list[tuple[str, str]] = []
-        degraded = False
-
-        for document_id in per_document:
-            if _past_deadline(state):
-                break
-            try:
-                result = search_evidence(
-                    query=primary_query,
-                    workspace_id=state["workspace_id"],
-                    allowed_document_ids=[document_id],
-                )
-            except Exception as exc:
-                logger.exception(
-                    "Cross-document search failed for document_id=%s",
-                    document_id,
-                )
-                errors.append(("RETRIEVAL_ERROR", str(exc)))
-                continue
-
-            error_code = result.get("error_code")
-            if error_code:
-                errors.append(
-                    (
-                        str(error_code),
-                        result.get("error") or "Document retrieval failed.",
-                    )
-                )
-                continue
-
-            degraded = degraded or bool(result.get("degraded"))
-            chunks = _mark_success(list(result.get("evidence", [])))
-            if chunks:
-                collected.extend(chunks[:4])
-            confidences.append(float(result.get("confidence") or 0.0))
-
-        if errors and not collected:
+        result = _search_evidence_variants(
+            queries=queries,
+            workspace_id=state["workspace_id"],
+            document_ids=primary_ids,
+            max_calls=max(0, MAX_TOOL_CALLS_PER_QUERY - int(state.get("tool_calls_used", 0))),
+        )
+        if result.get("error_code"):
             return {
                 "evidence": [],
                 "confidence": 0.0,
-                "error": errors[0],
-                "degraded": degraded,
+                "error": (str(result["error_code"]), result.get("error") or "Document retrieval failed."),
+                "degraded": bool(result.get("degraded")),
+                "calls": int(result.get("calls", 0)),
             }
-
-        confidence = min(confidences) if confidences else 0.0
         return {
-            "evidence": collected,
-            "confidence": confidence,
-            "error": errors[0] if errors and not collected else None,
-            "degraded": degraded,
+            "evidence": _mark_success(list(result.get("evidence", []))),
+            "confidence": float(result.get("confidence") or 0.0),
+            "error": None,
+            "degraded": bool(result.get("degraded")),
+            "calls": int(result.get("calls", 0)),
         }
 
-    result = search_evidence(
-        query=primary_query,
+    result = _search_evidence_variants(
+        queries=queries,
         workspace_id=state["workspace_id"],
-        allowed_document_ids=primary_ids,
+        document_ids=primary_ids,
+        max_calls=max(0, MAX_TOOL_CALLS_PER_QUERY - int(state.get("tool_calls_used", 0))),
     )
 
     error_code = result.get("error_code")
@@ -3678,6 +3947,7 @@ def _run_documents(
                 str(error_code),
                 result.get("error") or "Document retrieval failed.",
             ),
+            "calls": int(result.get("calls", 0)),
         }
 
     chunks = _mark_success(list(result.get("evidence", [])))
@@ -3688,23 +3958,33 @@ def _run_documents(
         raw_query = effective_planning_query(state)
 
         scoped_to_resolved = bool(primary_ids)
+        explicit_source_scope = bool(_resolved_document_ids(state)) or bool(
+            _named_missing_source_references(state)
+        )
         all_ids = _document_ids_for_search(state)
         retry_ids = primary_ids if scoped_to_resolved else (all_ids or primary_ids)
 
-        if scoped_to_resolved and not chunks and _plan_is_mixed(state):
-            # Widen only inside the conversation allow-list (None = whole
-            # workspace, which the catalog is already limited to).
+        # Scope Guard's relevant_document_ids are a preferred search set, not
+        # an authorization boundary. If they produce insufficient evidence,
+        # expand to every conversation-authorized document. An explicitly
+        # resolved source remains hard-scoped and is never widened silently.
+        if not explicit_source_scope:
             authorized = _allowed_document_ids(state)
-            authorized_set = set(authorized) if authorized is not None else None
-            catalog_ids = [
-                _coerce_int(doc.get("document_id"))
-                for doc in _resources(state).catalog()
-            ]
-            widened = [
-                i
-                for i in dict.fromkeys(list(all_ids) + catalog_ids)
-                if i is not None and (authorized_set is None or i in authorized_set)
-            ]
+            if authorized is not None:
+                widened = list(dict.fromkeys(int(value) for value in authorized))
+            else:
+                try:
+                    widened = [
+                        value
+                        for value in (
+                            _coerce_int(doc.get("document_id"))
+                            for doc in _resources(state).catalog()
+                        )
+                        if value is not None
+                    ]
+                except Exception:
+                    logger.exception("Could not expand preferred document scope")
+                    widened = []
             if widened:
                 retry_ids = widened
 
@@ -3712,7 +3992,13 @@ def _run_documents(
             raw_query != primary_query or sorted(retry_ids) != sorted(primary_ids)
         )
 
-        if different and not _past_deadline(state) and budget.try_consume():
+        recovery_calls = 0
+        if (
+            different
+            and not _past_deadline(state)
+            and budget.try_consume()
+            and int(state.get("tool_calls_used", 0)) + int(result.get("calls", 0)) < MAX_TOOL_CALLS_PER_QUERY
+        ):
             logger.info(
                 "document_search recovery: chunks=%d confidence=%.4f",
                 len(chunks),
@@ -3724,6 +4010,7 @@ def _run_documents(
                     workspace_id=state["workspace_id"],
                     allowed_document_ids=retry_ids,
                 )
+                recovery_calls = 1
             except Exception:
                 logger.exception("document_search recovery failed")
                 retry = None
@@ -3742,6 +4029,7 @@ def _run_documents(
         "confidence": confidence,
         "error": None,
         "degraded": degraded,
+        "calls": int(result.get("calls", 0)) + locals().get("recovery_calls", 0),
     }
 
 

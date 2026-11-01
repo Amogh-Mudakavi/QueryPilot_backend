@@ -37,8 +37,9 @@ from typing import Any, Iterable
 
 from documents.ingestion.vectors import VectorStore
 
-from .bm25 import BM25Retriever
+from .bm25 import FieldedBM25Retriever
 from .evidence import Evidence
+from .reranker import reranker
 from .keys import key_pattern
 
 logger = logging.getLogger(__name__)
@@ -231,12 +232,20 @@ class HybridRetriever:
             )
 
         if dense_candidates or bm25_candidates:
+            self._enrich_candidate_titles(
+                candidates=dense_candidates + bm25_candidates,
+                workspace_id=workspace_id,
+            )
             fused_candidates = self._rrf_fuse(
                 dense_candidates=dense_candidates,
                 bm25_candidates=bm25_candidates,
             )
 
-            final_candidates = fused_candidates[: self.top_k]
+            ranked_candidates = reranker.rerank(
+                query=query,
+                candidates=fused_candidates[: reranker.MAX_CANDIDATES],
+            )
+            final_candidates = ranked_candidates[: self.top_k]
 
             evidence = [candidate["evidence"] for candidate in final_candidates]
 
@@ -587,6 +596,44 @@ class HybridRetriever:
 
         return normalized
 
+    @staticmethod
+    def _enrich_candidate_titles(
+        *,
+        candidates: list[dict[str, Any]],
+        workspace_id: int,
+    ) -> None:
+        """Attach authoritative document titles for contextual reranking."""
+        document_ids = set()
+        for candidate in candidates:
+            metadata = candidate.get("metadata")
+            if not isinstance(metadata, dict) or metadata.get("document_title"):
+                continue
+            try:
+                document_ids.add(int(metadata.get("document_id")))
+            except (TypeError, ValueError):
+                continue
+        if not document_ids:
+            return
+        try:
+            from documents.models import Document
+            titles = dict(
+                Document.objects.filter(
+                    workspace_id=workspace_id, id__in=document_ids
+                ).values_list("id", "title")
+            )
+            for candidate in candidates:
+                metadata = candidate.get("metadata")
+                if not isinstance(metadata, dict) or metadata.get("document_title"):
+                    continue
+                try:
+                    title = titles.get(int(metadata.get("document_id")))
+                except (TypeError, ValueError):
+                    title = None
+                if title:
+                    metadata["document_title"] = str(title)
+        except Exception:
+            logger.exception("Candidate title enrichment failed; preserving retrieval results")
+
     def _dense_search(
         self,
         *,
@@ -685,12 +732,59 @@ class HybridRetriever:
             return []
 
         try:
-            bm25 = BM25Retriever(documents=documents)
+            # Keep the three lexical fields separate. Chunk text already
+            # carries its heading for dense retrieval; the structured heading
+            # and title metadata receive independently weighted BM25 fields.
+            headings = []
+            titles = []
+            content_fields = []
+            for index, text in enumerate(documents):
+                metadata = (
+                    metadatas[index]
+                    if index < len(metadatas) and isinstance(metadatas[index], dict)
+                    else {}
+                )
+                heading = str(metadata.get("heading_path") or metadata.get("heading") or "")
+                title = str(metadata.get("document_title") or "")
+                body = str(text or "")
+                if heading and body.casefold().startswith((heading + ":").casefold()):
+                    body = body[len(heading) + 1 :].lstrip()
+                content_fields.append(body)
+                headings.append(heading)
+                titles.append(title)
 
-            matches = bm25.top_k(
-                query=query,
-                k=self.bm25_k,
+            # Older vectors may not carry document_title. Resolve missing titles
+            # in one bounded metadata query, without loading document contents.
+            missing_ids = {
+                int(meta.get("document_id"))
+                for meta in metadatas
+                if isinstance(meta, dict)
+                and not str(meta.get("document_title") or "").strip()
+                and str(meta.get("document_id") or "").isdigit()
+            }
+            if missing_ids:
+                try:
+                    from documents.models import Document
+                    title_by_id = dict(
+                        Document.objects.filter(
+                            workspace_id=workspace_id, id__in=missing_ids
+                        ).values_list("id", "title")
+                    )
+                    for index, meta in enumerate(metadatas):
+                        if index < len(titles) and not titles[index] and isinstance(meta, dict):
+                            try:
+                                titles[index] = str(title_by_id.get(int(meta.get("document_id"))) or "")
+                            except (TypeError, ValueError):
+                                pass
+                except Exception:
+                    logger.exception("BM25 document-title lookup failed; continuing without title field")
+
+            bm25 = FieldedBM25Retriever(
+                content=content_fields,
+                headings=headings,
+                titles=titles,
             )
+            matches = bm25.top_k(query=query, k=self.bm25_k)
         except Exception as exc:
             raise RetrievalError(
                 code="RETRIEVAL_ERROR",

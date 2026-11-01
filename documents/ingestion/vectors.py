@@ -219,6 +219,7 @@ class VectorStore:
         workspace_id,
         document_id,
         chunks,
+        document_title=None,
     ):
         if not chunks:
             return
@@ -245,6 +246,14 @@ class VectorStore:
                             "heading": _clip(
                                 chunk.get("heading") or "",
                                 MAX_HEADING_CHARS,
+                            ),
+                            "heading_path": _clip(
+                                chunk.get("heading") or "",
+                                MAX_HEADING_CHARS,
+                            ),
+                            "document_title": _clip(
+                                document_title or "",
+                                MAX_DOCUMENT_NAME_CHARS,
                             ),
                         },
                     }

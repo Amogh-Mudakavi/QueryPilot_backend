@@ -212,6 +212,7 @@ class IngestionPipeline:
         VectorStore.store_chunks(
             workspace_id=workspace_id,
             document_id=document_id,
+            document_title=document.title or original_filename,
             chunks=chunks,
         )
 

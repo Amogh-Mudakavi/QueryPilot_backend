@@ -22,6 +22,11 @@ Rules:
 - Mixed = the answer needs both table data and document text: a calculation combining a rule/policy/formula in one source with data in another, OR a figure, rate, period or measurement that the named source may not itself contain. When unsure whether the needed data sits in a table elsewhere in workspace_catalog, choose mixed.
 - data_sources_needed: decide this first. Does the answer depend on recorded values (measurements, transactions, counts, dates, statuses for a particular period, entity or item) that the sources the user named cannot themselves contain? A rule, contract, policy or specification states what should hold; whether it held, or what follows from it, needs the records. If so, list the exact `title` of every workspace_catalog entry whose columns could hold those values, even when likely_relevant is false (that flag only reflects the wording of the question). Otherwise return []. Never list a title that is not in workspace_catalog, and never list a source merely because it exists.
 - If data_sources_needed is not empty, category_hint must be mixed.
+- Decompose substantive requests into the smallest useful evidence requirements (usually 1-5). Each requirement describes a fact to establish, not a source or answer.
+- Use kind=text for passages/rules, table for recorded rows/aggregates, and either when either representation could establish the fact.
+- queries must be short retrieval queries grounded in the requirement; never invent document titles, IDs, policies, people or values.
+- dependencies use only IDs of other requirements and only when one fact is needed to identify or formulate another. Avoid artificial dependencies.
+- Use [] for requirements on chitchat or pure conversation-memory requests. The raw user question is always searched independently as a safety net.
 - Table content is structured; file/table catalog questions are metadata.
 - "first/second/last/nth" preserves position semantics. Deterministic resolution handles ambiguity later.
 - For contextual follow-ups, use history only when the subject is unambiguous; a self-contained query does not inherit prior topic/files.
@@ -75,6 +80,24 @@ ACTION_SCHEMA = {
                     "type": "array",
                     "items": {"type": "string"},
                 },
+                "needs_instance_data": {"type": "boolean"},
+                "requirements": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "kind": {"type": "string", "enum": ["text", "table", "either"]},
+                            "type": {"type": "string", "enum": ["rule", "fact", "numeric", "entity", "status", "date", "comparison", "other"]},
+                            "description": {"type": "string"},
+                            "queries": {"type": "array", "items": {"type": "string"}},
+                            "entities": {"type": "array", "items": {"type": "string"}},
+                            "depends_on": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["id", "kind", "type", "description", "queries", "entities", "depends_on"],
+                        "additionalProperties": False,
+                    },
+                },
                 "reason": {"type": "string"},
             },
             "required": [
@@ -83,6 +106,8 @@ ACTION_SCHEMA = {
                 "operation",
                 "references",
                 "requested_fields",
+                "needs_instance_data",
+                "requirements",
                 "reason",
             ],
             "additionalProperties": False,

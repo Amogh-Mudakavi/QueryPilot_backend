@@ -230,3 +230,66 @@ class BM25Retriever:
         )
 
         return ranked[:k]
+
+
+class FieldedBM25Retriever:
+    """BM25 over separate content, heading and title fields.
+
+    Scores are combined with explicit field weights. This prevents a repeated
+    document title from being concatenated into every chunk and dominating the
+    lexical corpus. The weights are configurable and are starting values, not
+    calibrated probabilities.
+    """
+
+    DEFAULT_WEIGHTS = {"content": 1.0, "heading": 0.8, "title": 0.3}
+
+    def __init__(
+        self,
+        *,
+        content: Sequence[str],
+        headings: Sequence[str] | None = None,
+        titles: Sequence[str] | None = None,
+        field_weights: dict[str, float] | None = None,
+    ) -> None:
+        self.content = list(content)
+        size = len(self.content)
+        self.headings = list(headings or [""] * size)
+        self.titles = list(titles or [""] * size)
+        if len(self.headings) != size or len(self.titles) != size:
+            raise ValueError("all BM25 fields must have the same number of documents")
+        self.weights = dict(self.DEFAULT_WEIGHTS)
+        if field_weights:
+            for field, weight in field_weights.items():
+                if field not in self.weights:
+                    raise ValueError(f"unknown BM25 field: {field}")
+                value = float(weight)
+                if value < 0:
+                    raise ValueError("BM25 field weights must be non-negative")
+                self.weights[field] = value
+        self._retrievers = {
+            "content": BM25Retriever(self.content),
+            "heading": BM25Retriever(self.headings),
+            "title": BM25Retriever(self.titles),
+        }
+
+    def get_scores(self, query: str) -> list[float]:
+        scores = [0.0] * len(self.content)
+        for field, retriever in self._retrievers.items():
+            weight = self.weights[field]
+            if weight == 0:
+                continue
+            field_scores = retriever.get_scores(query)
+            for index, score in enumerate(field_scores):
+                scores[index] += weight * score
+        return scores
+
+    def top_k(self, query: str, k: int = 10) -> list[BM25Result]:
+        if k <= 0:
+            return []
+        ranked = [
+            BM25Result(index=index, score=score)
+            for index, score in enumerate(self.get_scores(query))
+            if score > 0.0
+        ]
+        ranked.sort(key=lambda result: result.score, reverse=True)
+        return ranked[:k]

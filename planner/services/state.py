@@ -23,6 +23,9 @@ class AgentState(TypedDict, total=False):
     scope_route: str
 
     query_understanding: dict[str, Any]
+    evidence_requirements: list[dict[str, Any]]
+    requirement_assessment: dict[str, Any]
+    query_trace: Any
     resolved_references: dict[str, Any]
     execution_plan: dict[str, Any]
 
