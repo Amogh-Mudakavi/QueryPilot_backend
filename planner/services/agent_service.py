@@ -3768,6 +3768,20 @@ _FACT_MAX_VALUE_CHARS = 30
 _FACT_MAX_QUERIES = 3
 _FACT_INCLUDE_QUESTION = False  # True: append the question to each fact query
 _FACT_NUMERIC = re.compile(r"^[\s\d.,%+\-/:]+$")
+# QP-FIX-6: a SMALL table (one entity's rows) has no variety to measure, but a
+# yes/no style flag in it still points at a rule written in prose. Only these
+# boolean-looking values are used from small tables; names, cities and other
+# free text would only add noise to the search.
+_FACT_BOOL_VALUES = {"yes", "no", "true", "false", "y", "n"}
+
+
+def _table_is_rule_only(item: Any, roles: dict[str, str]) -> bool:  # QP-FIX-6
+    names = {
+        str(s.get("table_name"))
+        for s in (item.get("sources") or [] if isinstance(item, dict) else [])
+        if isinstance(s, dict) and s.get("table_name")
+    }
+    return bool(names) and all(roles.get(name) == "rule" for name in names)
 
 
 def _row_fact_phrases(state: AgentState, structured: list[Any]) -> list[str]:
@@ -3789,6 +3803,23 @@ def _row_fact_phrases(state: AgentState, structured: list[Any]) -> list[str]:
             continue
         rows = [r for r in (content.get("rows") or []) if isinstance(r, dict)]
         if len(rows) < _FACT_MIN_ROWS:
+            # QP-FIX-6: small (entity) tables still contribute their yes/no flags
+            if rows and not _table_is_rule_only(item, roles):
+                for column in [str(c) for c in (content.get("columns") or list(rows[0]))]:
+                    if is_id_column(column):
+                        continue
+                    flag_values = list(
+                        dict.fromkeys(
+                            str(r.get(column)).strip()
+                            for r in rows
+                            if r.get(column) not in (None, "")
+                        )
+                    )
+                    if len(flag_values) == 1 and flag_values[0].lower() in _FACT_BOOL_VALUES:
+                        label = re.sub(
+                            r"[_\s]+", " ", re.sub(r"([a-z])([A-Z])", r"\1 \2", column)
+                        ).strip()
+                        scored.append((1, f"{label} {flag_values[0]}"))
             continue
         names = {
             str(s.get("table_name"))
@@ -3823,6 +3854,19 @@ def _row_fact_phrases(state: AgentState, structured: list[Any]) -> list[str]:
     scored.sort(key=lambda pair: pair[0])
     phrases = list(dict.fromkeys(text for _, text in scored))
     return phrases[:_FACT_MAX_QUERIES]
+
+
+def _doc_and_chunk_indexes(item: Any) -> tuple[int | None, set[int]]:  # QP-FIX-5
+    """(document id, chunk indexes) of a text passage; indexes may be empty."""
+    if not isinstance(item, dict):
+        return None, set()
+    meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    doc = _coerce_int(item.get("document_id", meta.get("document_id")))
+    indexes = meta.get("chunk_indexes")
+    if not isinstance(indexes, list):
+        single = meta.get("chunk_index")
+        indexes = [single] if isinstance(single, int) else []
+    return doc, {i for i in indexes if isinstance(i, int)}
 
 
 def _search_row_facts(
@@ -3908,6 +3952,7 @@ def _supplement_dependency_evidence(
     primary = list(document_result.get("evidence", []) or [])
     coverage_query = query  # QP-FIX-4
     _fact_phrases = _row_fact_phrases(state, list(structured or []))
+    _fact_chunk_map: dict[int, set[int]] = {}  # QP-FIX-5: doc id -> chunks found via row facts
     if _fact_phrases:
         _fact_hits = _mark_success(
             _search_row_facts(
@@ -3925,6 +3970,12 @@ def _supplement_dependency_evidence(
             sorted(_document_ids_from_text_evidence(_fact_hits)),
         )
         if _fact_hits:
+            for _hit in _fact_hits:  # QP-FIX-5: rules found via row facts must survive trimming
+                if isinstance(_hit, dict):
+                    _hit["protect_from_trim"] = True
+                    _hd, _hc = _doc_and_chunk_indexes(_hit)
+                    if _hd is not None:
+                        _fact_chunk_map.setdefault(_hd, set()).update(_hc)
             supplemental = _fact_hits + supplemental
             coverage_query = f"{query} {' '.join(_fact_phrases)}"
     if not supplemental:
@@ -3973,6 +4024,26 @@ def _supplement_dependency_evidence(
             dependency_coverage = list(covered.get("evidence", []) or [])
             dependency_notes = list(covered.get("notes") or [])
             dependency_cov_info = list(covered.get("coverage") or [])
+            # QP-FIX-5: a coverage passage that holds a chunk found through row
+            # facts is protected from trimming. If the passage carries no chunk
+            # info, every passage of that document is protected (it was loaded
+            # because a row fact pointed there).
+            _prot = 0
+            for _cov in dependency_coverage:
+                if not isinstance(_cov, dict):
+                    continue
+                _cd, _cc = _doc_and_chunk_indexes(_cov)
+                if _cd is None or _cd not in _fact_chunk_map:
+                    continue
+                if not _cc or (_cc & _fact_chunk_map[_cd]):
+                    _cov["protect_from_trim"] = True
+                    _prot += 1
+            logger.info(
+                "row-fact protection: protected=%d of %d coverage passage(s) fact_chunks=%s",
+                _prot,
+                len(dependency_coverage),
+                {k: sorted(v) for k, v in _fact_chunk_map.items()},
+            )
 
     # Prefer coverage for documents it actually represented, avoiding duplicate
     # top-k chunks for the same document. Keep ranked results as a fallback if

@@ -1934,6 +1934,23 @@ def _narrow_spreadsheet_tables_v3(
     return out, changed
 
 
+
+def _is_trim_protected(item: Any) -> bool:  # QP-FIX-5
+    return isinstance(item, dict) and bool(item.get("protect_from_trim"))
+
+
+def _describe_passage(item: Any) -> str:  # QP-FIX-5
+    """One log line for a text passage: document, chunks, score, protection, start of text."""
+    if not isinstance(item, dict):
+        return repr(type(item).__name__)
+    doc, chunks = _text_chunk_set(item)
+    text = " ".join(str(item.get("content") or "").split())[:100]
+    return (
+        f"doc={doc} chunks={sorted(chunks)} score={item.get('score')} "
+        f"protected={_is_trim_protected(item)} text={text!r}"
+    )
+
+
 def fit_evidence_to_budget(
     *,
     query: str,
@@ -2003,14 +2020,26 @@ def fit_evidence_to_budget(
     if removed_notes and _fits_answer_budget(query, items + [note], conversation_history):
         return items + [note]
 
-    # Stage 3 - lowest-scored passages first, keep >= 1 per document
+    # Stage 3 - lowest-scored passages first, keep >= 1 per document.
+    # QP-FIX-5: a passage tagged protect_from_trim (it was found through facts
+    # read from the table rows, so it holds a rule that applies to those rows)
+    # is never dropped here. If everything else is gone and the evidence still
+    # does not fit, we fall through to the explicit "evidence too large" path
+    # instead of silently answering without the rule.
     per_doc: dict[Any, int] = {}
     for it in items:
         doc, chunks = _text_chunk_set(it)
         if chunks:
             per_doc[doc] = per_doc.get(doc, 0) + 1
+    protected_count = sum(
+        1 for it in items if _text_chunk_set(it)[1] and _is_trim_protected(it)
+    )
     candidates = sorted(
-        (i for i, it in enumerate(items) if _text_chunk_set(it)[1]),
+        (
+            i
+            for i, it in enumerate(items)
+            if _text_chunk_set(it)[1] and not _is_trim_protected(it)
+        ),
         key=lambda i: (float(items[i].get("score") or 0.0), -i),
     )
     removed: set[int] = set()
@@ -2023,10 +2052,26 @@ def fit_evidence_to_budget(
         trial = [it for j, it in enumerate(items) if j not in removed] + [note]
         if _fits_answer_budget(query, trial, conversation_history):
             logger.warning(
-                "fit_evidence_to_budget: dropped %d low-ranked passage(s) to fit",
+                "fit_evidence_to_budget: dropped %d low-ranked passage(s) to fit "
+                "(protected passages kept: %d)",
                 len(removed),
+                protected_count,
             )
+            for j in sorted(removed):  # QP-FIX-5: say exactly what was dropped
+                logger.warning(
+                    "fit_evidence_to_budget: DROPPED %s", _describe_passage(items[j])
+                )
+            for j, it in enumerate(items):
+                if j not in removed and _text_chunk_set(it)[1]:
+                    logger.warning(
+                        "fit_evidence_to_budget: KEPT %s", _describe_passage(it)
+                    )
             return trial
+    logger.error(
+        "fit_evidence_to_budget: no more unprotected passages to drop "
+        "(protected passages: %d)",
+        protected_count,
+    )
 
     _largest = sorted(
         (
