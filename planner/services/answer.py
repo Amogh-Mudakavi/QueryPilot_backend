@@ -1475,7 +1475,13 @@ _CALCULATION_GUIDANCE = (
     "conditions depend on an attribute of the entity (for example a membership flag) "
     "or on another document, look for that rule in the evidence; if it is absent, say "
     "exactly what is missing and give the result for each plausible case instead of a "
-    "flat yes or no. Answer every part of the question."
+    "flat yes or no. Answer every part of the question. "
+    # QP-FIX-9: generic rules for questions over a whole population and for money.
+    "When the question covers every record, test each record on its own using its "
+    "own values (a per-record flag or category can change a window, limit or fee), "
+    "then list every record you leave out with one short reason. "
+    "Keep money amounts at the precision of the source values; do not round a final "
+    "amount to whole units unless the question asks for it."
 )
 
 
