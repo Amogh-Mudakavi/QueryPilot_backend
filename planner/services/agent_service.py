@@ -4005,27 +4005,6 @@ def _supplement_dependency_evidence(
         _dep_room,
         _DEPENDENCY_MIN_CHARS,
     )
-    # QP-FIX-7: when the dependency document was found through row facts, only
-    # the matched chunks (plus some neighbouring context) are needed, not the
-    # whole document. Size the load from what the matches actually weigh, so a
-    # long document cannot crowd the answer out of the model's token budget.
-    _dep_budget = max(_dep_room, _DEPENDENCY_MIN_CHARS)
-    if dependency_ids and _fact_chunk_map and all(
-        d in _fact_chunk_map for d in dependency_ids
-    ):
-        _hit_chars = sum(
-            len(str(_h.get("content") or ""))
-            for _h in (_fact_hits if _fact_phrases else [])
-            if isinstance(_h, dict) and _doc_and_chunk_indexes(_h)[0] in dependency_ids
-        )
-        if _hit_chars > 0:
-            _dep_budget = min(_dep_budget, max(1200, 2 * _hit_chars))
-        logger.info(
-            "dependency load sized from row-fact matches: hit_chars=%d budget=%d (floor=%d)",
-            _hit_chars,
-            _dep_budget,
-            _DEPENDENCY_MIN_CHARS,
-        )
     if dependency_ids:
         try:
             covered = _run_documents_with_coverage(
@@ -4033,7 +4012,7 @@ def _supplement_dependency_evidence(
                 dependency_ids,
                 coverage_query,
                 require_complete=False,
-                budget_chars=_dep_budget,
+                budget_chars=max(_dep_room, _DEPENDENCY_MIN_CHARS),
             )
         except Exception:
             logger.exception(

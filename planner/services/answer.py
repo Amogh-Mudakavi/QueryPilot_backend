@@ -1758,7 +1758,9 @@ def _fits_answer_budget(
         _system_tokens()
         + _estimate_tokens(payload)
         + REQUEST_OVERHEAD_TOKENS
-        + min(ANSWER_OUTPUT_TOKEN_CAPS[cap_key], 2000)
+        # QP-FIX-8: use the SAME minimum completion room that _completion_budget
+        # accepts, so the trimmer and the final check cannot disagree.
+        + min(ANSWER_OUTPUT_TOKEN_CAPS[cap_key], MIN_ANSWER_COMPLETION_TOKENS)
     )
     return reserved <= MODEL_TPM_LIMITS[MODEL_120B]
 
