@@ -31,24 +31,22 @@ differently cannot make the provider reject the whole response.
 
 Deterministic checks around the model (none depend on it being right):
   * requested fields that no candidate column provides are computed by
-    definition; if something must be computed, the selection must contain at
-    least one input or rule table, otherwise the result is explicitly marked
-    invalid and callers must not widen to every candidate table;
+    definition; if the model omits their input/rule table, the metadata
+    fallback attempts a bounded rescue rather than widening the table scope;
   * names outside the candidate set are discarded;
   * data reported as unmet is looked for, by token overlap, in unselected
     candidates before being accepted as absent;
-  * a document the selector chose nothing from keeps only its best-matching
-    table, and only if that table shares at least two words with the question
-    (it never pulls in ALL of the document's tables); forced (entity-located)
-    tables are always kept.
+  * provider or validation failures use a bounded metadata ranker over the
+    authorized candidates; a failure never widens the scope to every table;
+    forced (entity-located or explicitly named) tables are always kept.
   * roles and computed values are returned to the caller (select_tables_detailed)
     so the executor can aggregate large input tables instead of dumping rows.
 
 Nothing here knows about any domain, column name, or file format. It never
 executes SQL. A valid empty selection is returned as ``status="no_match"``;
-a selection that violates the computed-input contract is ``status="invalid"``.
-Provider, parsing, or transport failures return None and are logged. Callers
-must distinguish these outcomes from a non-applicable selection.
+provider, parsing, transport, or computed-input failures use the metadata
+fallback and are logged. Callers can distinguish that path through
+``strategy``.
 
 Document profiles are intentionally not used: they are per-document, so they
 cannot tell sibling tables of one document apart.
@@ -59,6 +57,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -81,6 +80,8 @@ MAX_SAMPLE_ROWS_LARGE = 1
 MAX_SAMPLE_CHARS_TOTAL = 3500
 
 MAX_COMPUTED_FIELDS = 8
+MAX_FALLBACK_TABLES_PER_DOCUMENT = 2
+MAX_FALLBACK_TABLES = 8
 
 ROLES = ("output", "filter", "input", "rule", "key")
 _CALCULATION_ROLES = {"input", "rule"}
@@ -126,6 +127,7 @@ class TableSelection:
     computed: list[str] = field(default_factory=list)
     unmet: list[str] = field(default_factory=list)
     status: str = "selected"
+    strategy: str = "llm"
 
 
 def _shorten(value: Any) -> Any:
@@ -145,7 +147,256 @@ def _as_int(value: Any) -> int | None:
 def _tokens(text: Any) -> frozenset[str]:
     spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(text or ""))
     found = re.findall(r"[a-z0-9]+", spaced.lower())
-    return frozenset(t[:-1] if len(t) > 3 and t.endswith("s") else t for t in found)
+    normalized = set()
+    for token in found:
+        if len(token) > 4 and token.endswith("ies"):
+            token = token[:-3] + "y"
+        elif (
+            len(token) > 4
+            and token.endswith("s")
+            and not token.endswith(("ss", "us", "is"))
+        ):
+            token = token[:-1]
+        normalized.add(token)
+    return frozenset(normalized)
+
+
+_SELECTION_STOPWORDS = frozenset(
+    "a an and are as at be been being by can could did do does for from had has "
+    "have how i in into is it its may might of on or should so than that the their "
+    "them then there these they this those to was we were what when where which "
+    "who why will with would you your document documents pdf file files table tables "
+    "data information source sources record records answer question please tell "
+    "give show based according using about all each both across between".split()
+)
+_RULE_SCHEMA_TOKENS = frozenset(
+    {
+        "rule", "policy", "version", "effective", "threshold", "rate", "limit",
+        "formula", "criteria", "condition", "eligibility", "sla", "validity",
+        "override", "deduction", "cap", "penalty", "commitment",
+    }
+)
+_CALCULATION_OPERATIONS = frozenset(
+    {"calculate", "aggregate", "compare", "filter", "list", "lookup"}
+)
+
+
+def _selection_weights(query: str, understanding: dict[str, Any]) -> Counter[str]:
+    """Build weighted concepts from the user request and planner checklist."""
+    weights: Counter[str] = Counter()
+
+    def add(value: Any, weight: float) -> None:
+        for token in _tokens(value) - _SELECTION_STOPWORDS:
+            weights[token] += weight
+
+    add(query, 1.0)
+    for field_name in _requested_fields(understanding):
+        add(field_name, 3.0)
+
+    requirements = understanding.get("requirements") or []
+    if isinstance(requirements, list):
+        for requirement in requirements:
+            if not isinstance(requirement, dict):
+                continue
+            kind = str(requirement.get("kind") or "either").lower()
+            req_type = str(requirement.get("type") or "other").lower()
+            weight = 3.0 if kind == "table" else 2.2 if kind == "either" else 1.0
+            if req_type == "rule":
+                weight = max(weight, 2.5)
+            add(requirement.get("description"), weight)
+            for value in requirement.get("queries") or []:
+                add(value, weight)
+            for value in requirement.get("entities") or []:
+                add(value, 4.0)
+    for value in understanding.get("references") or []:
+        add(value, 1.5)
+    return weights
+
+
+def _fallback_table_selection(
+    *,
+    query: str,
+    understanding: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    forced: set[str] | None = None,
+    computed: list[str] | None = None,
+    unmet: list[str] | None = None,
+    reason: str = "selector unavailable",
+) -> "TableSelection":
+    """Select a small, explainable table set when the model cannot select.
+
+    Ranking uses only authorized candidate metadata: column names are strongest,
+    then table identifiers, request fields/requirements, document titles and
+    sample values. It never expands to all tables and never crosses the caller's
+    candidate-document boundary.
+    """
+    forced_names = set(forced or ())
+    allowed = {
+        str(item.get("table_name")): item
+        for item in candidates
+        if item.get("table_name")
+    }
+    forced_names &= set(allowed)
+    weights = _selection_weights(query, understanding)
+    operation = str(understanding.get("operation") or "").strip().lower()
+    computed_values = list(dict.fromkeys((computed or []) + fields_without_matching_column(
+        _requested_fields(understanding), candidates
+    )))[:MAX_COMPUTED_FIELDS]
+
+    scored_by_document: dict[
+        int | None, list[tuple[float, int, set[str], dict[str, Any]]]
+    ] = defaultdict(list)
+    for item in candidates:
+        name = str(item.get("table_name") or "")
+        if not name:
+            continue
+        columns = set().union(*(_tokens(column) for column in item.get("columns") or []))
+        table_name_tokens = _tokens(name) - _SELECTION_STOPWORDS
+        title_tokens = _tokens(item.get("document_title") or "") - _SELECTION_STOPWORDS
+        sample_tokens: set[str] = set()
+        for row in item.get("sample_rows") or []:
+            if isinstance(row, dict):
+                for value in row.values():
+                    sample_tokens |= set(_tokens(value)) - _SELECTION_STOPWORDS
+        column_hits = columns & set(weights)
+        name_hits = table_name_tokens & set(weights)
+        title_hits = title_tokens & set(weights)
+        sample_hits = sample_tokens & set(weights)
+        score = (
+            sum(weights[token] * 3.0 for token in column_hits)
+            + sum(weights[token] * 1.8 for token in name_hits)
+            + sum(weights[token] * 0.65 for token in title_hits)
+            + sum(weights[token] * 0.35 for token in sample_hits)
+        )
+        scored_by_document[_as_int(item.get("document_id"))].append(
+            (score, len(column_hits), column_hits | name_hits, item)
+        )
+
+    chosen = set(forced_names)
+    roles: dict[str, str] = {}
+    for name in forced_names:
+        roles[name] = "filter"
+
+    # Keep the best evidence table(s) within each candidate document. A second
+    # table is admitted only when it contributes a distinct matching concept.
+    for document_id, ranked in scored_by_document.items():
+        ranked.sort(
+            key=lambda part: (part[0], part[1], str(part[3].get("table_name"))),
+            reverse=True,
+        )
+        # One weak common-word overlap is not enough to read a table. Strong
+        # planner-field or requirement matches can qualify a single column;
+        # otherwise require a meaningful multi-concept column match.
+        eligible = [
+            part for part in ranked
+            if part[0] >= 3.5 and part[1] > 0
+        ]
+        if not eligible:
+            continue
+        selected_for_doc = sum(
+            1
+            for name in chosen
+            if _as_int(allowed.get(name, {}).get("document_id")) == document_id
+        )
+        covered: set[str] = set()
+        for score, column_hits, matched, item in eligible:
+            name = str(item.get("table_name"))
+            if name in chosen:
+                covered |= matched
+                continue
+            if selected_for_doc >= MAX_FALLBACK_TABLES_PER_DOCUMENT:
+                break
+            if selected_for_doc and not (matched - covered):
+                continue
+            top_score = eligible[0][0]
+            if selected_for_doc and score < top_score * 0.55:
+                continue
+            chosen.add(name)
+            covered |= matched
+            selected_for_doc += 1
+
+    if len(chosen) > MAX_FALLBACK_TABLES:
+        # Preserve cross-document coverage under the global cap: admit each
+        # document's strongest match before a second table from any document.
+        forced_order = sorted(forced_names)
+        ranked_by_document: list[list[str]] = []
+        for _, ranked in sorted(
+            scored_by_document.items(),
+            key=lambda pair: max((part[0] for part in pair[1]), default=0.0),
+            reverse=True,
+        ):
+            names_for_document = [
+                str(part[3].get("table_name"))
+                for part in sorted(ranked, key=lambda part: part[0], reverse=True)
+                if str(part[3].get("table_name")) in chosen
+                and str(part[3].get("table_name")) not in forced_names
+            ]
+            if names_for_document:
+                ranked_by_document.append(names_for_document)
+        ranked_names: list[str] = []
+        max_rank = max((len(names) for names in ranked_by_document), default=0)
+        for rank in range(max_rank):
+            ranked_names.extend(
+                names[rank]
+                for names in ranked_by_document
+                if rank < len(names)
+            )
+        chosen = set(
+            forced_order
+            + ranked_names[: max(0, MAX_FALLBACK_TABLES - len(forced_order))]
+        )
+
+    for name in chosen:
+        item = allowed[name]
+        # Classify by the table itself, not its parent document title: a
+        # document called "Policy Ledger" can still contain ordinary records.
+        feature_tokens = set(_tokens(name))
+        feature_tokens |= set().union(*(_tokens(column) for column in item.get("columns") or []))
+        is_rule_source = bool(feature_tokens & _RULE_SCHEMA_TOKENS)
+        if name in forced_names:
+            roles[name] = "filter"
+        elif is_rule_source:
+            roles[name] = "rule"
+        elif operation in _CALCULATION_OPERATIONS or computed_values:
+            roles[name] = "input"
+        else:
+            roles[name] = "output"
+
+    if computed_values and chosen and not (set(roles.values()) & _CALCULATION_ROLES):
+        best = max(
+            chosen,
+            key=lambda name: sum(
+                weights[token] * 3.0
+                for token in (
+                    set().union(*(_tokens(column) for column in allowed[name].get("columns") or []))
+                    & set(weights)
+                )
+            ),
+        )
+        roles[best] = "input"
+
+    if not chosen:
+        logger.warning(
+            "table selection fallback found no schema match: candidates=%d reason=%s",
+            len(candidates), reason[:160],
+        )
+        return TableSelection(
+            tables=set(), roles={}, computed=computed_values,
+            unmet=list(unmet or []), status="no_match", strategy="metadata_fallback",
+        )
+
+    logger.warning(
+        "table selection fallback: selected=%d/%d names=%s reason=%s",
+        len(chosen), len(allowed), sorted(chosen), reason[:160],
+    )
+    return TableSelection(
+        tables=chosen,
+        roles=roles,
+        computed=computed_values,
+        unmet=list(unmet or []),
+        status="selected",
+        strategy="metadata_fallback",
+    )
 
 
 def _requested_fields(understanding: dict[str, Any]) -> list[str]:
@@ -236,10 +487,44 @@ def build_selection_payload(
             }
         )
 
+    # Give the selector the planner's evidence decomposition, not just the
+    # raw question. Keep this compact so the table-selection call stays within
+    # the small provider budget even when the planner emitted many requirements.
+    compact_requirements: list[dict[str, Any]] = []
+    requirements = understanding.get("requirements") or []
+    if isinstance(requirements, list):
+        for requirement in requirements[:8]:
+            if not isinstance(requirement, dict):
+                continue
+            compact_requirements.append({
+                "kind": str(requirement.get("kind") or "either")[:12],
+                "type": str(requirement.get("type") or "other")[:16],
+                "description": str(requirement.get("description") or "")[:180],
+                "queries": [
+                    str(value)[:160]
+                    for value in (requirement.get("queries") or [])[:2]
+                    if str(value or "").strip()
+                ],
+                "entities": [
+                    str(value)[:100]
+                    for value in (requirement.get("entities") or [])[:3]
+                    if str(value or "").strip()
+                ],
+            })
+
+    raw_references = understanding.get("references") or []
+    compact_references = [
+        str(value)[:120]
+        for value in raw_references[:8]
+        if str(value or "").strip()
+    ] if isinstance(raw_references, (list, tuple)) else []
+
     payload: dict[str, Any] = {
-        "question": query,
+        "question": query[:1200],
         "operation": understanding.get("operation"),
-        "requested_fields": understanding.get("requested_fields"),
+        "requested_fields": _requested_fields(understanding)[:20],
+        "requirements": compact_requirements,
+        "references": compact_references,
         "documents": documents_payload,
     }
 
@@ -373,31 +658,30 @@ def select_tables_detailed(
     candidates: list[dict[str, Any]],
     forced_table_names: set[str] | None = None,
 ) -> TableSelection | None:
-    """
-    Return the tables to read with their roles and computed values.
+    """Return a narrow, authorized table scope or an explicit no-match.
 
-    ``None`` means no narrowing result is available (for example, there is
-    only one candidate table, or the selector response could not be used). An
-    empty ``TableSelection`` is different: the selector ran but found no
-    usable table, or returned a selection that violated the computed-input
-    contract. Callers must not interpret that as permission to query every
-    candidate table.
-
-    candidates are schema-registry items of the resolved documents.
-    forced_table_names (e.g. tables proven to contain a resolved entity)
-    are always kept.
+    An empty candidate set returns ``status="no_match"``. Selector failures
+    use a deterministic metadata ranker; they never mean "read every candidate".
     """
     forced = set(forced_table_names or set())
-    names = [str(c.get("table_name")) for c in candidates if c.get("table_name")]
-    if len(names) <= 1:
-        return None
+    candidates = [
+        item for item in candidates
+        if isinstance(item, dict) and item.get("table_name")
+    ]
+    names = [str(item["table_name"]) for item in candidates]
+    if not names:
+        return TableSelection(tables=set(), status="no_match", strategy="none")
 
-    by_document: dict[int | None, list[dict[str, Any]]] = {}
-    for item in candidates:
-        by_document.setdefault(_as_int(item.get("document_id")), []).append(item)
-
-    if all(len(tables) <= 1 for tables in by_document.values()):
-        return None
+    allowed_names = set(names)
+    forced &= allowed_names
+    if len(names) == 1:
+        return _fallback_table_selection(
+            query=query,
+            understanding=understanding,
+            candidates=candidates,
+            forced=forced,
+            reason="single candidate table",
+        )
 
     payload = build_selection_payload(
         query=query,
@@ -405,7 +689,6 @@ def select_tables_detailed(
         candidates=candidates,
     )
     deterministic_computed = payload.get("computed_fields") or []
-    allowed_names = set(names)
 
     try:
         response = router.generate(
@@ -429,99 +712,76 @@ def select_tables_detailed(
         data = json.loads(response.choices[0].message.content)
         roles, computed, unmet = _parse_selection(data, allowed_names)
     except InvalidResponseError as exc:
-        logger.error(
-            "table selection NOT narrowed: provider rejected the response "
-            "against the selection schema (%s)",
-            str(exc)[:200],
+        logger.warning("table selection schema rejected; using metadata fallback: %s", str(exc)[:200])
+        return _fallback_table_selection(
+            query=query, understanding=understanding, candidates=candidates,
+            forced=forced, computed=deterministic_computed, reason="provider schema rejection",
         )
-        return None
     except (KeyError, ValueError, TypeError, AttributeError, IndexError) as exc:
-        logger.error(
-            "table selection NOT narrowed: malformed selector output (%s: %s)",
-            type(exc).__name__,
-            str(exc)[:200],
+        logger.warning(
+            "table selection malformed (%s: %s); using metadata fallback",
+            type(exc).__name__, str(exc)[:160],
         )
-        return None
-    except Exception:
-        logger.exception("table selection NOT narrowed: selector call failed")
-        return None
+        return _fallback_table_selection(
+            query=query, understanding=understanding, candidates=candidates,
+            forced=forced, computed=deterministic_computed, reason="malformed selector response",
+        )
+    except Exception as exc:
+        logger.warning(
+            "table selector unavailable (%s); using metadata fallback",
+            type(exc).__name__,
+        )
+        return _fallback_table_selection(
+            query=query, understanding=understanding, candidates=candidates,
+            forced=forced, computed=deterministic_computed, reason="provider/transport failure",
+        )
 
     chosen = set(roles)
-
-    # The selector may report a needed concept as unmet because its sample
-    # rows did not expose the matching source. Check all candidate column
-    # names before accepting that conclusion. This must also run when the
-    # selector initially chose zero tables; otherwise the rescue path is
-    # unreachable for precisely that case.
     rescued = _rescue_unmet(unmet, candidates, chosen) if unmet else set()
     chosen |= rescued
+    chosen |= forced
 
-    # Entity-resolved tables remain authoritative even when the selector
-    # omitted them. They are already proven to contain the requested entity.
-    chosen |= forced & allowed_names
-
-    if not chosen:
-        logger.error(
-            "table selection found no relevant table: candidates=%d unmet=%s reason=%s",
-            len(candidates),
-            unmet,
-            str(data.get("reason", ""))[:200],
-        )
-        return TableSelection(
-            tables=set(),
-            roles=dict(roles),
-            computed=list(dict.fromkeys(list(deterministic_computed) + list(computed))),
-            unmet=list(unmet),
-            status="no_match",
+    all_computed = list(dict.fromkeys(deterministic_computed + computed))
+    must_compute = bool(all_computed)
+    if not chosen or (must_compute and not (set(roles.values()) & _CALCULATION_ROLES)):
+        reason = "empty model selection" if not chosen else "computed outputs lack input/rule table"
+        logger.warning("table selector result needs metadata fallback: %s", reason)
+        return _fallback_table_selection(
+            query=query, understanding=understanding, candidates=candidates,
+            forced=forced, computed=all_computed, unmet=unmet, reason=reason,
         )
 
-    # Something must be derived, but nothing selected supplies inputs or
-    # rules: the selection cannot produce the answer, so do not trust it.
-    must_compute = bool(deterministic_computed or computed)
-    if must_compute and not (set(roles.values()) & _CALCULATION_ROLES):
-        logger.error(
-            "table selection invalid: computed values %s but no input/rule "
-            "table selected",
-            deterministic_computed or computed,
-        )
-        return TableSelection(
-            tables=set(),
-            roles=dict(roles),
-            computed=list(dict.fromkeys(list(deterministic_computed) + list(computed))),
-            unmet=list(unmet),
-            status="invalid",
-        )
-
-    if unmet:
-        logger.warning(
-            "table selection: unmet=%s rescued=%s",
-            unmet,
-            sorted(rescued),
-        )
-
-    # Do not auto-add a "best matching" table merely to give each document
-    # structured coverage. Document relevance does not imply table relevance;
-    # the selector's explicit choices, conservative unmet rescue, and proven
-    # entity tables are the only routes into the table read scope.
-    chosen |= forced & allowed_names
+    # Rescue and forced tables also need explicit roles. The join stage uses
+    # these roles to distinguish a rule source from a data source; leaving a
+    # selected table unclassified can cause unnecessary sibling-table scans.
+    for name in chosen:
+        if name in roles:
+            continue
+        item = next((candidate for candidate in candidates if str(candidate.get("table_name")) == name), {})
+        feature_tokens = set(_tokens(name)) | set(_tokens(item.get("document_title") or ""))
+        for column in item.get("columns") or []:
+            feature_tokens.update(_tokens(column))
+        if name in forced:
+            roles[name] = "filter"
+        elif feature_tokens & _RULE_SCHEMA_TOKENS:
+            roles[name] = "rule"
+        elif all_computed or str(understanding.get("operation") or "").lower() in _CALCULATION_OPERATIONS:
+            roles[name] = "input"
+        else:
+            roles[name] = "output"
 
     logger.info(
         "table selection: selected=%d/%d names=%s roles=%s rescued=%s forced=%s computed=%s reason=%s",
-        len(chosen),
-        len(names),
-        sorted(chosen),
-        roles,
-        sorted(rescued),
-        sorted(forced & allowed_names),
-        deterministic_computed or computed,
-        str(data.get("reason", ""))[:300],
+        len(chosen), len(names), sorted(chosen), roles, sorted(rescued),
+        sorted(forced), all_computed, str(data.get("reason", ""))[:300],
     )
     return TableSelection(
         tables=chosen,
         roles=dict(roles),
-        computed=list(dict.fromkeys(list(deterministic_computed) + list(computed))),
+        computed=all_computed,
         unmet=list(unmet),
         status="selected",
+        strategy="llm",
     )
 
 

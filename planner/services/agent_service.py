@@ -1161,27 +1161,41 @@ def _with_table_scope(
             query=effective_planning_query(state),
             understanding=state.get("query_understanding", {}) or {},
             candidates=candidates,
-            forced_table_names=(
-                entity_tables | _resolved_table_names(state)
-                if rule_dependent_mixed
-                else entity_tables
-            ),
+            # A table explicitly named by the user or located by entity
+            # resolution is authoritative in every route, not only mixed
+            # requests. These names are still intersected with candidates by
+            # the selector, so they cannot widen authorization.
+            forced_table_names=entity_tables | _resolved_table_names(state),
         )
     except Exception:
-        logger.exception("table scope selection failed; not narrowing")
-        return state
+        logger.exception(
+            "table scope selection failed; falling back to document evidence"
+        )
+        scoped = dict(state)
+        # None means unrestricted schema. On failure, an explicit empty scope
+        # prevents the table executor from interpreting the failure as a full
+        # scan. Exact table/entity references remain in the state for text
+        # fallback and diagnostics.
+        scoped["table_scope"] = []
+        scoped["table_roles"] = {}
+        scoped["table_computed"] = []
+        scoped["table_selection_status"] = "unavailable"
+        return scoped
 
     if selection is None:
-        return state
+        scoped = dict(state)
+        scoped["table_scope"] = []
+        scoped["table_roles"] = {}
+        scoped["table_computed"] = []
+        scoped["table_selection_status"] = "no_match"
+        return scoped
 
     selected = selection.tables
     if not selected:
-        # A valid no-match is not the same as "no narrowing". Unless the user
-        # named a physical table or an entity was deterministically located in
-        # one, keep the empty result explicit. Dispatch will switch to
-        # document evidence instead of generating SQL against every candidate.
-        if _resolved_table_names(state) or _resolved_entity_values(state):
-            return state
+        # A valid no-match is not the same as "no narrowing". Exact table and
+        # entity references were passed as forced candidates above. If none
+        # survived candidate validation, fail closed rather than treating an
+        # absent scope as permission to query every table.
         scoped = dict(state)
         scoped["table_scope"] = []
         scoped["table_roles"] = {}
@@ -1205,51 +1219,20 @@ def _table_scope(state: AgentState) -> set[str] | None:
     return {str(name) for name in state.get("table_scope", [])}
 
 
-def _join_table_scope(state: AgentState) -> set[str] | None:  # QP-FIX-3
-    """Tables the key join may look up.
+def _join_table_scope(state: AgentState) -> set[str] | None:
+    """Return the exact selected table scope for key-based companion lookups.
 
-    Table selection runs BEFORE any row is read, so it can skip a sibling
-    table that only becomes needed once a row shows a foreign key. The join
-    already searches tables by those key values, but it only searched the
-    selected ones. Here the scope is widened to every table of a document that
-    contributes at least one non-rule selected table. Rule-only documents stay
-    out. The join itself still limits tables to the request's documents and
-    returns only rows that match the keys.
+    A key join is a row filter over tables already selected for this request;
+    it is not permission to broaden the physical table set. Widening to every
+    sibling table after selection can reintroduce the same all-table scan that
+    the selector is designed to prevent. Relevant companion tables must be
+    selected by the normal query-specific selector before any table is read.
     """
     scope = _table_scope(state)
-    if not scope:
-        return scope
-    roles = {
-        str(name): str(role or "").strip().lower()
-        for name, role in (state.get("table_roles") or {}).items()
-    }
-    try:
-        index = _resources(state).table_index()
-    except Exception:
-        logger.exception("join scope widening failed; using selected tables only")
-        return scope
-    document_of = {
-        str(item.get("table_name")): _coerce_int(item.get("document_id"))
-        for item in index
-    }
-    data_documents = {
-        document_of[name]
-        for name in scope
-        if document_of.get(name) is not None and roles.get(name) != "rule"
-    }
-    if not data_documents:
-        return scope
-    widened = set(scope) | {
-        name for name, doc_id in document_of.items() if doc_id in data_documents
-    }
-    added = sorted(widened - scope)
-    if added:
-        logger.info(
-            "cross-document join scope widened by %d sibling table(s): %s",
-            len(added),
-            added,
-        )
-    return widened
+    # The key join is not an independent discovery route. If no table scope
+    # was selected, it may still join text evidence but must not query the
+    # entire structured corpus by default.
+    return scope if scope is not None else set()
 
 
 def _in_table_scope(
@@ -2092,7 +2075,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
     # instead; _document_ids_for_search still includes Scope Guard candidates.
     selection_status = state.get("table_selection_status")
     if (
-        selection_status in {"no_match", "invalid"}
+        selection_status in {"no_match", "invalid", "unavailable"}
         and "TABLE_QUERY" in capabilities
     ):
         capabilities = [item for item in capabilities if item != "TABLE_QUERY"]

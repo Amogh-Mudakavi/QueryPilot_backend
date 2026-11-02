@@ -47,7 +47,7 @@ MODEL_QWEN_27B = "qwen/qwen3.8-27b"
 # One source of truth for task completion ceilings. Reasoning tokens are
 # included in max_tokens, so these caps leave room for reasoning and output.
 PLANNER_MAX_COMPLETION_TOKENS = 3400
-TABLE_SELECTION_MAX_COMPLETION_TOKENS = 1500
+TABLE_SELECTION_MAX_COMPLETION_TOKENS = 900
 SQL_GENERATION_MAX_COMPLETION_TOKENS = 1800
 ANSWER_OUTPUT_TOKEN_CAPS = {
     "normal": 2000,

@@ -188,6 +188,19 @@ def _requests_table_content(understanding: dict[str, Any]) -> bool:
     return False
 
 
+def _structured_requirement_kinds(understanding: dict[str, Any]) -> set[str]:
+    """Structured representations explicitly allowed by the planner."""
+    requirements = understanding.get("requirements") or []
+    if not isinstance(requirements, list):
+        return set()
+    return {
+        str(item.get("kind") or "").strip().lower()
+        for item in requirements
+        if isinstance(item, dict)
+        and str(item.get("kind") or "").strip().lower() in {"table", "either"}
+    }
+
+
 def _decide_cross_document(
     *,
     source_ids: set[int],
@@ -396,14 +409,37 @@ def build_execution_plan(
             and operation in TABLE_ROW_OPERATIONS
             and has_structured_sources
         )
-        if operation not in OVERVIEW_OPERATIONS and (
-            table_content_requested or row_operation
-        ):
+        structured_requirement_kinds = _structured_requirement_kinds(understanding)
+        if table_content_requested or row_operation or structured_requirement_kinds:
+            # "either" means either representation may establish the fact.
+            # Query both instead of assuming DOCUMENT_SEARCH reads extracted
+            # table rows (it intentionally searches text chunks only).
+            if (
+                "either" in structured_requirement_kinds
+                and not table_content_requested
+                and not row_operation
+            ):
+                return plan(
+                    ["TABLE_QUERY", "DOCUMENT_SEARCH"],
+                    ["table_query", "document_search"],
+                    "planner evidence requirements allow structured or text evidence",
+                )
             return plan(
                 ["TABLE_QUERY"],
                 ["table_query"],
-                "request targets the table/row content of the named document",
+                "request targets structured evidence in the named document",
                 fallback=["DOCUMENT_SEARCH"],
+            )
+        if operation not in OVERVIEW_OPERATIONS and has_structured_sources:
+            # DOCUMENT_SEARCH is intentionally text-only. For substantive
+            # questions against a PDF that also has extracted tables, perform
+            # a query-specific table selection in parallel with text search.
+            # This does NOT read every table: TABLE_QUERY receives the selector's
+            # bounded table_scope, and an explicit no-match falls back to text.
+            return plan(
+                ["TABLE_QUERY", "DOCUMENT_SEARCH"],
+                ["table_query", "document_search"],
+                "fact question over a document with both text and structured evidence",
             )
         return plan(
             ["DOCUMENT_SEARCH"],

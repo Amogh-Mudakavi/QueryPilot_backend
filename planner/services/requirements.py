@@ -95,14 +95,17 @@ def normalize_requirements(raw: Any) -> list[dict[str, Any]]:
     by_id = {item["id"]: item for item in normalized}
     indegree = {key: 0 for key in by_id}
     dependents: dict[str, list[str]] = defaultdict(list)
+    # Unknown dependency IDs are planner noise, not a reason to discard every
+    # otherwise valid evidence requirement. Drop only the invalid edge.
     for item in normalized:
+        valid_dependencies = []
         for dependency in item["depends_on"]:
             if dependency not in by_id:
-                raise ValueError(
-                    f"requirement {item['id']} depends on unknown requirement {dependency}"
-                )
+                continue
+            valid_dependencies.append(dependency)
             indegree[item["id"]] += 1
             dependents[dependency].append(item["id"])
+        item["depends_on"] = valid_dependencies
 
     queue = deque(key for key, degree in indegree.items() if degree == 0)
     depth = {key: 1 for key in queue}
@@ -111,11 +114,20 @@ def normalize_requirements(raw: Any) -> list[dict[str, Any]]:
         current = queue.popleft()
         visited += 1
         for child in dependents[current]:
-            depth[child] = max(depth.get(child, 1), depth[current] + 1)
-            if depth[child] > MAX_DEPENDENCY_DEPTH:
-                raise ValueError("requirement dependency depth exceeds configured limit")
+            proposed_depth = depth[current] + 1
+            if proposed_depth > MAX_DEPENDENCY_DEPTH:
+                # Preserve the evidence requirement, but drop this over-deep
+                # edge. It can still be retrieved independently.
+                by_id[child]["depends_on"] = [
+                    dependency
+                    for dependency in by_id[child]["depends_on"]
+                    if dependency != current
+                ]
+            else:
+                depth[child] = max(depth.get(child, 1), proposed_depth)
             indegree[child] -= 1
             if indegree[child] == 0:
+                depth.setdefault(child, 1)
                 queue.append(child)
     if visited != len(by_id):
         raise ValueError("requirement dependencies contain a cycle")
