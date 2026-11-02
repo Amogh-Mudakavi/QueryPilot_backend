@@ -57,5 +57,11 @@ class AgentState(TypedDict, total=False):
 
     # Request-scoped structured-resource metadata shared by agent/dispatch.
     resource_context: Any
+    # An explicit empty table_scope means the selector found no safe table;
+    # None/absence means table selection was not applied.
+    table_scope: list[str] | None
+    table_roles: dict[str, str]
+    table_computed: list[str]
+    table_selection_status: str
 
     _pending_action: dict[str, Any]

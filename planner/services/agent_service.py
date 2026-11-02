@@ -83,7 +83,10 @@ from planner.services.schema_registry import (
 )
 from planner.services.sql_generation import generate_sql
 from planner.services.state import AgentState
-from planner.services.requirements import normalize_requirements
+from planner.services.requirements import (
+    ensure_query_fallback_requirement,
+    normalize_requirements,
+)
 from planner.services.query_trace import QueryTrace, current_trace
 from planner.services.sufficiency import documents_insufficient
 from planner.services.table_selection import (
@@ -871,6 +874,20 @@ def agent_node(state: AgentState) -> dict[str, Any]:
         except ValueError as exc:
             logger.warning("Planner requirements rejected; retaining raw-query retrieval: %s", exc)
             evidence_requirements = []
+        before_fallback = len(evidence_requirements)
+        evidence_requirements = ensure_query_fallback_requirement(
+            evidence_requirements,
+            query=planning_query or original_query,
+            category=str(understanding.get("category_hint") or ""),
+            operation=str(understanding.get("operation") or ""),
+        )
+        if not before_fallback and evidence_requirements:
+            logger.warning(
+                "Planner supplied no valid evidence requirements; using one "
+                "raw-query requirement (category=%s operation=%s)",
+                understanding.get("category_hint"),
+                understanding.get("operation"),
+            )
         understanding["requirements"] = evidence_requirements
         understanding["needs_instance_data"] = bool(understanding.get("needs_instance_data"))
         trace = current_trace()
@@ -1061,7 +1078,9 @@ def _with_table_scope(
     Evidence selection for structured sources: a resolved document does not
     make every one of its tables relevant. Decide, from profiles and schema
     metadata, which tables this question needs BEFORE anything is read.
-    The result travels in state["table_scope"]; absent means "no narrowing".
+    The result travels in state["table_scope"]. An absent scope means no
+    narrowing applies; an explicit empty scope means the selector ran and
+    found no safe structured table for this request.
     """
     # Scope Guard's relevant IDs are candidates, not the final plan.  Keep
     # them available while the selector evaluates schemas, together with any
@@ -1151,20 +1170,38 @@ def _with_table_scope(
         logger.exception("table scope selection failed; not narrowing")
         return state
 
-    selected = selection.tables if selection is not None else None
-    if not selected:
+    if selection is None:
         return state
+
+    selected = selection.tables
+    if not selected:
+        # A valid no-match is not the same as "no narrowing". Unless the user
+        # named a physical table or an entity was deterministically located in
+        # one, keep the empty result explicit. Dispatch will switch to
+        # document evidence instead of generating SQL against every candidate.
+        if _resolved_table_names(state) or _resolved_entity_values(state):
+            return state
+        scoped = dict(state)
+        scoped["table_scope"] = []
+        scoped["table_roles"] = {}
+        scoped["table_computed"] = list(selection.computed)
+        scoped["table_selection_status"] = selection.status
+        return scoped
 
     scoped = dict(state)
     scoped["table_scope"] = sorted(selected)
     scoped["table_roles"] = dict(selection.roles)
     scoped["table_computed"] = list(selection.computed)
+    scoped["table_selection_status"] = selection.status
     return scoped
 
 
 def _table_scope(state: AgentState) -> set[str] | None:
-    scope = state.get("table_scope")
-    return {str(name) for name in scope} if scope else None
+    # Missing/None means selection was not applied. An explicit [] is a
+    # meaningful deny-all result and must never widen back to the full schema.
+    if "table_scope" not in state or state.get("table_scope") is None:
+        return None
+    return {str(name) for name in state.get("table_scope", [])}
 
 
 def _join_table_scope(state: AgentState) -> set[str] | None:  # QP-FIX-3
@@ -1219,7 +1256,7 @@ def _in_table_scope(
     items: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     scope = _table_scope(state)
-    if not scope:
+    if scope is None:
         return items
     return [item for item in items if str(item.get("table_name")) in scope]
 
@@ -2036,6 +2073,36 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
     resources = _resources(state)
     state = {**state, "resource_context": resources}
     state = _with_table_scope(state, capabilities)
+
+    # An explicit empty selection means the candidate tables were examined
+    # and none could support this question. Do not let _run_table interpret an
+    # absent table restriction as "all tables" and manufacture an aggregate
+    # over a neighbouring layout table. Use the authorized document corpus
+    # instead; _document_ids_for_search still includes Scope Guard candidates.
+    selection_status = state.get("table_selection_status")
+    if (
+        selection_status in {"no_match", "invalid"}
+        and "TABLE_QUERY" in capabilities
+    ):
+        capabilities = [item for item in capabilities if item != "TABLE_QUERY"]
+        if "DOCUMENT_SEARCH" not in capabilities:
+            capabilities.append("DOCUMENT_SEARCH")
+        plan = dict(state.get("execution_plan") or {})
+        plan["capabilities"] = list(capabilities)
+        plan["actions"] = [
+            action
+            for action in plan.get("actions", [])
+            if action != "table_query"
+        ]
+        if "document_search" not in plan["actions"]:
+            plan["actions"].append("document_search")
+        plan["fallback_capabilities"] = []
+        state = {**state, "execution_plan": plan}
+        logger.info(
+            "table selection status=%s; skipping SQL and falling back to "
+            "document search within authorized candidate documents",
+            selection_status,
+        )
 
     structured: list[Any] = []
     documents: list[Any] = []
@@ -4630,7 +4697,7 @@ def _apply_table_scope(
     schema: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     scope = _table_scope(state)
-    if not scope:
+    if scope is None:
         return schema
     # An explicit table scope is authoritative. If none of the supplied
     # schema entries match it, return no tables rather than silently widening

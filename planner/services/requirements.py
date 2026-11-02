@@ -137,3 +137,44 @@ def retrieval_queries(requirements: list[dict[str, Any]], raw_query: str, limit:
         if len(result) >= max(1, int(limit)):
             break
     return result
+
+
+def ensure_query_fallback_requirement(
+    requirements: list[dict[str, Any]],
+    *,
+    query: str,
+    category: str,
+    operation: str,
+) -> list[dict[str, Any]]:
+    """Keep a minimal evidence checklist when the planner omits one.
+
+    This does not invent a sub-question, source, entity, or fact: it preserves
+    the user's query as one retrieval requirement. Product, conversation, and
+    catalog-metadata requests intentionally remain requirement-free.
+    """
+    if requirements:
+        return requirements
+
+    category = str(category or "").strip().lower()
+    if category not in {"document", "structured", "mixed"}:
+        return []
+
+    query = str(query or "").strip()[:MAX_QUERY_CHARS]
+    if not query:
+        return []
+
+    operation = str(operation or "").strip().lower()
+    requirement_type = (
+        "numeric" if operation in {"aggregate", "calculate"} else "other"
+    )
+    return [
+        {
+            "id": "R1",
+            "kind": "text" if category == "document" else "either",
+            "type": requirement_type,
+            "description": query[:1000],
+            "queries": [query],
+            "entities": [],
+            "depends_on": [],
+        }
+    ]

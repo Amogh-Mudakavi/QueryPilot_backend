@@ -32,8 +32,8 @@ differently cannot make the provider reject the whole response.
 Deterministic checks around the model (none depend on it being right):
   * requested fields that no candidate column provides are computed by
     definition; if something must be computed, the selection must contain at
-    least one input or rule table, otherwise the answer is a contract
-    violation and nothing is narrowed;
+    least one input or rule table, otherwise the result is explicitly marked
+    invalid and callers must not widen to every candidate table;
   * names outside the candidate set are discarded;
   * data reported as unmet is looked for, by token overlap, in unselected
     candidates before being accepted as absent;
@@ -45,8 +45,10 @@ Deterministic checks around the model (none depend on it being right):
     so the executor can aggregate large input tables instead of dumping rows.
 
 Nothing here knows about any domain, column name, or file format. It never
-executes SQL. Failures return None ("do not narrow") and are logged with an
-explicit reason; they are a safe failure mode, not the normal path.
+executes SQL. A valid empty selection is returned as ``status="no_match"``;
+a selection that violates the computed-input contract is ``status="invalid"``.
+Provider, parsing, or transport failures return None and are logged. Callers
+must distinguish these outcomes from a non-applicable selection.
 
 Document profiles are intentionally not used: they are per-document, so they
 cannot tell sibling tables of one document apart.
@@ -116,12 +118,14 @@ class TableSelection:
     roles     table_name -> output | filter | input | rule | key | other
     computed  values the answer must derive (not stored as columns)
     unmet     needed data the selector could not find in any candidate
+    status    selected | no_match | invalid
     """
 
     tables: set[str]
     roles: dict[str, str] = field(default_factory=dict)
     computed: list[str] = field(default_factory=list)
     unmet: list[str] = field(default_factory=list)
+    status: str = "selected"
 
 
 def _shorten(value: Any) -> Any:
@@ -370,8 +374,14 @@ def select_tables_detailed(
     forced_table_names: set[str] | None = None,
 ) -> TableSelection | None:
     """
-    Return the tables to read with their roles and computed values, or None
-    when no narrowing applies.
+    Return the tables to read with their roles and computed values.
+
+    ``None`` means no narrowing result is available (for example, there is
+    only one candidate table, or the selector response could not be used). An
+    empty ``TableSelection`` is different: the selector ran but found no
+    usable table, or returned a selection that violated the computed-input
+    contract. Callers must not interpret that as permission to query every
+    candidate table.
 
     candidates are schema-registry items of the resolved documents.
     forced_table_names (e.g. tables proven to contain a resolved entity)
@@ -437,23 +447,51 @@ def select_tables_detailed(
         return None
 
     chosen = set(roles)
+
+    # The selector may report a needed concept as unmet because its sample
+    # rows did not expose the matching source. Check all candidate column
+    # names before accepting that conclusion. This must also run when the
+    # selector initially chose zero tables; otherwise the rescue path is
+    # unreachable for precisely that case.
+    rescued = _rescue_unmet(unmet, candidates, chosen) if unmet else set()
+    chosen |= rescued
+
+    # Entity-resolved tables remain authoritative even when the selector
+    # omitted them. They are already proven to contain the requested entity.
+    chosen |= forced & allowed_names
+
     if not chosen:
-        logger.error("table selection NOT narrowed: selector chose no tables")
-        return None
+        logger.error(
+            "table selection found no relevant table: candidates=%d unmet=%s reason=%s",
+            len(candidates),
+            unmet,
+            str(data.get("reason", ""))[:200],
+        )
+        return TableSelection(
+            tables=set(),
+            roles=dict(roles),
+            computed=list(dict.fromkeys(list(deterministic_computed) + list(computed))),
+            unmet=list(unmet),
+            status="no_match",
+        )
 
     # Something must be derived, but nothing selected supplies inputs or
     # rules: the selection cannot produce the answer, so do not trust it.
     must_compute = bool(deterministic_computed or computed)
     if must_compute and not (set(roles.values()) & _CALCULATION_ROLES):
         logger.error(
-            "table selection NOT narrowed: computed values %s but no input/rule "
+            "table selection invalid: computed values %s but no input/rule "
             "table selected",
             deterministic_computed or computed,
         )
-        return None
+        return TableSelection(
+            tables=set(),
+            roles=dict(roles),
+            computed=list(dict.fromkeys(list(deterministic_computed) + list(computed))),
+            unmet=list(unmet),
+            status="invalid",
+        )
 
-    rescued = _rescue_unmet(unmet, candidates, chosen) if unmet else set()
-    chosen |= rescued
     if unmet:
         logger.warning(
             "table selection: unmet=%s rescued=%s",
@@ -483,6 +521,7 @@ def select_tables_detailed(
         roles=dict(roles),
         computed=list(dict.fromkeys(list(deterministic_computed) + list(computed))),
         unmet=list(unmet),
+        status="selected",
     )
 
 
@@ -502,4 +541,8 @@ def select_tables(
         candidates=candidates,
         forced_table_names=forced_table_names,
     )
-    return set(selection.tables) if selection is not None else None
+    return (
+        set(selection.tables)
+        if selection is not None and selection.status == "selected"
+        else None
+    )
