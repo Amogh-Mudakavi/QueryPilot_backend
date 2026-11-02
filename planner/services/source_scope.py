@@ -141,6 +141,22 @@ _CORRECTION = re.compile(
 _GREETINGS = {"hi", "hello", "hey", "thanks", "thank you", "thx"}
 
 
+def requests_workspace_wide_cross_document_search(query: str) -> bool:
+    """Detect explicit user intent to search across the uploaded corpus.
+
+    This recognizes scope language only; it does not infer topics, entities,
+    answers, or which documents are relevant. Callers must still enforce the
+    conversation's document allow-list when expanding the search scope.
+    """
+    value = str(query or "").casefold()
+    patterns = (
+        r"\b(?:across|among|between)\b.{0,80}\b(?:all\s+)?(?:uploaded\s+)?(?:documents?|docs?|pdfs?|files?|sources?)\b",
+        r"\b(?:all|every)\s+(?:uploaded\s+)?(?:documents?|docs?|pdfs?|files?|sources?)\b",
+        r"\b(?:across|throughout)\s+(?:the\s+)?(?:knowledge\s+base|workspace)\b",
+    )
+    return any(re.search(pattern, value) for pattern in patterns)
+
+
 def effective_planning_query(state: Mapping[str, Any]) -> str:
     """Return the enriched task query for planning, retrieval and answering.
 

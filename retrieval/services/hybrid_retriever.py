@@ -247,6 +247,16 @@ class HybridRetriever:
             )
             final_candidates = ranked_candidates[: self.top_k]
 
+            logger.info(
+                "[RETRIEVAL_RANKING] workspace_id=%s document_ids=%s "
+                "reranker_enabled=%s fused_top=%s reranked_top=%s",
+                workspace_id,
+                normalized_document_ids,
+                reranker.enabled,
+                self._ranking_diagnostics(fused_candidates[:10]),
+                self._ranking_diagnostics(ranked_candidates[:10]),
+            )
+
             evidence = [candidate["evidence"] for candidate in final_candidates]
 
             confidence = self._calculate_confidence(
@@ -880,6 +890,30 @@ class HybridRetriever:
             validated.append(candidate)
 
         return validated
+
+    @staticmethod
+    def _ranking_diagnostics(
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return provenance/ranking signals without logging document text."""
+        diagnostics: list[dict[str, Any]] = []
+        for candidate in candidates:
+            metadata = candidate.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            diagnostics.append(
+                {
+                    "document_id": metadata.get("document_id"),
+                    "page_start": metadata.get("page_start"),
+                    "page_end": metadata.get("page_end"),
+                    "chunk_index": metadata.get("chunk_index"),
+                    "dense_rank": candidate.get("dense_rank"),
+                    "bm25_rank": candidate.get("bm25_rank"),
+                    "rrf_score": candidate.get("rrf_score"),
+                    "reranker_score": candidate.get("reranker_score"),
+                }
+            )
+        return diagnostics
 
     @staticmethod
     def _candidate_key(

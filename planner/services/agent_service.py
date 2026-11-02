@@ -74,6 +74,7 @@ from planner.services.source_scope import (
     effective_planning_query,
     requires_dependency_discovery,
     requires_document_evidence,
+    requests_workspace_wide_cross_document_search,
 )
 from planner.services.product_knowledge import get_product_knowledge
 from planner.services.schema_registry import (
@@ -2056,6 +2057,16 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
 
     capabilities = list(plan.get("capabilities", []))
 
+    # A user can explicitly ask for corpus-wide evidence even when the LLM
+    # planner resolved only one named/relevant source. Preserve that intent;
+    # the actual expansion below remains bounded by allowed_document_ids.
+    if (
+        requests_workspace_wide_cross_document_search(effective_planning_query(state))
+        and not plan.get("cross_document")
+    ):
+        plan = {**plan, "cross_document": True}
+        state = {**state, "execution_plan": plan}
+
     if (
         "SOURCE_METADATA" in capabilities
         and not _resolved_entity_values(state)
@@ -2106,7 +2117,6 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
 
     structured: list[Any] = []
     documents: list[Any] = []
-    document_tables: list[Any] = []
     total_tool_calls = 0
     table_status: str | None = None
     table_result: dict[str, Any] | None = None
@@ -2176,6 +2186,8 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
 
         resolved_doc_ids = _resolved_document_ids(state)
         source_document_ids = _document_ids_for_search(state)
+        if cross_document_plan:
+            source_document_ids = _cross_document_search_ids(state, source_document_ids)
         missing_named_sources = _named_missing_source_references(state)
         named_source_missing = bool(missing_named_sources) and not resolved_doc_ids
 
@@ -2210,26 +2222,13 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
                 "(independent capability)"
             )
 
-        # IMPORTANT:
-        # A resolved document is evidence through every channel it has.
-        # Text documents are handled by DOCUMENT_SEARCH.
-        # Structured documents such as XLSX may have no text chunks, so their
-        # extracted SQLite tables must also be added as document evidence.
-        #
-        # Do this for every resolved document regardless of operation type.
-        # For PDFs/documents without extracted tables, this simply returns [].
-        if (
-            "DOCUMENT_SEARCH" in capabilities
-            and not skip_document_search
-            and source_document_ids
-        ):
-            document_tables = _run_resolved_document_tables(
-                state,
-                _tables_used_by_table_query(table_result),
-            )
-            if document_tables:
-                structured.extend(document_tables)
-                total_tool_calls = _count_tool_call(total_tool_calls)
+        # Document text retrieval must not implicitly read every extracted
+        # SQLite table belonging to a candidate document. Structured evidence
+        # is fetched only through TABLE_QUERY, where table selection, scope
+        # validation and the SQL allow-list are applied. This prevents
+        # unrelated PDF-layout tables from entering the answer context or
+        # generating row-fact searches. Spreadsheet/table-only requests are
+        # routed through TABLE_QUERY by the planner.
 
         if "DOCUMENT_SEARCH" in capabilities and not skip_document_search:
             structured = _narrow_structured_to_request(state, structured)  # QP-PATCH-V4
@@ -2427,7 +2426,6 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             and not skip_document_search
             and not document_search_error
             and not documents
-            and not document_tables
             and requires_document_evidence(
                 state,
                 skip_document_search=skip_document_search,
@@ -3669,6 +3667,54 @@ def _document_ids_for_search(state: AgentState) -> list[int]:
     return _candidate_document_ids(state)
 
 
+def _workspace_document_ids_for_search(state: AgentState) -> list[int]:
+    """List searchable documents inside the caller's authorization boundary."""
+    allowed = _allowed_document_ids(state)
+    if allowed is not None:
+        allowed_set = set(allowed)
+        if not allowed_set:
+            return []
+    else:
+        allowed_set = None
+
+    try:
+        catalog = _resources(state).catalog()
+    except Exception:
+        logger.exception("Could not load authorized workspace document catalog")
+        return []
+
+    document_ids = {
+        document_id
+        for document_id in (
+            _coerce_int(item.get("document_id"))
+            for item in catalog
+            if isinstance(item, dict)
+        )
+        if document_id is not None
+        and (allowed_set is None or document_id in allowed_set)
+    }
+    return sorted(document_ids)
+
+
+def _cross_document_search_ids(
+    state: AgentState,
+    candidate_ids: list[int],
+) -> list[int]:
+    """Expand an explicitly cross-document request only within authorization.
+
+    If at least two source documents were resolved/relevant, preserve that
+    narrower set. If the planner marked a cross-document task but only one
+    candidate was found, search the authorized workspace corpus so an
+    unresolved companion document is not silently omitted.
+    """
+    unique = sorted(
+        {int(value) for value in candidate_ids if _coerce_int(value) is not None}
+    )
+    if len(unique) >= 2:
+        return unique
+    return _workspace_document_ids_for_search(state)
+
+
 def _mark_success(chunks: list[Any]) -> list[Any]:
     for item in chunks:
         if isinstance(item, dict):
@@ -3927,9 +3973,12 @@ def _run_documents(
 ) -> dict[str, Any]:
     primary_query = _document_query(state)
     primary_ids = _document_ids_for_search(state)
-    # Several explicitly named sources: retrieve from each one. This is
-    # RETRIEVAL scope only; whether the sources are also joined/compared is
-    # decided by the plan (plan["cross_document"]), not here.
+    if state.get("execution_plan", {}).get("cross_document"):
+        primary_ids = _cross_document_search_ids(state, primary_ids)
+    # Retrieve every source selected by the plan. For cross-document work,
+    # _cross_document_search_ids has already expanded an incomplete candidate
+    # set to the authorized workspace corpus. Retrieval scope and cross-source
+    # reasoning remain separate decisions.
     multi_source = len(primary_ids) >= 2
 
     # A summary/overview must see the whole document, not only the top-k
@@ -4594,102 +4643,6 @@ def _supplement_row_fact_evidence(
     except Exception:
         logger.exception("row-fact supplement failed; keeping existing evidence")
         return document_result
-
-
-def _tables_used_by_table_query(table: dict[str, Any] | None) -> set[str]:
-    """Table names the executed business SQL actually read rows from.
-
-    A query that ran but returned nothing did not read the table's content,
-    so that table must stay available to the document-evidence fallback.
-    """
-    if not table:
-        return set()
-    names: set[str] = set()
-    for item in table.get("evidence", []):
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("result_status", "")).upper() != "SUCCESS":
-            continue
-        for name in item.get("content", {}).get("tables_used", []) or []:
-            names.add(str(name))
-    return names
-
-
-def _run_resolved_document_tables(
-    state: AgentState,
-    tables_used: set[str],
-) -> list[dict[str, Any]]:
-    """
-    Cross-document evidence: tables extracted from documents the user
-    deterministically resolved, that the business SQL did not read.
-
-    A resolved document's content is evidence through every channel it
-    has. Its text arrives via DOCUMENT_SEARCH (text chunks only); its
-    tabular content lives only in SQLite and is otherwise reachable by
-    neither evidence path. Generically: no query keywords, no
-    table-name matching, no domain assumptions.
-
-    Deterministic (no ranking), read-only, allowlisted per table.
-    source_type stays "table_query" so downstream consumers are
-    unchanged; evidence_role marks the semantic difference.
-    """
-    resolved_ids = set(_document_ids_for_search(state))
-    if not resolved_ids:
-        return []
-
-    # Only the resolved documents' tables are needed; details already loaded
-    # earlier in this request are reused, not re-read.
-    schema = _resources(state).schema(document_ids=resolved_ids)
-    candidates = [
-        item
-        for item in schema
-        if _coerce_int(item.get("document_id")) in resolved_ids
-        and str(item.get("table_name")) not in tables_used
-    ]
-    candidates = _in_table_scope(state, candidates)
-
-    evidence: list[dict[str, Any]] = []
-    for item in candidates:
-        table_name = str(item["table_name"])
-        try:
-            result = query_tables(
-                workspace_id=state["workspace_id"],
-                sql=f'SELECT * FROM "{table_name}"',
-                parameters=[],
-                allowed_table_names={table_name},
-            )
-        except ValueError:
-            logger.exception("document table query failed: %s", table_name)
-            continue
-
-        row_count = int(result.get("row_count", 0) or 0)
-        evidence.append(
-            {
-                "source_type": "table_query",
-                "workspace_id": state["workspace_id"],
-                "sources": [
-                    {
-                        "table_name": table_name,
-                        "document_id": item.get("document_id"),
-                    }
-                ],
-                "content": {
-                    **result,
-                    "evidence_role": "document_table",
-                    "document_title": item.get("document_title"),
-                    "interpretation": (
-                        "Rows of a table extracted from a document the "
-                        "user referenced. This is that document's own "
-                        "tabular content — its rules, rates, thresholds, "
-                        "or facts. Treat it as authoritative document "
-                        "evidence, alongside the document's text "
-                        "passages."
-                    ),
-                },
-                "result_status": "SUCCESS" if row_count > 0 else "NOT_FOUND",
-            }
-        )
-    return evidence
 
 
 def _apply_table_scope(
