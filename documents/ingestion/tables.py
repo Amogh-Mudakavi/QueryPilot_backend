@@ -1,12 +1,52 @@
 """Ingestion Tables module for QueryPilot."""
 
 import logging
+import os
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 MAX_SEMANTIC_CELL_CHARS = 500
 MAX_SAMPLE_ROWS = 10
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# --- SQL eligibility gate -------------------------------------------------
+#
+# A parser "table node" is only a candidate. Layout blocks (schedules, cards,
+# two-column page designs) are detected as tables too, and their "header" is
+# really a paragraph. Such tables are kept as readable text evidence instead
+# of becoming a physical SQL table.
+
+# A header longer than this, or with more words than HEADER_MAX_WORDS, reads
+# as a sentence, not as a column label.
+HEADER_MAX_CHARS = _env_int("INGESTION_TABLE_HEADER_MAX_CHARS", 64)
+HEADER_MAX_WORDS = _env_int("INGESTION_TABLE_HEADER_MAX_WORDS", 12)
+
+# Reject a table for SQL when at least this share of its real headers are
+# sentence-like.
+PROSE_HEADER_RATIO = _env_float("INGESTION_TABLE_PROSE_HEADER_RATIO", 0.5)
+
+MAX_TABLE_COLUMNS = _env_int("INGESTION_TABLE_MAX_COLUMNS", 300)
+
+# Safety cap for tables that are kept as text evidence.
+FALLBACK_MAX_ROWS = _env_int("INGESTION_TABLE_FALLBACK_MAX_ROWS", 1000)
+
+_GENERATED_HEADER = re.compile(r"^column_\d+(?:_\d+)?$")
 
 
 class TableProcessor:
@@ -107,21 +147,75 @@ class TableProcessor:
         return normalized_headers, normalized_rows
 
     @staticmethod
-    def validate_table(
+    def is_prose_header(header: Any) -> bool:
+        """True when a header cell reads like a sentence, not a column label."""
+        text = " ".join(str(header or "").split())
+
+        if not text:
+            return False
+
+        return (
+            len(text) > HEADER_MAX_CHARS
+            or len(text.split()) > HEADER_MAX_WORDS
+        )
+
+    @classmethod
+    def sql_rejection_reason(
+        cls,
         headers: list[str],
         rows: list[list[str]],
-    ) -> bool:
+        strict: bool = True,
+    ) -> str | None:
+        """
+        Why this table must NOT become a physical SQL table, or None.
 
+        ``strict`` applies the header-prose check. It is meant for tables
+        found INSIDE documents (PDF, DOCX), where layout blocks look like
+        tables. Spreadsheets and CSV files are datasets by definition: their
+        headers can legitimately be long (survey questions), and they rely on
+        safe column naming instead.
+        """
         if not headers:
-            return False
+            return "no headers"
 
         if len(headers) < 2:
-            return False
+            return "fewer than 2 columns"
 
         if not rows:
-            return False
+            return "no data rows"
 
-        return True
+        if len(headers) > MAX_TABLE_COLUMNS:
+            return f"more than {MAX_TABLE_COLUMNS} columns"
+
+        if strict:
+            real_headers = [
+                header
+                for header in headers
+                if header and not _GENERATED_HEADER.match(header)
+            ]
+
+            if real_headers:
+                prose = sum(
+                    1 for header in real_headers if cls.is_prose_header(header)
+                )
+
+                if prose / len(real_headers) >= PROSE_HEADER_RATIO:
+                    return (
+                        f"{prose}/{len(real_headers)} headers are "
+                        "sentence-like (layout block, not a data table)"
+                    )
+
+        return None
+
+    @classmethod
+    def validate_table(
+        cls,
+        headers: list[str],
+        rows: list[list[str]],
+        strict: bool = True,
+    ) -> bool:
+
+        return cls.sql_rejection_reason(headers, rows, strict) is None
 
     @staticmethod
     def build_metadata(
@@ -178,6 +272,7 @@ class TableProcessor:
         cls,
         table_node: dict[str, Any],
         document_id: int,
+        strict: bool = True,
     ) -> dict[str, Any] | None:
 
         table = cls.extract_table(table_node)
@@ -187,15 +282,19 @@ class TableProcessor:
             table["rows"],
         )
 
-        if not cls.validate_table(
+        reason = cls.sql_rejection_reason(
             headers,
             rows,
-        ):
+            strict,
+        )
+
+        if reason:
             logger.info(
-                "Table rejected for document %s (page %s): "
-                "%d headers, %d rows after normalization.",
+                "Table not eligible for SQL for document %s (page %s): "
+                "%s (%d headers, %d rows after normalization).",
                 document_id,
                 table.get("page"),
+                reason,
                 len(headers),
                 len(rows),
             )
@@ -233,3 +332,96 @@ class TableProcessor:
         )
 
         return payload
+
+    @staticmethod
+    def _cell_text(value: Any) -> str:
+        if value is None:
+            return ""
+
+        return " ".join(str(value).split())
+
+    @classmethod
+    def fallback_text_nodes(
+        cls,
+        table_node: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """
+        Render a table that is not stored in SQL as text nodes for the
+        normal chunker, so its content stays searchable and citable.
+
+        Every row becomes one self-contained line where each value keeps its
+        column label ("Issue: Damaged item | Resolution: Submit an image"),
+        so a retrieved row can never lose the header it belongs to. Headers
+        that are really sentences are not used as labels. Never raises.
+        """
+        try:
+            page = table_node.get("page") if isinstance(table_node, dict) else None
+            page = page if isinstance(page, int) else 0
+
+            raw_rows = table_node.get("rows") or []
+
+            grid = [
+                [cls._cell_text(cell) for cell in row]
+                for row in raw_rows
+                if isinstance(row, (list, tuple))
+            ]
+
+            grid = [row for row in grid if any(row)]
+
+            lines: list[str] = []
+
+            if not grid:
+                fallback = table_node.get("markdown") or table_node.get("csv") or ""
+
+                lines = [
+                    line.strip()
+                    for line in str(fallback).splitlines()
+                    if line.strip()
+                ]
+            elif len(grid) == 1:
+                lines = [" | ".join(cell for cell in grid[0] if cell)]
+            else:
+                header, data = grid[0], grid[1:]
+
+                labels = [
+                    "" if (not cell or cls.is_prose_header(cell)) else cell
+                    for cell in header
+                ]
+
+                if any(labels):
+                    lines.append(
+                        "Columns: " + " | ".join(label for label in labels if label)
+                    )
+
+                for number, row in enumerate(data[:FALLBACK_MAX_ROWS], start=1):
+                    parts = []
+
+                    for position, cell in enumerate(row):
+                        if not cell:
+                            continue
+
+                        label = labels[position] if position < len(labels) else ""
+
+                        parts.append(f"{label}: {cell}" if label else cell)
+
+                    if parts:
+                        lines.append(f"Row {number}: " + " | ".join(parts))
+
+                if len(data) > FALLBACK_MAX_ROWS:
+                    lines.append(
+                        f"({len(data) - FALLBACK_MAX_ROWS} more rows omitted)"
+                    )
+
+            if not lines:
+                return []
+
+            return [
+                {
+                    "page": page,
+                    "text": "\n".join([f"## Table (page {page})", *lines]),
+                }
+            ]
+
+        except Exception:
+            logger.exception("Could not render table as text evidence.")
+            return []

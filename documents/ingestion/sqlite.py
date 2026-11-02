@@ -8,12 +8,46 @@ The physical structured-data store is now MySQL RDS #2.
 
 from __future__ import annotations
 
+import hashlib
 import re
 
 from django.db import connections, transaction
+from django.db.utils import DatabaseError, DataError
 
 
 CONNECTION_TIMEOUT_SECONDS = 10
+
+# MySQL limits every identifier (table, column) to 64 characters.
+MAX_IDENTIFIER_LENGTH = 64
+
+_HASH_SUFFIX_LENGTH = 8
+
+# MySQL error codes that mean "this particular table's schema or data cannot
+# be stored", as opposed to "the database is unavailable". They are
+# deterministic: retrying the same input fails the same way every time.
+_DETERMINISTIC_MYSQL_ERROR_CODES = frozenset(
+    {
+        1048,  # column cannot be null
+        1054,  # unknown column
+        1059,  # identifier name too long
+        1060,  # duplicate column name
+        1064,  # syntax error
+        1067,  # invalid default value
+        1071,  # specified key too long
+        1074,  # column length too big
+        1101,  # BLOB/TEXT cannot have a default
+        1103,  # incorrect table name
+        1117,  # too many columns
+        1118,  # row size too large
+        1136,  # column count does not match value count
+        1166,  # incorrect column name
+        1170,  # BLOB/TEXT used in key specification
+        1264,  # value out of range
+        1265,  # data truncated
+        1366,  # incorrect string value
+        1406,  # data too long
+    }
+)
 
 _IDENTIFIER_PATTERN = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_]*$"
@@ -69,32 +103,123 @@ class SQLiteManager:
                 f"Invalid MySQL {label}: '{identifier}'."
             )
 
+        if len(identifier) > MAX_IDENTIFIER_LENGTH:
+            raise ValueError(
+                f"MySQL {label} is longer than "
+                f"{MAX_IDENTIFIER_LENGTH} characters: '{identifier}'."
+            )
+
         return identifier
 
     @staticmethod
     def sanitize_column_name(
         column_name,
+        index=None,
     ):
         """
-        Preserve the existing QueryPilot column sanitisation behavior.
-        """
-        column_name = str(
-            column_name
-        ).strip()
+        Turn extracted header text into a safe physical column name.
 
-        column_name = re.sub(
+        Extracted headers are untrusted document content, so the result is
+        guaranteed to be a valid MySQL identifier no matter what the
+        document contained:
+
+        - only ``[A-Za-z0-9_]`` characters (existing behavior);
+        - never empty and never punctuation/non-ASCII only: such headers
+          become ``column_<index>`` instead of collapsing to ``_``;
+        - never starts with a digit (``2023`` -> ``c_2023``), which the
+          planner's identifier validation would otherwise reject;
+        - never longer than MAX_IDENTIFIER_LENGTH. Longer names are cut
+          and given a short hash of the ORIGINAL header, so two different
+          long headers sharing a prefix stay distinct and the same header
+          always maps to the same column.
+
+        Names that were already valid and short are returned unchanged.
+        """
+        raw = str(column_name).strip()
+
+        cleaned = re.sub(
             r"[^a-zA-Z0-9_]",
             "_",
-            column_name,
+            raw,
         )
 
-        column_name = re.sub(
+        cleaned = re.sub(
             r"_+",
             "_",
-            column_name,
+            cleaned,
         )
 
-        return column_name or "column"
+        if not re.search(r"[A-Za-z0-9]", cleaned):
+            return (
+                f"column_{index}"
+                if index is not None
+                else "column"
+            )
+
+        if cleaned[0].isdigit():
+            cleaned = f"c_{cleaned}"
+
+        if len(cleaned) > MAX_IDENTIFIER_LENGTH:
+            digest = hashlib.sha1(
+                raw.encode("utf-8")
+            ).hexdigest()[:_HASH_SUFFIX_LENGTH]
+
+            keep = MAX_IDENTIFIER_LENGTH - _HASH_SUFFIX_LENGTH - 1
+
+            cleaned = f"{cleaned[:keep].rstrip('_')}_{digest}"
+
+        return cleaned
+
+    @staticmethod
+    def _unique_column_name(
+        column,
+        used_columns,
+    ):
+        """
+        Return ``column`` or the first ``column_<n>`` (n >= 2) that is not
+        already used, case-insensitively, without exceeding the MySQL
+        identifier limit.
+        """
+        if column.lower() not in used_columns:
+            return column
+
+        suffix = 2
+
+        while True:
+            tail = f"_{suffix}"
+
+            candidate = (
+                column[: MAX_IDENTIFIER_LENGTH - len(tail)]
+                + tail
+            )
+
+            if candidate.lower() not in used_columns:
+                return candidate
+
+            suffix += 1
+
+    @staticmethod
+    def is_deterministic_error(exc):
+        """
+        True when ``exc`` means this one table's schema/data cannot be
+        stored, so retrying cannot help and the caller should degrade that
+        table instead of failing the whole document.
+
+        Connectivity problems, timeouts and unknown database errors return
+        False and must keep propagating so the job retries.
+        """
+        if isinstance(exc, (ValueError, DataError)):
+            return True
+
+        if isinstance(exc, DatabaseError) and exc.args:
+            code = exc.args[0]
+
+            return (
+                isinstance(code, int)
+                and code in _DETERMINISTIC_MYSQL_ERROR_CODES
+            )
+
+        return False
 
     @classmethod
     def create_table(
@@ -116,25 +241,22 @@ class SQLiteManager:
         normalized_columns = []
         used_columns = set()
 
-        # Preserve the current duplicate-column handling exactly.
-        for column in columns:
+        for position, column in enumerate(columns):
 
             column = cls.sanitize_column_name(
-                column
+                column,
+                index=position,
             )
 
-            if column.lower() in used_columns:
+            column = cls._unique_column_name(
+                column,
+                used_columns,
+            )
 
-                base = column
-                suffix = 2
-
-                while (
-                    f"{base}_{suffix}".lower()
-                    in used_columns
-                ):
-                    suffix += 1
-
-                column = f"{base}_{suffix}"
+            column = cls.validate_identifier(
+                column,
+                "column name",
+            )
 
             used_columns.add(
                 column.lower()

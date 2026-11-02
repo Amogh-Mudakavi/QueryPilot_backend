@@ -62,6 +62,10 @@ from documents.ingestion.vectors import (
 
 logger = logging.getLogger(__name__)
 
+# Sources that ARE datasets. Their tables skip the "is this really a table?"
+# prose check that protects document sources (PDF, DOCX) from layout blocks.
+_DATASET_SOURCE_TYPES = frozenset({"xlsx", "csv"})
+
 
 class IngestionPipeline:
     """
@@ -224,6 +228,15 @@ class IngestionPipeline:
 
         table_metadata = []
 
+        # Tables that do not become SQL tables are kept as text evidence so
+        # their content is still searchable and citable.
+        fallback_nodes = []
+
+        strict_tables = (
+            str(getattr(document, "source_type", "") or "").lower()
+            not in _DATASET_SOURCE_TYPES
+        )
+
         for index, table_node in enumerate(
             table_nodes,
             start=1,
@@ -239,17 +252,31 @@ class IngestionPipeline:
                 column_count,
             )
 
-            processed = TableProcessor.process(
-                table_node=table_node,
-                document_id=document_id,
-            )
+            try:
+                processed = TableProcessor.process(
+                    table_node=table_node,
+                    document_id=document_id,
+                    strict=strict_tables,
+                )
+
+            except Exception:
+                logger.exception(
+                    "Document %s: table #%d could not be processed; "
+                    "keeping it as text evidence.",
+                    document_id,
+                    index,
+                )
+
+                processed = None
 
             if not processed:
-                continue
+                fallback_nodes.extend(
+                    TableProcessor.fallback_text_nodes(
+                        table_node
+                    )
+                )
 
-            table_metadata.append(
-                processed["metadata"]
-            )
+                continue
 
             table_name = (
                 f"ws_{workspace_id}_"
@@ -272,38 +299,107 @@ class IngestionPipeline:
                 len(rows),
             )
 
-            SQLiteManager.create_table(
-                table_name=table_name,
-                columns=headers,
-            )
+            try:
+                SQLiteManager.create_table(
+                    table_name=table_name,
+                    columns=headers,
+                )
 
-            SQLiteManager.insert_rows(
-                table_name=table_name,
-                rows=rows,
-            )
+                SQLiteManager.insert_rows(
+                    table_name=table_name,
+                    rows=rows,
+                )
 
-            logger.info(
-                "[CHECKPOINT 5] SQLITE INSERT COMPLETED #%d: "
-                "table=%s rows_count=%d.",
-                index,
-                table_name,
-                len(rows),
-            )
+                logger.info(
+                    "[CHECKPOINT 5] SQLITE INSERT COMPLETED #%d: "
+                    "table=%s rows_count=%d.",
+                    index,
+                    table_name,
+                    len(rows),
+                )
 
-            VectorStore.store_table_metadata(
-                workspace_id=workspace_id,
-                document_id=document_id,
-                table_name=table_name,
-                summary=processed["semantic_text"],
+                VectorStore.store_table_metadata(
+                    workspace_id=workspace_id,
+                    document_id=document_id,
+                    table_name=table_name,
+                    summary=processed["semantic_text"],
+                )
+
+            except Exception as exc:
+                # A table whose schema or data MySQL cannot store fails the
+                # same way on every retry, so it must not fail the document.
+                # Anything else (connection loss, timeouts, embedding
+                # errors) still propagates so the job is retried.
+                if not SQLiteManager.is_deterministic_error(exc):
+                    raise
+
+                logger.exception(
+                    "Document %s: table #%d (%s) cannot be stored in SQL; "
+                    "keeping it as text evidence.",
+                    document_id,
+                    index,
+                    table_name,
+                )
+
+                try:
+                    SQLiteManager.drop_table(table_name)
+
+                except Exception:
+                    logger.exception(
+                        "Document %s: could not drop partial table %s.",
+                        document_id,
+                        table_name,
+                    )
+
+                fallback_nodes.extend(
+                    TableProcessor.fallback_text_nodes(
+                        table_node
+                    )
+                )
+
+                continue
+
+            table_metadata.append(
+                processed["metadata"]
             )
 
         del table_nodes
 
         logger.info(
-            "Document %s: processed %d table(s) into SQLite.",
+            "Document %s: processed %d table(s) into SQL; "
+            "%d table(s) kept as text evidence.",
             document_id,
             len(table_metadata),
+            len(fallback_nodes),
         )
+
+        if fallback_nodes:
+            extra_chunks = chunker.chunk(
+                fallback_nodes
+            )
+
+            offset = len(chunks)
+
+            for extra in extra_chunks:
+                extra["chunk_index"] += offset
+
+            VectorStore.store_chunks(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_title=document.title or original_filename,
+                chunks=extra_chunks,
+            )
+
+            chunks = chunks + extra_chunks
+
+            logger.info(
+                "Document %s: stored %d text chunk(s) for tables kept "
+                "as text evidence.",
+                document_id,
+                len(extra_chunks),
+            )
+
+        del fallback_nodes
 
         stage_started = time.monotonic()
 
