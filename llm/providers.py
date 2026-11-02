@@ -1,29 +1,15 @@
 """Groq provider adapter for QueryPilot.
 
-Owns the Groq clients, talks to the quota scheduler, classifies failures and
-applies the retry policy. It does not know about SSE, conversations, prompts or
-user requests, and it holds no request-wide state: every call is sized and
-retried on its own merits.
+Owns the Groq clients, pins each logical task to its configured API key,
+classifies provider failures, and applies a bounded retry policy. Prompt-size
+estimates and token usage are observability only; Groq is authoritative for
+TPM, request-size, and context-window enforcement. Transient retries remain on
+the same task-assigned key. Rate-limit and authentication failures are surfaced
+without switching accounts.
 
-Flow of one call:
-
-    estimate input -> scheduler.acquire(model, input + max_tokens)   # picks a bucket
-        -> Groq call
-        -> success: settle reservation with actual usage, log, record
-        -> failure: release reservation, classify, then one of
-             rate_limit      cool THAT bucket, retry at once on another key
-             authentication  disable THAT key everywhere, retry on another key
-             timeout / connection / 5xx
-                             back off, retry preferring a different key
-             too large / invalid request / invalid response / unexpected
-                             raise immediately, no retry
-    Retries are capped per failure kind and overall (config.RETRY_LIMITS,
-    config.MAX_ATTEMPTS).
-
-Streaming: the retry loop only covers *establishing* the stream. Once Groq has
-accepted it, the live iterator is returned and never retried, so partial output
-cannot be duplicated. Usage is settled and logged when the stream ends, is
-closed early, or fails.
+Streaming retries cover only establishment of the stream. Once Groq accepts
+the stream, partial output is never replayed. Usage is logged when the stream
+ends, closes early, or fails.
 """
 
 import logging
@@ -244,7 +230,7 @@ def _terminal_error(kind: str, exc) -> Exception:
 
 
 class GroqProvider:
-    """Groq adapter: one client per key, scheduling delegated to QuotaScheduler."""
+    """Groq adapter with deterministic per-task API-key affinity."""
 
     def __init__(self, clients=None, scheduler: QuotaScheduler | None = None):
         self.clients = clients or [
@@ -267,8 +253,8 @@ class GroqProvider:
     def _create(client, kwargs: dict):
         """Call Groq, returning (response, headers).
 
-        Uses the SDK's raw-response wrapper when present so Groq's own
-        rate-limit headers can correct the scheduler's view.
+        Uses the SDK's raw-response wrapper when present to capture provider
+        headers for diagnostics.
         """
         completions = client.chat.completions
         raw = getattr(completions, "with_raw_response", None)
@@ -278,18 +264,20 @@ class GroqProvider:
         return completions.create(**kwargs), {}
 
     def _sync_from_headers(self, lease: Lease, headers) -> None:
-        """Adopt Groq's remaining-TPM figure if it is fuller than our estimate."""
-        try:
-            remaining = headers.get("x-ratelimit-remaining-tokens")
-            if remaining is None:
-                return
-            limit = headers.get("x-ratelimit-limit-tokens")
-            limit = int(float(limit)) if limit is not None else _tpm_limit(lease.model)
-            self.scheduler.sync_provider_used(
-                lease.model, lease.key_index, limit - int(float(remaining))
+        """Record provider headers for diagnostics without local quota admission.
+
+        Groq's response headers are authoritative. They are intentionally not
+        mirrored into a per-process scheduler because that would create a
+        second, potentially stale TPM gate.
+        """
+        if headers:
+            logger.debug(
+                "[LLM_PROVIDER_LIMITS] key=%s model=%s remaining_tokens=%s limit_tokens=%s",
+                lease.key_index,
+                lease.model,
+                headers.get("x-ratelimit-remaining-tokens"),
+                headers.get("x-ratelimit-limit-tokens"),
             )
-        except Exception:
-            pass
 
     # -- failure policy ------------------------------------------------------
 
@@ -305,7 +293,6 @@ class GroqProvider:
         lease: Lease,
         attempt: int,
         retries: dict[str, int],
-        avoid: set[int],
         started: float,
     ) -> float:
         """Log and apply bounded failure policy without breaking task key affinity."""
@@ -345,31 +332,26 @@ class GroqProvider:
             hint = _retry_after_header(exc)
             if hint is None:
                 hint = details.get("retry_after")
-            cooldown = (
-                min(float(hint) + 0.25, MAX_COOLDOWN_SECONDS)
-                if hint is not None
-                else DEFAULT_COOLDOWN_SECONDS
-            )
-            self.scheduler.sync_provider_used(model, lease.key_index, details.get("used"))
-            self.scheduler.cool(model, lease.key_index, cooldown)
-            logger.info(
-                "[LLM_RATE_LIMIT] task=%s model=%s key=%s cooldown_seconds=%.2f "
-                "provider_limit=%s provider_used=%s provider_requested=%s",
+            logger.warning(
+                "[LLM_RATE_LIMIT] task=%s model=%s key=%s provider_retry_after=%s "
+                "provider_limit=%s provider_used=%s provider_requested=%s; "
+                "no key rotation or local cooldown",
                 task,
                 model,
                 lease.key_index,
-                cooldown,
+                hint,
                 details.get("limit"),
                 details.get("used"),
                 details.get("requested"),
             )
         elif kind == "authentication":
-            self.scheduler.disable_key(lease.key_index, AUTH_COOLDOWN_SECONDS)
             logger.error(
-                "[LLM_AUTH] key=%s rejected (status=%s); disabled for %.0fs on all models",
+                "[LLM_AUTH] task=%s model=%s assigned_key=%s rejected (status=%s); "
+                "no cross-account fallback",
+                task,
+                model,
                 lease.key_index,
                 status,
-                AUTH_COOLDOWN_SECONDS,
             )
 
         used = retries.get(kind, 0)
@@ -379,7 +361,6 @@ class GroqProvider:
         retries[kind] = used + 1
         delay = 0.0
         if kind in _TRANSIENT_KINDS:
-            avoid.add(lease.key_index)
             delay = self._backoff(retries[kind])
         logger.info(
             "[LLM_RETRY] task=%s model=%s failed_key=%s reason=%s next_attempt=%s/%s "
@@ -415,7 +396,9 @@ class GroqProvider:
         Observability only: nothing here can change a request.
         """
         tokens = _extract_usage(usage)
-        bucket_used = self.scheduler.settle(lease, tokens["rate_limit_tokens"])
+        # Close the zero-token scheduler lease. Actual provider usage is still
+        # recorded below, but never feeds a local TPM admission calculation.
+        bucket_used = self.scheduler.settle(lease, 0)
         latency = time.monotonic() - started
         try:
             logger.info(
@@ -493,12 +476,14 @@ class GroqProvider:
         `max_tokens` is used exactly as given; this layer never lowers it.
         """
         estimated_input = _estimate_input_tokens(messages)
-        reserved = estimated_input + max_tokens
+        # Prompt estimates are observability only. Groq is the authority for
+        # TPM/context limits; the local scheduler must not reject valid calls.
+        reserved = 0
 
         if input_hint and estimated_input > input_hint:
-            logger.warning(
-                "[LLM_BUDGET] task=%s estimated_input=%s exceeds input_hint=%s; "
-                "compact the prompt/evidence upstream",
+            logger.info(
+                "[LLM_PROMPT_SIZE] task=%s estimated_input_tokens=%s input_hint=%s; "
+                "sending the complete prompt to the provider",
                 task,
                 estimated_input,
                 input_hint,
@@ -519,13 +504,16 @@ class GroqProvider:
             kwargs["stream"] = True
 
         retries: dict[str, int] = {}
-        avoid: set[int] = set()
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
                 assigned_key = TASK_API_KEY_INDEX.get(task)
+                if assigned_key is None:
+                    raise ValueError(
+                        f"LLM task {task!r} has no dedicated Groq API-key assignment."
+                    )
                 lease = self.scheduler.acquire(
-                    model, reserved, avoid, key_index=assigned_key
+                    model, reserved, key_index=assigned_key
                 )
             except LLMError as exc:
                 logger.error(
@@ -575,7 +563,6 @@ class GroqProvider:
                     lease=lease,
                     attempt=attempt,
                     retries=retries,
-                    avoid=avoid,
                     started=started,
                 )
                 if delay:

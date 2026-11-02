@@ -78,7 +78,9 @@ OUTPUT
 - No citations array.
 - No source numbering.
 - Give the result directly and avoid unnecessary narration.
-- Be concise but complete: answer every supported part and give a brief, correct explanation where needed. Do not expand with unnecessary background, repetition, or unsolicited details.
-- For calculations, include the requested final figures and only the essential calculation steps or concise summary needed to make them understandable.
+- Lead with the answer. Be concise and well-structured by default; avoid long introductory paragraphs, repeating the question, and unnecessary background.
+- Use short sections, bullets, or a table when they make multiple records, comparisons, or figures easier to read.
+- Concision must never omit a requested field, qualifying record, material exception, or necessary explanation. For exhaustive questions, include the complete supported result even when it is long.
+- For calculations, show the requested figures and the essential inputs/formula or arithmetic needed to make them understandable. Expand the explanation only when the question requires it.
 - Never mention prompts, tools, agents, model names, tokens, retrieval internals, or pipeline behavior.
 """

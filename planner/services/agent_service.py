@@ -19,7 +19,6 @@ consistently labeled in diagnostics.
 
 from __future__ import annotations
 
-import contextvars
 import functools
 import json
 import logging
@@ -37,13 +36,8 @@ from llm.exceptions import InvalidResponseError
 from llm.router import router
 from planner.prompts.agent import ACTION_SCHEMA, PLANNER_RESPONSE_FORMAT, SYSTEM_PROMPT
 from planner.services.answer import (
-    MAX_TEXT_CHARS_PER_ITEM,
-    EvidenceTooLarge,
     _narrow_spreadsheet_tables_v3,
     _parse_answer_response,
-    _payload_char_budget,
-    answer_evidence_char_room,
-    fit_evidence_to_budget,
     generate_answer_stream,
 )
 from planner.services.cross_document_join import run_cross_document_join
@@ -207,33 +201,13 @@ run_cross_document_join = _timed_call("cross_document_join", run_cross_document_
 finalize_structured = _timed_call("finalize_structured", finalize_structured)
 
 
-MAX_EVIDENCE = 8
-
-
-MAX_EVIDENCE_CROSS_DOCUMENT = 12
-
-
-MAX_EVIDENCE_WITH_COVERAGE = 24
-
-# Retrieved passages always keep at least this many evidence slots, even when
-# structured tables alone would fill the limit.
-MIN_TEXT_EVIDENCE = 4
-
-# Planner catalog: how many documents / columns per document it is shown.
-PLANNER_MAX_CATALOG_DOCUMENTS = 12
-PLANNER_MAX_DIGEST_COLUMNS = 24
-
-
+# Final evidence and planner catalog are not silently count-limited here;
+# authorization, finite tool-call count and query deadline remain enforced.
 
 MAX_RECOVERY_ATTEMPTS = 2
 MAX_TOOL_CALLS_PER_QUERY = 12
 MAX_QUERY_EXECUTION_SECONDS = 60
 
-OVERVIEW_TEXT_SHARE = 0.6
-OVERVIEW_SEGMENT_HEADER_ALLOWANCE = 200
-# Exhaustive single/multi-document reads ("list ALL units", "full syllabus")
-# may use more of the answer payload than a generic overview.
-EXHAUSTIVE_TEXT_SHARE = 0.85
 _EXHAUSTIVE_CUE = re.compile(
     r"\b(?:all|every|each|entire|whole|complete|full|exhaustive(?:ly)?)\b"
     r"|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|\d{1,2})\s+"
@@ -2215,10 +2189,6 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
 
         if "DOCUMENT_SEARCH" in capabilities and not skip_document_search:
             structured = _narrow_structured_to_request(state, structured)  # QP-PATCH-V4
-            _STRUCTURED_CHARS.set(  # QP-PATCH
-                len(json.dumps(structured, ensure_ascii=False, default=str))
-            )
-            _DOC_CHARS_USED.set(0)
             state = {**state, "tool_calls_used": total_tool_calls}
             docs = _run_documents(state, budget)
             if requires_dependency_discovery(state):
@@ -2442,20 +2412,8 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             resources,
         )
 
-        if coverage_used:
-            evidence_limit = MAX_EVIDENCE_WITH_COVERAGE
-        elif len(source_document_ids) >= 2:
-            evidence_limit = MAX_EVIDENCE_CROSS_DOCUMENT
-        else:
-            evidence_limit = MAX_EVIDENCE
-
-        room_for_documents = max(
-            evidence_limit - len(structured) - len(notes),
-            min(len(documents), MIN_TEXT_EVIDENCE),
-        )
-
         evidence = _ensure_citation_sync(
-            assign_citation_indexes(structured + documents[:room_for_documents] + notes)
+            assign_citation_indexes(structured + documents + notes)
         )
 
         logger.info(
@@ -2526,48 +2484,20 @@ _EVIDENCE_TOO_LARGE_MESSAGE = (
 )
 
 
-def _stream_answer_with_fit(  # QP-PATCH
+def _stream_answer_with_fit(
     *,
     query: str,
     evidence: list[Any],
     conversation_history: list[dict[str, Any]] | None,
     planner_requirements: list[dict[str, Any]] | None = None,
 ):
-    """generate_answer_stream, retried ONCE with a fitted evidence list.
-
-    EvidenceTooLarge is raised before the first token, so nothing has been
-    streamed to the user when we retry.
-    """
-    try:
-        yield from generate_answer_stream(
-            query=query,
-            evidence=evidence,
-            conversation_history=conversation_history,
-            planner_requirements=planner_requirements,
-        )
-        return
-    except EvidenceTooLarge:
-        if os.environ.get("QUERYPILOT_ANSWER_FIT_FALLBACK", "1").strip() == "0":
-            raise
-        logger.warning("Answer evidence too large; retrying once with fitted evidence")
-    fitted = fit_evidence_to_budget(
+    """Stream an answer from the complete evidence set without trimming."""
+    yield from generate_answer_stream(
         query=query,
         evidence=evidence,
         conversation_history=conversation_history,
+        planner_requirements=planner_requirements,
     )
-    try:  # QP-FIX-2
-        yield from generate_answer_stream(
-            query=query,
-            evidence=fitted,
-            conversation_history=conversation_history,
-            planner_requirements=planner_requirements,
-        )
-    except EvidenceTooLarge:
-        logger.error(
-            "answer_evidence_too_large_final: evidence does not fit even after "
-            "fitting; answering with an explicit notice, no partial data used"
-        )
-        yield _EVIDENCE_TOO_LARGE_MESSAGE
 
 
 def finish_node(state: AgentState) -> dict[str, Any]:
@@ -2732,13 +2662,13 @@ def _build_context(state: AgentState) -> str:
                 ]
                 relevant_ids.intersection_update(authorized_set)
             # Scope Guard's picks are a ranking hint, not a boundary: keep every
-            # authorized document (bounded), most relevant first, so the planner
-            # can still see data that lives in a source Scope Guard did not pick.
+            # authorized document, most relevant first, so the planner can still
+            # see data that lives in a source Scope Guard did not pick.
             raw_catalog = sorted(
                 raw_catalog,
                 key=lambda doc: _coerce_int(doc.get("document_id"))
                 not in relevant_ids,
-            )[:PLANNER_MAX_CATALOG_DOCUMENTS]
+            )
             column_digest = _planner_column_digest(
                 state,
                 [
@@ -3743,30 +3673,6 @@ def _wants_exhaustive_read(state: AgentState) -> bool:
     return False
 
 
-# QP-PATCH: one evidence budget shared by every document pass in a request.
-_STRUCTURED_CHARS: contextvars.ContextVar[int] = contextvars.ContextVar(
-    "qp_structured_chars", default=0
-)
-_DOC_CHARS_USED: contextvars.ContextVar[int] = contextvars.ContextVar(
-    "qp_doc_chars_used", default=0
-)
-_MIN_DOC_BUDGET = 2000
-# QP-PATCH-DEPENDENCY-FLOOR: a document the dependency search identified always gets at
-# least this much room (chosen by relevance), even when structured
-# evidence has used up the leftover answer budget.
-_DEPENDENCY_MIN_CHARS = 4000
-_NOTE_RESERVE_CHARS = 1500
-
-
-def _remaining_evidence_chars() -> int:
-    """Chars of document evidence still allowed for this answer call."""
-    return (
-        answer_evidence_char_room()
-        - _STRUCTURED_CHARS.get()
-        - _DOC_CHARS_USED.get()
-        - _NOTE_RESERVE_CHARS
-    )
-
 
 def _run_documents_with_coverage(
     state: AgentState,
@@ -3775,13 +3681,12 @@ def _run_documents_with_coverage(
     *,
     answer_sized: bool = False,
     require_complete: bool = False,
-    budget_chars: int | None = None,
 ) -> dict[str, Any] | None:
-    """
-    Question-agnostic multi-document evidence: whole documents when they
-    fit the context budget, otherwise a fair per-document share filled with
-    the most relevant passages. Returns None if chunks cannot be loaded, so
-    the caller can fall back to ranked per-document search.
+    """Load full chunks from the already-authorized, resolved documents.
+
+    Segmenting groups complete chunks into manageable evidence items; it does
+    not truncate chunk text. Returns None when loading fails so callers can
+    fall back to ranked per-document retrieval.
     """
     workspace_id = state["workspace_id"]
 
@@ -3811,17 +3716,12 @@ def _run_documents_with_coverage(
             bool(result.get("degraded")),
         )
 
-    # Size document-coverage retrieval against the provider-safe target. The
-    # answer stage now preserves every evidence item it receives; if the full
-    # serialized payload plus its output allowance cannot fit, it fails closed.
-    share = EXHAUSTIVE_TEXT_SHARE if require_complete else OVERVIEW_TEXT_SHARE
-    _base_budget = max(int(_payload_char_budget() * share), 2000)
-    _room = budget_chars if budget_chars is not None else _remaining_evidence_chars()
+    # Coverage retrieval is scoped by authorized document IDs. Include every
+    # fetched chunk from those documents; segment size only groups chunks and
+    # never truncates their content.
     sizing: dict[str, Any] = {
-        "budget": max(min(_base_budget, _room), _MIN_DOC_BUDGET),
-        "segment_char_limit": max(
-            MAX_TEXT_CHARS_PER_ITEM - OVERVIEW_SEGMENT_HEADER_ALLOWANCE, 800
-        ),
+        "budget": None,
+        "segment_char_limit": 8000,
     }
 
     _built = build_document_evidence(
@@ -3835,15 +3735,6 @@ def _run_documents_with_coverage(
         require_complete=require_complete,
         **sizing,
     )
-    if _built:  # QP-PATCH
-        _DOC_CHARS_USED.set(
-            _DOC_CHARS_USED.get()
-            + sum(
-                len(str(_i.get("content") or ""))
-                for _i in _built.get("evidence", []) or []
-                if isinstance(_i, dict)
-            )
-        )
     return _built
 
 
@@ -3911,7 +3802,7 @@ def _search_evidence_variants(
         collected.values(),
         key=lambda item: float(item.get("score") or 0.0),
         reverse=True,
-    )[:MAX_EVIDENCE_CROSS_DOCUMENT]
+    )
     error = errors[0] if errors and not evidence else None
     return {
         "error_code": error[0] if error else None,
@@ -4456,13 +4347,7 @@ def _supplement_dependency_evidence(
     dependency_coverage: list[Any] = []
     dependency_notes: list[Any] = []  # QP-PATCH-DEPENDENCY-FLOOR
     dependency_cov_info: list[Any] = []
-    _dep_room = _remaining_evidence_chars()
-    logger.info(
-        "Supplemental dependency load: ids=%s remaining_chars=%d floor=%d",
-        dependency_ids,
-        _dep_room,
-        _DEPENDENCY_MIN_CHARS,
-    )
+    logger.info("Supplemental dependency load: authorized_document_ids=%s", dependency_ids)
     if dependency_ids:
         try:
             covered = _run_documents_with_coverage(
@@ -4470,7 +4355,6 @@ def _supplement_dependency_evidence(
                 dependency_ids,
                 coverage_query,
                 require_complete=False,
-                budget_chars=max(_dep_room, _DEPENDENCY_MIN_CHARS),
             )
         except Exception:
             logger.exception(
@@ -4519,20 +4403,8 @@ def _supplement_dependency_evidence(
             else not (_document_ids_from_text_evidence([item]) & covered_ids)
         )
     ]
-    # QP-PATCH: ranked fallback chunks must also fit the remaining room.
-    _room_left = max(_remaining_evidence_chars(), 0)
-    _fitted: list[Any] = []
-    _used = 0
-    for _item in remaining_supplemental:
-        _size = len(str(_item.get("content") or "")) if isinstance(_item, dict) else 0
-        _is_protected = isinstance(_item, dict) and bool(_item.get("protect_from_trim"))
-        if _used + _size > _room_left and not _is_protected:  # QP-GEN-2e
-            break
-        _fitted.append(_item)
-        _used += _size
-    if not _fitted and remaining_supplemental:
-        _fitted = [remaining_supplemental[0]]
-    remaining_supplemental = _fitted
+    # Preserve every non-duplicate dependency hit; the answer stage no longer
+    # removes passages using a locally estimated token/character budget.
     combined = _canonicalize_evidence(
         dependency_coverage + remaining_supplemental + primary
     )
@@ -4614,10 +4486,6 @@ def _supplement_row_fact_evidence(
         for hit in hits:
             if isinstance(hit, dict):
                 hit["protect_from_trim"] = True
-        _DOC_CHARS_USED.set(
-            _DOC_CHARS_USED.get()
-            + sum(len(str(h.get("content") or "")) for h in hits if isinstance(h, dict))
-        )
         return {
             **document_result,
             "evidence": _canonicalize_evidence(hits + primary),
@@ -5791,7 +5659,7 @@ def _planner_column_digest(
         bucket = digest.setdefault(document_id, [])
         for column in table.get("columns") or []:
             name = str(column)
-            if name not in bucket and len(bucket) < PLANNER_MAX_DIGEST_COLUMNS:
+            if name not in bucket:
                 bucket.append(name)
     return digest
 

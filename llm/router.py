@@ -7,8 +7,8 @@ message, so a late stage such as answer generation always gets its full,
 task-defined allowance.
 
 The router does NOT know about SSE, conversations or persistence, does not
-parse provider stream chunks, and does not schedule keys (the provider's quota
-scheduler does that, per key and model).
+parse provider stream chunks, and does not schedule keys (the provider pins each task to its configured
+API key; provider rate limits remain authoritative).
 """
 
 import logging

@@ -14,7 +14,9 @@ from typing import Any
 
 from llm.config import (
     ANSWER_MAX_OUTPUT_TOKENS,
+    ANSWER_MIN_OUTPUT_TOKENS,
     ANSWER_OUTPUT_TOKEN_CAPS,
+    ANSWER_TPM_SAFETY_MARGIN_TOKENS,
     ANSWER_RETRY_MULTIPLIER,
     CHARS_PER_TOKEN_ESTIMATE,
     MESSAGE_OVERHEAD_TOKENS,
@@ -28,7 +30,6 @@ from retrieval.services.keys import is_id_column
 
 logger = logging.getLogger(__name__)
 
-MIN_EVIDENCE_CHARS = 4000
 RETURN_PARTIAL_ON_BUDGET_EXHAUSTION = True
 PARTIAL_ANSWER_MIN_CHARS = 120
 PARTIAL_ANSWER_NOTICE = "\n\n_Note: this answer was cut short and may be incomplete._"
@@ -39,8 +40,6 @@ STREAM_TRUNCATED_NOTICE = (
 )
 REQUEST_OVERHEAD_TOKENS = MESSAGE_OVERHEAD_TOKENS * 2 + 1
 CHARS_PER_TOKEN = CHARS_PER_TOKEN_ESTIMATE
-MAX_TEXT_CHARS_PER_ITEM = 1800
-MAX_NOTE_CHARS = 400
 MAX_CELL_CHARS = 120
 MIN_ROWS_WHEN_TRIMMED = 3
 # Retrieved passages are shortened only down to this size while any table can
@@ -109,92 +108,55 @@ def _system_tokens() -> int:
     return _estimate_tokens(SYSTEM_PROMPT)
 
 
-def _payload_char_budget() -> int:
-    """Retrieval sizing hint; answer-stage evidence is never trimmed to it."""
-    request_limit = MODEL_TPM_LIMITS[MODEL_120B]
-    fixed = _system_tokens() + REQUEST_OVERHEAD_TOKENS + ANSWER_MAX_OUTPUT_TOKENS
-    provider_room = max(request_limit - fixed, 0)
-    return max(int(provider_room * CHARS_PER_TOKEN), MIN_EVIDENCE_CHARS)
-
-
-# QP-PATCH-V2: smallest completion allowance worth sending an answer call with.
-MIN_ANSWER_COMPLETION_TOKENS = int(
-    os.environ.get("QUERYPILOT_MIN_ANSWER_TOKENS", "1500")
-)
-
-
-class EvidenceTooLarge(ValueError):  # QP-PATCH
-    """Complete evidence + answer allowance exceeds the provider TPM reservation.
-
-    Subclasses ValueError so existing `except ValueError` handlers keep working.
-    """
-
-
-def answer_evidence_char_room(complexity: str = "normal") -> int:  # QP-PATCH
-    """Characters of evidence that REALLY fit one answer call.
-
-    Same arithmetic as _completion_budget (system prompt + overhead + the real
-    completion cap), so retrieval sizing and the final check cannot disagree.
-    A 10% margin covers the JSON wrapper and conversation history.
-    """
-    cap = ANSWER_OUTPUT_TOKEN_CAPS.get(complexity, ANSWER_OUTPUT_TOKEN_CAPS["normal"])
-    room_tokens = (
-        MODEL_TPM_LIMITS[MODEL_120B] - _system_tokens() - REQUEST_OVERHEAD_TOKENS - cap
-    )
-    return max(int(room_tokens * CHARS_PER_TOKEN * 0.9), MIN_EVIDENCE_CHARS)
-
-
 def _completion_budget(
-    payload: str, *, query: str, evidence: list[Any]
+    payload: str,
+    *,
+    query: str,
+    evidence: list[Any],
+    system_prompt: str = SYSTEM_PROMPT,
 ) -> tuple[int, int]:
-    """Choose a centrally configured answer cap without shrinking evidence.
+    """Set an answer-output ceiling without trimming or rejecting evidence.
 
-    If the complete evidence plus the required output allowance cannot fit the
-    provider's per-key TPM reservation, fail clearly rather than deleting rows,
-    columns, notes, or passages and answering from partial context.
+    The estimate is used only to choose the answer's output allowance. The
+    complete selected evidence is always serialized and sent. This avoids the
+    old failure mode where the application rejected or removed evidence based
+    on a guessed combined-token budget. Groq remains authoritative for actual
+    request, context-window, and rolling TPM limits.
     """
     complexity = _calculation_complexity(query, evidence)
     cap_key = complexity if complexity in ANSWER_OUTPUT_TOKEN_CAPS else "normal"
-    max_tokens = ANSWER_OUTPUT_TOKEN_CAPS[cap_key]
-    input_tokens = (
-        _system_tokens() + _estimate_tokens(payload) + REQUEST_OVERHEAD_TOKENS
+    preferred_tokens = min(
+        ANSWER_OUTPUT_TOKEN_CAPS[cap_key],
+        ANSWER_MAX_OUTPUT_TOKENS,
     )
-    request_limit = MODEL_TPM_LIMITS[MODEL_120B]
-    reserved_tokens = input_tokens + max_tokens
-    if reserved_tokens > MODEL_TPM_LIMITS[MODEL_120B]:  # QP-PATCH-V2
-        _room = MODEL_TPM_LIMITS[MODEL_120B] - input_tokens
-        if _room >= MIN_ANSWER_COMPLETION_TOKENS:
-            logger.warning(
-                "answer_call_budget: completion cap lowered %d -> %d to fit TPM limit",
-                max_tokens,
-                _room,
-            )
-            max_tokens = _room
-            reserved_tokens = input_tokens + max_tokens
+    input_tokens = (
+        _estimate_tokens(system_prompt)
+        + _estimate_tokens(payload)
+        + REQUEST_OVERHEAD_TOKENS
+    )
+    provider_tpm = int(MODEL_TPM_LIMITS.get(MODEL_120B, 8000))
+    estimated_output_room = (
+        provider_tpm - input_tokens - ANSWER_TPM_SAFETY_MARGIN_TOKENS
+    )
+    # Only the answer allowance is adapted. Even when the estimate leaves very
+    # little room, preserve all evidence and let Groq return any real rejection.
+    max_tokens = min(
+        preferred_tokens,
+        max(ANSWER_MIN_OUTPUT_TOKENS, estimated_output_room),
+    )
     logger.info(
-        "answer_call_budget: complexity=%s input~%d completion_cap=%d "
-        "reserved~%d provider_tpm_limit=%d evidence_chars=%d",
+        "answer_generation_allowance: complexity=%s input_estimate~%d "
+        "preferred_completion=%d selected_completion=%d provider_tpm_reference=%d "
+        "payload_chars=%d evidence_preserved=true",
         complexity,
         input_tokens,
+        preferred_tokens,
         max_tokens,
-        reserved_tokens,
-        request_limit,
+        provider_tpm,
         len(payload),
     )
-    if reserved_tokens > request_limit:
-        logger.error(
-            "answer_evidence_too_large: input~%d + completion_cap=%d > model TPM limit=%d; "
-            "evidence preserved, no answer generated",
-            input_tokens,
-            max_tokens,
-            request_limit,
-        )
-        raise EvidenceTooLarge(
-            "The complete evidence is too large to send with a sufficient answer "
-            "budget. No evidence was removed; narrow the question or reduce the "
-            "amount of source data and try again."
-        )
     return max_tokens, input_tokens
+
 _INLINE_CITATION = re.compile(r"\s?\[\d{1,3}\]")
 
 
@@ -1006,7 +968,6 @@ def _log_evidence_debug(stage: str, items: list[dict[str, Any]]) -> None:
 def _canonical_answer_evidence(
     evidence: list[Any],
     *,
-    budget_chars: int | None = None,
     query: str = "",
 ) -> list[dict[str, Any]]:
     """Preserve every supplied evidence item, row, column and text value.
@@ -1037,18 +998,11 @@ def _canonical_answer_evidence(
         items.append(item)
 
     _log_evidence_debug("preserved_for_answer", items)
-    total_chars = _size(items)
-    if budget_chars is not None and total_chars > budget_chars:
-        logger.warning(
-            "answer_evidence_over_hint: chars=%d hint=%d; preserving complete evidence",
-            total_chars,
-            budget_chars,
-        )
     return items
 
 
 def _bound_evidence(evidence: list[Any]) -> list[dict[str, Any]]:
-    return _canonical_answer_evidence(evidence, budget_chars=_payload_char_budget())
+    return _canonical_answer_evidence(evidence)
 
 
 def _population_contract(*, evidence: list[Any]) -> dict[str, Any] | None:
@@ -1255,16 +1209,16 @@ def _payload_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _planner_requirements_for_answer(
     requirements: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
-    """Build a bounded checklist for the answer model; never assess completion."""
+    """Build a complete checklist for the answer model; never assess completion."""
     if not isinstance(requirements, list):
         return []
 
     normalized: list[dict[str, Any]] = []
-    for item in requirements[:12]:
+    for item in requirements:
         if not isinstance(item, dict):
             continue
-        requirement_id = str(item.get("id") or "").strip()[:32]
-        description = str(item.get("description") or "").strip()[:700]
+        requirement_id = str(item.get("id") or "").strip()
+        description = str(item.get("description") or "").strip()
         if not requirement_id or not description:
             continue
 
@@ -1272,8 +1226,8 @@ def _planner_requirements_for_answer(
             "id": requirement_id,
             "description": description,
         }
-        for key, limit in (("kind", 16), ("type", 24)):
-            value = str(item.get(key) or "").strip()[:limit]
+        for key in ("kind", "type"):
+            value = str(item.get(key) or "").strip()
             if value:
                 entry[key] = value
 
@@ -1283,11 +1237,11 @@ def _planner_requirements_for_answer(
                 continue
             values = list(
                 dict.fromkeys(
-                    str(value).strip()[:160]
+                    str(value).strip()
                     for value in raw_values
                     if isinstance(value, (str, int)) and str(value).strip()
                 )
-            )[:8]
+            )
             if values or key == "depends_on":
                 entry[key] = values
         normalized.append(entry)
@@ -1312,8 +1266,8 @@ def _prepare_request(
     symbol = _currency_symbol_for(evidence)
     if symbol:
         extras["presentation"] = {"currency_symbol": symbol}
-    # Keep the entire evidence payload. _completion_budget validates the full
-    # request against the provider reservation limit and fails closed if needed.
+    # Keep the entire selected evidence payload; provider-side limits are
+    # evaluated by Groq after the complete request is sent.
     items = _canonical_answer_evidence(evidence, query=query)
     has_aggregate = any(
         isinstance(i.get("content"), dict)
@@ -1578,15 +1532,19 @@ def _request_answer(
 
 
 def _retry_budget(payload: str, initial_cap: int) -> int:
-    """One larger retry, bounded by the central task cap and provider room."""
-    input_tokens = (
+    """One concise-prompt retry, still bounded by the answer-output allowance."""
+    doubled_cap = initial_cap * ANSWER_RETRY_MULTIPLIER
+    provider_tpm = int(MODEL_TPM_LIMITS.get(MODEL_120B, 8000))
+    retry_input = (
         _estimate_tokens(RETRY_SYSTEM_PROMPT)
         + _estimate_tokens(payload)
         + REQUEST_OVERHEAD_TOKENS
     )
-    provider_room = max(MODEL_TPM_LIMITS[MODEL_120B] - input_tokens, 0)
-    doubled_cap = initial_cap * ANSWER_RETRY_MULTIPLIER
-    return min(doubled_cap, ANSWER_MAX_OUTPUT_TOKENS, provider_room)
+    estimated_room = (
+        provider_tpm - retry_input - ANSWER_TPM_SAFETY_MARGIN_TOKENS
+    )
+    provider_aware_cap = max(ANSWER_MIN_OUTPUT_TOKENS, estimated_room)
+    return min(doubled_cap, ANSWER_MAX_OUTPUT_TOKENS, provider_aware_cap)
 
 
 def _partial_answer(
@@ -1608,9 +1566,10 @@ def generate_answer(
     conversation_history: list[dict[str, Any]] | None = None,
 ) -> str:
     """Generate the complete user-facing answer in one request.
-    Normal path: exactly one call. A second call happens only after
-    finish=length and only when the individual retry request has enough
-    per-call provider room.
+
+    Normal path: one call. A single larger retry is allowed after finish=length,
+    bounded by the task's configured answer-output ceiling. Provider TPM and
+    context limits are enforced by Groq, not estimated here.
     """
     payload, canon_items, contract = _prepare_request(
         query=query,
@@ -1794,34 +1753,6 @@ def _text_chunk_set(item: Any) -> tuple[Any, set[int]]:
         single = meta.get("chunk_index")
         indexes = [single] if isinstance(single, int) else []
     return doc, {i for i in indexes if isinstance(i, int)}
-
-
-def _fits_answer_budget(
-    query: str,
-    items: list[Any],
-    conversation_history: list[dict[str, Any]] | None,
-) -> bool:
-    _previous_level = logger.level  # QP-PATCH-V2: keep the evidence debug spam out
-    logger.setLevel(logging.WARNING)
-    try:
-        payload, _, _ = _prepare_request(
-            query=query, evidence=items, conversation_history=conversation_history
-        )
-    except Exception:
-        return False
-    finally:
-        logger.setLevel(_previous_level)
-    complexity = _calculation_complexity(query, items)
-    cap_key = complexity if complexity in ANSWER_OUTPUT_TOKEN_CAPS else "normal"
-    reserved = (
-        _system_tokens()
-        + _estimate_tokens(payload)
-        + REQUEST_OVERHEAD_TOKENS
-        # QP-FIX-8: use the SAME minimum completion room that _completion_budget
-        # accepts, so the trimmer and the final check cannot disagree.
-        + min(ANSWER_OUTPUT_TOKEN_CAPS[cap_key], MIN_ANSWER_COMPLETION_TOKENS)
-    )
-    return reserved <= MODEL_TPM_LIMITS[MODEL_120B]
 
 
 _SPREADSHEET_TITLE = re.compile(r"\.(xlsx|xlsm|xls|csv|tsv)$", re.IGNORECASE)  # QP-PATCH-V2
@@ -2018,146 +1949,9 @@ def fit_evidence_to_budget(
     evidence: list[Any],
     conversation_history: list[dict[str, Any]] | None = None,
 ) -> list[Any]:
-    """Shrink evidence just enough to fit; returns the ORIGINAL list if it cannot.
-
-    Stage 1: drop text passages whose chunks are fully contained in another
-             passage of the same document (pure duplicates, nothing lost).
-    Stage 2: drop NOT_FOUND evidence notes (they only say "key not in doc X").
-    Stage 3: drop the lowest-scored text passages, always keeping at least one
-             passage per document. Tables and aggregates are never touched.
-    """
-    items = list(evidence)
-    if _fits_answer_budget(query, items, conversation_history):
-        return evidence
-
-    # Stage 1 - exact containment duplicates
-    order = sorted(
-        (i for i, it in enumerate(items) if _text_chunk_set(it)[1]),
-        key=lambda i: -len(_text_chunk_set(items[i])[1]),
-    )
-    covered: dict[Any, set[int]] = {}
-    drop: set[int] = set()
-    for i in order:
-        doc, chunks = _text_chunk_set(items[i])
-        if chunks and chunks <= covered.get(doc, set()):
-            drop.add(i)
-        else:
-            covered.setdefault(doc, set()).update(chunks)
-    items = [it for i, it in enumerate(items) if i not in drop]
-    if drop:
-        logger.warning("fit_evidence_to_budget: dropped %d duplicate passage(s)", len(drop))
-    if _fits_answer_budget(query, items, conversation_history):
-        return items
-
-    # Stage 1b - narrow big spreadsheet tables to the rows the question names
-    items, narrowed = _narrow_spreadsheet_tables_v3(items, query)  # QP-PATCH-V3
-    if narrowed:
-        logger.warning(
-            "fit_evidence_to_budget: narrowed %d spreadsheet table(s) to named rows",
-            narrowed,
-        )
-        if _fits_answer_budget(query, items, conversation_history):
-            return items
-
-    # Stage 2 - NOT_FOUND evidence notes
-    kept = [
-        it
-        for it in items
-        if not (
-            isinstance(it, dict)
-            and it.get("source_type") == "evidence_note"
-            and str(it.get("result_status") or "").upper() == "NOT_FOUND"
-        )
-    ]
-    removed_notes = len(items) - len(kept)
-    items = kept
-    note = {
-        "source_type": "evidence_note",
-        "result_status": "SUCCESS",
-        "content": _FIT_OMISSION_NOTE,
-    }
-    if removed_notes:
-        logger.warning("fit_evidence_to_budget: dropped %d NOT_FOUND note(s)", removed_notes)
-    if removed_notes and _fits_answer_budget(query, items + [note], conversation_history):
-        return items + [note]
-
-    # Stage 3 - lowest-scored passages first, keep >= 1 per document.
-    # QP-FIX-5: a passage tagged protect_from_trim (it was found through facts
-    # read from the table rows, so it holds a rule that applies to those rows)
-    # is never dropped here. If everything else is gone and the evidence still
-    # does not fit, we fall through to the explicit "evidence too large" path
-    # instead of silently answering without the rule.
-    per_doc: dict[Any, int] = {}
-    for it in items:
-        doc, chunks = _text_chunk_set(it)
-        if chunks:
-            per_doc[doc] = per_doc.get(doc, 0) + 1
-    protected_count = sum(
-        1 for it in items if _text_chunk_set(it)[1] and _is_trim_protected(it)
-    )
-    candidates = sorted(
-        (
-            i
-            for i, it in enumerate(items)
-            if _text_chunk_set(it)[1] and not _is_trim_protected(it)
-        ),
-        key=lambda i: (float(items[i].get("score") or 0.0), -i),
-    )
-    removed: set[int] = set()
-    for i in candidates:
-        doc, _ = _text_chunk_set(items[i])
-        if per_doc.get(doc, 0) <= 1:
-            continue
-        removed.add(i)
-        per_doc[doc] -= 1
-        trial = [it for j, it in enumerate(items) if j not in removed] + [note]
-        if _fits_answer_budget(query, trial, conversation_history):
-            logger.warning(
-                "fit_evidence_to_budget: dropped %d low-ranked passage(s) to fit "
-                "(protected passages kept: %d)",
-                len(removed),
-                protected_count,
-            )
-            for j in sorted(removed):  # QP-FIX-5: say exactly what was dropped
-                logger.warning(
-                    "fit_evidence_to_budget: DROPPED %s", _describe_passage(items[j])
-                )
-            for j, it in enumerate(items):
-                if j not in removed and _text_chunk_set(it)[1]:
-                    logger.warning(
-                        "fit_evidence_to_budget: KEPT %s", _describe_passage(it)
-                    )
-            return trial
-    logger.error(
-        "fit_evidence_to_budget: no more unprotected passages to drop "
-        "(protected passages: %d)",
-        protected_count,
-    )
-
-    _largest = sorted(
-        (
-            (
-                _size(it),
-                str(it.get("source_type") if isinstance(it, dict) else type(it).__name__),
-                str(
-                    (it.get("content") or {}).get("document_title")
-                    or (it.get("content") or {}).get("document")
-                    or it.get("document_name")
-                    or ""
-                )
-                if isinstance(it, dict) and isinstance(it.get("content", {}), dict)
-                else "",
-                len((it.get("content") or {}).get("rows") or [])
-                if isinstance(it, dict) and isinstance(it.get("content", {}), dict)
-                else 0,
-            )
-            for it in evidence
-        ),
-        reverse=True,
-    )[:5]
-    logger.error(
-        "fit_evidence_to_budget: could not fit evidence; keeping original. "
-        "Largest items (chars, type, document, rows): %s",
-        _largest,
+    """Compatibility no-op: never remove retrieved evidence to fit an estimate."""
+    logger.info(
+        "answer_evidence_preserved: items=%d; provider enforces actual request limits",
+        len(evidence),
     )
     return evidence

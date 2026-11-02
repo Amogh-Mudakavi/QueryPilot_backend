@@ -13,53 +13,15 @@ from retrieval.services.hybrid_retriever import (
 _retriever = HybridRetriever()
 logger = logging.getLogger(__name__)
 
-MAX_EVIDENCE_ITEMS = 8
-MAX_CHARS_PER_EVIDENCE = 6000
-MAX_TOTAL_EVIDENCE_CHARS = 24000
-
-
 def _bound_evidence(
     evidence: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    """Copy the retrieved evidence without count or character truncation.
+
+    The retriever already applies relevance ranking and top-k selection. This
+    adapter must not silently shorten passage bodies or drop returned hits.
     """
-    Bound retrieved evidence before it enters AgentState.
-
-    Metadata is preserved. Only the content body is truncated.
-    """
-
-    bounded: list[dict[str, Any]] = []
-    total_chars = 0
-
-    for item in evidence[:MAX_EVIDENCE_ITEMS]:
-        if not isinstance(item, dict):
-            continue
-
-        bounded_item = dict(item)
-
-        content = str(
-            bounded_item.get(
-                "content",
-                "",
-            )
-        )
-
-        remaining = MAX_TOTAL_EVIDENCE_CHARS - total_chars
-
-        if remaining <= 0:
-            break
-
-        content_limit = min(
-            MAX_CHARS_PER_EVIDENCE,
-            remaining,
-        )
-
-        bounded_item["content"] = content[:content_limit]
-
-        total_chars += len(bounded_item["content"])
-
-        bounded.append(bounded_item)
-
-    return bounded
+    return [dict(item) for item in evidence if isinstance(item, dict)]
 
 
 def _error_result(
@@ -84,7 +46,7 @@ def search_evidence(
     allowed_document_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     """
-    Retrieve bounded text evidence from workspace documents.
+    Retrieve ranked text evidence from workspace documents without content truncation.
 
     This tool is deliberately text-only. Table metadata is handled by
     the table/evidence inspection path and should not compete with

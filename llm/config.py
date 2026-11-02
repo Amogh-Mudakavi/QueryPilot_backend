@@ -47,8 +47,8 @@ MODEL_QWEN_27B = "qwen/qwen3.8-27b"
 # One source of truth for task completion ceilings. Reasoning tokens are
 # included in max_tokens, so these caps leave room for reasoning and output.
 PLANNER_MAX_COMPLETION_TOKENS = 3400
-TABLE_SELECTION_MAX_COMPLETION_TOKENS = 900
-SQL_GENERATION_MAX_COMPLETION_TOKENS = 1800
+TABLE_SELECTION_MAX_COMPLETION_TOKENS = 2200
+SQL_GENERATION_MAX_COMPLETION_TOKENS = 2600
 ANSWER_OUTPUT_TOKEN_CAPS = {
     "normal": 2000,
     "arithmetic": 2600,
@@ -56,6 +56,10 @@ ANSWER_OUTPUT_TOKEN_CAPS = {
 }
 # Maximum task ceiling also bounds the single retry after a length finish.
 ANSWER_MAX_OUTPUT_TOKENS = 4000
+# Answer output alone may be reduced to leave headroom for the provider's
+# per-minute request accounting. Evidence is never reduced to satisfy this.
+ANSWER_MIN_OUTPUT_TOKENS = 256
+ANSWER_TPM_SAFETY_MARGIN_TOKENS = 256
 ANSWER_RETRY_MULTIPLIER = 2
 
 REQUEST_TIMEOUT = 20.0
@@ -105,8 +109,8 @@ TASK_PROFILES: dict[str, TaskProfile] = {
         reasoning_effort="low",
         input_hint=3000,
     ),
-    # Keep the existing specialized table-selection model and its own rotating
-    # key pool; it is not allowed to spill into the dedicated 120B lanes.
+    # Table selection shares the structured-data lane with SQL generation.
+    # Its model fallback stays on this same key.
     "table_selection": TaskProfile(
         MODEL_QWEN_27B,
         max_tokens=TABLE_SELECTION_MAX_COMPLETION_TOKENS,
@@ -123,11 +127,18 @@ TASK_PROFILES: dict[str, TaskProfile] = {
 }
 
 # Zero-based indices into GROQ_API_KEYS (GROQ_API_KEY_1 is index 0).
-# These assignments apply only to the corresponding 120B work. Calls without
-# an assignment use the model's round-robin key pool.
+# Every configured task is pinned to exactly one independent API key.
+# Model fallback retains the same task assignment and never borrows another key.
 TASK_API_KEY_INDEX: dict[str, int] = {
+    # Key 1: planning and scope/control tasks.
     "planner": 0,
+    "scope_guard": 0,
+    "chitchat": 0,
+    "title": 0,
+    # Key 2: structured-data discovery and SQL.
+    "table_selection": 1,
     "sql_generation": 1,
+    # Key 3: user-facing answer generation.
     "answer_generation": 2,
 }
 
@@ -140,22 +151,29 @@ if any(index < 0 or index >= len(GROQ_API_KEYS) for index in TASK_API_KEY_INDEX.
 
 TASK_MODELS = {name: profile.model for name, profile in TASK_PROFILES.items()}
 
-# Cross-model fallback is intentionally disabled for the dedicated 120B task
-# lanes. Table selection may fall back to the rotating 20B pool; it may never
-# consume a planner, SQL, or answer-generation 120B key lane.
+if set(TASK_API_KEY_INDEX) != set(TASK_PROFILES):
+    missing = sorted(set(TASK_PROFILES) - set(TASK_API_KEY_INDEX))
+    unknown = sorted(set(TASK_API_KEY_INDEX) - set(TASK_PROFILES))
+    raise ValueError(
+        f"Every LLM task must have exactly one assigned Groq key; missing={missing}, unknown={unknown}."
+    )
+
+# Table-selection fallback may change the model, but the provider keeps the
+# table_selection task pinned to key 2. No fallback changes API-key identity.
 TASK_FALLBACK_MODELS: dict[str, tuple[str, ...]] = {
     "table_selection": (MODEL_20B,),
 }
 
 MAX_ATTEMPTS = 3
 RETRY_LIMITS = {
-    # Unpinned calls may rotate to another key. Dedicated lanes retry only on
-    # their assigned key and fail closed rather than borrowing another lane.
-    "rate_limit": 2,
-    "authentication": 2,
+    # A 429 or authentication failure is surfaced immediately. Never switch
+    # independent accounts or wait on an application-maintained quota estimate.
+    # Transient failures may retry on the same task-assigned key only.
+    "rate_limit": 0,
+    "authentication": 0,
     "timeout": 1,
-    "connection": 2,
-    "provider_5xx": 2,
+    "connection": 1,
+    "provider_5xx": 1,
 }
 
 RETRY_BACKOFF_SECONDS = 1.0

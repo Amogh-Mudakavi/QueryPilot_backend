@@ -69,19 +69,18 @@ logger = logging.getLogger(__name__)
 
 MAX_PROFILE_CHARS = 120
 MAX_SAMPLE_CELL_CHARS = 40
-MAX_COLUMNS_SHOWN = 18
+MAX_COLUMNS_SHOWN = None
 
-# A small table (rules, rates, parameters, lookups) is only described by its
-# rows, so it gets several; a large table is described by its columns and one
-# representative row. A total character budget keeps the prompt small.
+# Samples help disambiguate schemas; the complete column list remains available.
+# They are metadata examples, not evidence sent to the answer generator.
 SMALL_TABLE_ROWS = 12
 MAX_SAMPLE_ROWS_SMALL = 5
-MAX_SAMPLE_ROWS_LARGE = 1
+MAX_SAMPLE_ROWS_LARGE = 3
 MAX_SAMPLE_CHARS_TOTAL = 3500
 
-MAX_COMPUTED_FIELDS = 8
-MAX_FALLBACK_TABLES_PER_DOCUMENT = 2
-MAX_FALLBACK_TABLES = 8
+MAX_COMPUTED_FIELDS = None
+MAX_FALLBACK_TABLES_PER_DOCUMENT = None
+MAX_FALLBACK_TABLES = None
 
 ROLES = ("output", "filter", "input", "rule", "key")
 _CALCULATION_ROLES = {"input", "rule"}
@@ -241,7 +240,7 @@ def _fallback_table_selection(
     operation = str(understanding.get("operation") or "").strip().lower()
     computed_values = list(dict.fromkeys((computed or []) + fields_without_matching_column(
         _requested_fields(understanding), candidates
-    )))[:MAX_COMPUTED_FIELDS]
+    )))
 
     scored_by_document: dict[
         int | None, list[tuple[float, int, set[str], dict[str, Any]]]
@@ -304,8 +303,6 @@ def _fallback_table_selection(
             if name in chosen:
                 covered |= matched
                 continue
-            if selected_for_doc >= MAX_FALLBACK_TABLES_PER_DOCUMENT:
-                break
             if selected_for_doc and not (matched - covered):
                 continue
             top_score = eligible[0][0]
@@ -314,37 +311,6 @@ def _fallback_table_selection(
             chosen.add(name)
             covered |= matched
             selected_for_doc += 1
-
-    if len(chosen) > MAX_FALLBACK_TABLES:
-        # Preserve cross-document coverage under the global cap: admit each
-        # document's strongest match before a second table from any document.
-        forced_order = sorted(forced_names)
-        ranked_by_document: list[list[str]] = []
-        for _, ranked in sorted(
-            scored_by_document.items(),
-            key=lambda pair: max((part[0] for part in pair[1]), default=0.0),
-            reverse=True,
-        ):
-            names_for_document = [
-                str(part[3].get("table_name"))
-                for part in sorted(ranked, key=lambda part: part[0], reverse=True)
-                if str(part[3].get("table_name")) in chosen
-                and str(part[3].get("table_name")) not in forced_names
-            ]
-            if names_for_document:
-                ranked_by_document.append(names_for_document)
-        ranked_names: list[str] = []
-        max_rank = max((len(names) for names in ranked_by_document), default=0)
-        for rank in range(max_rank):
-            ranked_names.extend(
-                names[rank]
-                for names in ranked_by_document
-                if rank < len(names)
-            )
-        chosen = set(
-            forced_order
-            + ranked_names[: max(0, MAX_FALLBACK_TABLES - len(forced_order))]
-        )
 
     for name in chosen:
         item = allowed[name]
@@ -430,8 +396,8 @@ def fields_without_matching_column(
             continue
         if any(c <= field_tokens or field_tokens <= c for c in column_tokens):
             continue
-        missing.append(field[:80])
-    return missing[:MAX_COMPUTED_FIELDS]
+        missing.append(field)
+    return missing
 
 
 def _sample_rows_for(table: dict[str, Any], budget_left: int) -> tuple[list, int]:
@@ -472,12 +438,10 @@ def build_selection_payload(
             budget_left = max(budget_left - used, 0)
             entry: dict[str, Any] = {
                 "table_name": t.get("table_name"),
-                "columns": columns[:MAX_COLUMNS_SHOWN],
+                "columns": columns,
                 "row_count": t.get("row_count"),
                 "sample_rows": samples,
             }
-            if len(columns) > MAX_COLUMNS_SHOWN:
-                entry["total_columns"] = len(columns)
             table_payload.append(entry)
         documents_payload.append(
             {
@@ -493,36 +457,36 @@ def build_selection_payload(
     compact_requirements: list[dict[str, Any]] = []
     requirements = understanding.get("requirements") or []
     if isinstance(requirements, list):
-        for requirement in requirements[:8]:
+        for requirement in requirements:
             if not isinstance(requirement, dict):
                 continue
             compact_requirements.append({
                 "kind": str(requirement.get("kind") or "either")[:12],
                 "type": str(requirement.get("type") or "other")[:16],
-                "description": str(requirement.get("description") or "")[:180],
+                "description": str(requirement.get("description") or ""),
                 "queries": [
-                    str(value)[:160]
-                    for value in (requirement.get("queries") or [])[:2]
+                    str(value)
+                    for value in (requirement.get("queries") or [])
                     if str(value or "").strip()
                 ],
                 "entities": [
-                    str(value)[:100]
-                    for value in (requirement.get("entities") or [])[:3]
+                    str(value)
+                    for value in (requirement.get("entities") or [])
                     if str(value or "").strip()
                 ],
             })
 
     raw_references = understanding.get("references") or []
     compact_references = [
-        str(value)[:120]
-        for value in raw_references[:8]
+        str(value)
+        for value in raw_references
         if str(value or "").strip()
     ] if isinstance(raw_references, (list, tuple)) else []
 
     payload: dict[str, Any] = {
-        "question": query[:1200],
+        "question": query,
         "operation": understanding.get("operation"),
-        "requested_fields": _requested_fields(understanding)[:20],
+        "requested_fields": _requested_fields(understanding),
         "requirements": compact_requirements,
         "references": compact_references,
         "documents": documents_payload,

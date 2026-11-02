@@ -1,26 +1,11 @@
-"""
-planner/services/document_coverage.py
+"""Question-agnostic evidence assembly for authorized resolved documents.
 
-Question-agnostic evidence assembly for requests that span 2+ documents.
+The caller supplies the already-authorized document IDs. This module loads all
+available chunks for those documents and emits them in reading order. Segment
+size groups chunks for serialization only; it does not truncate evidence.
 
-Instead of "top-k of my query per document", the rule is:
-
-  1. Load the document's chunks (they are not ranked, just read).
-  2. If everything fits in the context budget, send EVERYTHING, in reading
-     order. Nothing can be missed, so "why was Q1 better than Q2?" works
-     without the question sharing words with the answer.
-  3. If it does not fit, split the budget fairly between documents (a small
-     document never starves a big one, and a big one never crowds out a
-     small one), then fill each document's share with the most relevant
-     chunks (BM25 over several query variants, boosted by the normal
-     hybrid retrieval when available), their neighbours, and the opening
-     chunk, and put them back into reading order.
-  4. Tell the answer model exactly what it was given (full vs selected),
-     so it says "not found in the provided passages" instead of guessing.
-
-Nothing here depends on file format, entity names, IDs or the question.
-Pure functions plus injected loaders, so it is unit-testable without
-Django, Chroma or an LLM.
+Pure functions plus injected loaders keep the selection/packing logic
+independent of Django, Chroma, and LLM provider behavior.
 """
 
 from __future__ import annotations
@@ -34,10 +19,7 @@ from retrieval.services.bm25 import BM25Retriever
 logger = logging.getLogger(__name__)
 
 
-DOCUMENT_CONTEXT_CHAR_BUDGET = 48_000
-
 SEGMENT_CHAR_LIMIT = 8_000
-MAX_QUERIES = 6
 NEIGHBOUR_SEEDS = 3
 
 
@@ -48,11 +30,27 @@ def build_queries(question: str, understanding: dict[str, Any] | None) -> list[s
     fields = [str(x) for x in understanding.get("requested_fields", []) or []]
     refs = [str(x) for x in understanding.get("references", []) or []]
     operation = str(understanding.get("operation") or "")
+    requirements = understanding.get("requirements") or []
 
     if fields:
         parts.append(" ".join([operation, *fields]).strip())
     parts.extend(fields)
     parts.extend(refs)
+    if isinstance(requirements, list):
+        for requirement in requirements:
+            if not isinstance(requirement, dict):
+                continue
+            description = str(requirement.get("description") or "").strip()
+            if description:
+                parts.append(description)
+            for query in requirement.get("queries") or []:
+                value = str(query or "").strip()
+                if value:
+                    parts.append(value)
+            for entity in requirement.get("entities") or []:
+                value = str(entity or "").strip()
+                if value:
+                    parts.append(value)
 
     seen: set[str] = set()
     queries: list[str] = []
@@ -61,7 +59,7 @@ def build_queries(question: str, understanding: dict[str, Any] | None) -> list[s
         if key and key not in seen:
             seen.add(key)
             queries.append(part)
-    return queries[:MAX_QUERIES]
+    return queries
 
 
 def allocate_budget(sizes: dict[int, int], total_budget: int) -> dict[int, int]:
@@ -207,7 +205,7 @@ def build_document_evidence(
     titles: dict[int, str],
     fetch_chunks: Callable[..., dict[str, Any]],
     boost_lookup: Callable[[int], tuple[set[int], bool]] | None = None,
-    budget: int = DOCUMENT_CONTEXT_CHAR_BUDGET,
+    budget: int | None = None,
     segment_char_limit: int = SEGMENT_CHAR_LIMIT,
     require_complete: bool = False,
 ) -> dict[str, Any] | None:
@@ -231,7 +229,11 @@ def build_document_evidence(
             by_doc[chunk["document_id"]].append(chunk)
 
     sizes = {d: sum(len(c["content"]) for c in cs) for d, cs in by_doc.items() if cs}
-    allocation = allocate_budget(sizes, budget)
+    allocation = (
+        {document_id: size for document_id, size in sizes.items()}
+        if budget is None
+        else allocate_budget(sizes, budget)
+    )
     queries = build_queries(question, understanding)
 
     evidence: list[dict[str, Any]] = []
@@ -253,7 +255,7 @@ def build_document_evidence(
             )
             continue
 
-        full = allocation[doc_id] >= sizes[doc_id]
+        full = budget is None or allocation[doc_id] >= sizes[doc_id]
         boosted: set[int] = set()
         if not full and boost_lookup is not None:
             try:
@@ -328,8 +330,8 @@ def build_document_evidence(
         )
 
     # `complete` = every document with text is fully included. It describes the
-    # evidence handed to answer generation (budgets are already answer-sized),
-    # and is independent of `degraded` (dense retrieval unavailable).
+    # evidence handed to answer generation and is independent of `degraded`
+    # (dense retrieval unavailable).
     complete = bool(with_text) and all(c["mode"] == "full" for c in with_text)
     logger.info(
         "document coverage: %s degraded=%s complete=%s require_complete=%s",
