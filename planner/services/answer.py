@@ -14,14 +14,10 @@ from typing import Any
 
 from llm.config import (
     ANSWER_MAX_OUTPUT_TOKENS,
-    ANSWER_MIN_OUTPUT_TOKENS,
     ANSWER_OUTPUT_TOKEN_CAPS,
-    ANSWER_TPM_SAFETY_MARGIN_TOKENS,
     ANSWER_RETRY_MULTIPLIER,
     CHARS_PER_TOKEN_ESTIMATE,
     MESSAGE_OVERHEAD_TOKENS,
-    MODEL_120B,
-    MODEL_TPM_LIMITS,
 )
 from llm.router import router
 from planner.prompts.answer_prompts import SYSTEM_PROMPT as BASE_SYSTEM_PROMPT
@@ -115,44 +111,30 @@ def _completion_budget(
     evidence: list[Any],
     system_prompt: str = SYSTEM_PROMPT,
 ) -> tuple[int, int]:
-    """Set an answer-output ceiling without trimming or rejecting evidence.
+    """Answer-output ceiling. NOT lowered from a local token estimate.
 
-    The estimate is used only to choose the answer's output allowance. The
-    complete selected evidence is always serialized and sent. This avoids the
-    old failure mode where the application rejected or removed evidence based
-    on a guessed combined-token budget. Groq remains authoritative for actual
-    request, context-window, and rolling TPM limits.
+    The old estimate once left 310 tokens, which a reasoning model spent
+    entirely on reasoning. If Groq rejects input + max_tokens as over the TPM
+    limit, the provider lowers it by Groq's own reported excess instead.
     """
     complexity = _calculation_complexity(query, evidence)
     cap_key = complexity if complexity in ANSWER_OUTPUT_TOKEN_CAPS else "normal"
-    preferred_tokens = min(
+    max_tokens = min(
         ANSWER_OUTPUT_TOKEN_CAPS[cap_key],
         ANSWER_MAX_OUTPUT_TOKENS,
     )
+    # Logging only; never used to reduce the completion allowance.
     input_tokens = (
         _estimate_tokens(system_prompt)
         + _estimate_tokens(payload)
         + REQUEST_OVERHEAD_TOKENS
     )
-    provider_tpm = int(MODEL_TPM_LIMITS.get(MODEL_120B, 8000))
-    estimated_output_room = (
-        provider_tpm - input_tokens - ANSWER_TPM_SAFETY_MARGIN_TOKENS
-    )
-    # Only the answer allowance is adapted. Even when the estimate leaves very
-    # little room, preserve all evidence and let Groq return any real rejection.
-    max_tokens = min(
-        preferred_tokens,
-        max(ANSWER_MIN_OUTPUT_TOKENS, estimated_output_room),
-    )
     logger.info(
         "answer_generation_allowance: complexity=%s input_estimate~%d "
-        "preferred_completion=%d selected_completion=%d provider_tpm_reference=%d "
-        "payload_chars=%d evidence_preserved=true",
+        "completion=%d payload_chars=%d evidence_preserved=true",
         complexity,
         input_tokens,
-        preferred_tokens,
         max_tokens,
-        provider_tpm,
         len(payload),
     )
     return max_tokens, input_tokens
@@ -1532,19 +1514,8 @@ def _request_answer(
 
 
 def _retry_budget(payload: str, initial_cap: int) -> int:
-    """One concise-prompt retry, still bounded by the answer-output allowance."""
-    doubled_cap = initial_cap * ANSWER_RETRY_MULTIPLIER
-    provider_tpm = int(MODEL_TPM_LIMITS.get(MODEL_120B, 8000))
-    retry_input = (
-        _estimate_tokens(RETRY_SYSTEM_PROMPT)
-        + _estimate_tokens(payload)
-        + REQUEST_OVERHEAD_TOKENS
-    )
-    estimated_room = (
-        provider_tpm - retry_input - ANSWER_TPM_SAFETY_MARGIN_TOKENS
-    )
-    provider_aware_cap = max(ANSWER_MIN_OUTPUT_TOKENS, estimated_room)
-    return min(doubled_cap, ANSWER_MAX_OUTPUT_TOKENS, provider_aware_cap)
+    """One retry with a larger allowance, bounded by the task ceiling."""
+    return min(initial_cap * ANSWER_RETRY_MULTIPLIER, ANSWER_MAX_OUTPUT_TOKENS)
 
 
 def _partial_answer(
@@ -1715,6 +1686,34 @@ def generate_answer_stream(
         if isinstance(delta, str) and delta:
             yielded_any = True
             yield delta
+    if not yielded_any and finish_seen and finish_seen[0] == "length":
+        # Reasoning consumed the whole allowance before any text was written.
+        # Nothing reached the user, so retry once with a larger allowance.
+        retry_cap = min(max_tokens * ANSWER_RETRY_MULTIPLIER, ANSWER_MAX_OUTPUT_TOKENS)
+        if retry_cap > max_tokens:
+            logger.warning(
+                "answer_stream_retry: empty output at completion=%d; retrying "
+                "once with completion=%d",
+                max_tokens,
+                retry_cap,
+            )
+            finish_seen.clear()
+            for delta in router.generate_stream(
+                task="answer_generation",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": payload},
+                ],
+                temperature=0.0,
+                max_tokens=retry_cap,
+                include_reasoning=False,
+                on_finish=finish_seen.append,
+                **options,
+            ):
+                if isinstance(delta, str) and delta:
+                    yielded_any = True
+                    yield delta
+            max_tokens = retry_cap
     if not yielded_any:
         raise ValueError("Answer LLM returned an empty streaming response.")
     finish_reason = finish_seen[0] if finish_seen else None

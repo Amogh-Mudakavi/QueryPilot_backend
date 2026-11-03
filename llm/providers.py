@@ -28,11 +28,13 @@ from .config import (
     CHARS_PER_TOKEN_ESTIMATE,
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_TPM_LIMIT,
+    FIT_MARGIN_TOKENS,
     GROQ_API_KEYS,
     MAX_ADMISSION_WAIT_SECONDS,
     MAX_ATTEMPTS,
     MAX_COOLDOWN_SECONDS,
     MESSAGE_OVERHEAD_TOKENS,
+    MIN_USEFUL_COMPLETION_TOKENS,
     MODEL_TPM_LIMITS,
     REQUEST_TIMEOUT,
     RETRY_BACKOFF_SECONDS,
@@ -473,7 +475,10 @@ class GroqProvider:
 
         stream=False returns the Groq completion. stream=True returns a live
         iterator of Groq chunks (see module docstring for retry semantics).
-        `max_tokens` is used exactly as given; this layer never lowers it.
+        `max_tokens` is used exactly as given, with one exception: if Groq
+        itself rejects the request because input + max_tokens exceeds the
+        limit, it is lowered once by the excess Groq reports (never by a local
+        estimate), provided a usable completion remains.
         """
         estimated_input = _estimate_input_tokens(messages)
         # Prompt estimates are observability only. Groq is the authority for
@@ -504,6 +509,7 @@ class GroqProvider:
             kwargs["stream"] = True
 
         retries: dict[str, int] = {}
+        shrunk = False
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
@@ -556,6 +562,32 @@ class GroqProvider:
                     raise InvalidResponseError("Groq returned no choices.")
             except Exception as exc:
                 self.scheduler.release(lease)
+                # Provider-guided fit: Groq counts input + max_tokens against
+                # the TPM limit and reports "Limit L, Requested R". Lower
+                # max_tokens by exactly R - L (once) instead of failing.
+                if not shrunk and _classify(exc) == "request_too_large":
+                    found = _parse_rate_limit_details(_exception_text(exc))
+                    if "limit" in found and "requested" in found:
+                        fitted = (
+                            kwargs["max_tokens"]
+                            - (found["requested"] - found["limit"])
+                            - FIT_MARGIN_TOKENS
+                        )
+                        if MIN_USEFUL_COMPLETION_TOKENS <= fitted < kwargs["max_tokens"]:
+                            logger.warning(
+                                "[LLM_FIT] task=%s model=%s max_tokens %s -> %s "
+                                "(provider limit=%s requested=%s)",
+                                task,
+                                model,
+                                kwargs["max_tokens"],
+                                fitted,
+                                found["limit"],
+                                found["requested"],
+                            )
+                            kwargs["max_tokens"] = fitted
+                            max_tokens = fitted
+                            shrunk = True
+                            continue
                 delay = self._after_failure(
                     exc=exc,
                     task=task,

@@ -56,11 +56,17 @@ ANSWER_OUTPUT_TOKEN_CAPS = {
 }
 # Maximum task ceiling also bounds the single retry after a length finish.
 ANSWER_MAX_OUTPUT_TOKENS = 4000
-# Answer output alone may be reduced to leave headroom for the provider's
-# per-minute request accounting. Evidence is never reduced to satisfy this.
+# Deprecated: the application no longer estimates TPM headroom, so these two
+# are no longer used by answer.py. Kept only so stray imports do not break.
 ANSWER_MIN_OUTPUT_TOKENS = 256
 ANSWER_TPM_SAFETY_MARGIN_TOKENS = 256
 ANSWER_RETRY_MULTIPLIER = 2
+# Provider-guided fitting: when Groq rejects a request because input +
+# max_tokens exceeds the TPM limit, the provider lowers max_tokens by exactly
+# the excess Groq reports (plus this margin), but only if what is left is still
+# a usable completion for a reasoning model. Otherwise the error is raised.
+MIN_USEFUL_COMPLETION_TOKENS = 1500
+FIT_MARGIN_TOKENS = 50
 
 REQUEST_TIMEOUT = 20.0
 DEFAULT_TEMPERATURE = 0.0
