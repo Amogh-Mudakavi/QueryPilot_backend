@@ -3,6 +3,8 @@
 # ============================================================
 FROM python:3.12-slim-bookworm AS builder
 
+ARG EMBEDDING_MODEL=mixedbread-ai/mxbai-embed-large-v1
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -10,7 +12,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HOME=/home/querypilot/.cache/huggingface \
     HF_HUB_DISABLE_PROGRESS_BARS=1 \
     TRANSFORMERS_VERBOSITY=error \
-    TOKENIZERS_PARALLELISM=false
+    TOKENIZERS_PARALLELISM=false \
+    EMBEDDING_MODEL=${EMBEDDING_MODEL} \
+    EMBEDDING_MODEL_PATH=/opt/models/mxbai-embed-large-v1
 
 WORKDIR /build
 
@@ -26,7 +30,7 @@ COPY requirements.txt .
 
 RUN python -m pip install --upgrade pip
 
-# Install CPU-only PyTorch.
+# Install CPU-only PyTorch (only needed because sentence-transformers imports it).
 RUN python -m pip install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cpu \
     torch==2.12.0
@@ -39,13 +43,21 @@ RUN python -m pip check && \
     python -c "import torch; print('PyTorch:', torch.__version__); print('CUDA:', torch.version.cuda); assert torch.version.cuda is None"
 
 # ------------------------------------------------------------
-# Download and verify the embedding model during image build.
+# Download the embedding model as a plain folder, ONNX only:
+# config files, tokenizer and the one quantized ONNX file.
+# No PyTorch weights are downloaded.
 # ------------------------------------------------------------
+RUN python -c "import os; from huggingface_hub import snapshot_download; snapshot_download(repo_id=os.environ['EMBEDDING_MODEL'], local_dir=os.environ['EMBEDDING_MODEL_PATH'], allow_patterns=['*.json', '*.txt', 'onnx/model_quantized.onnx'])" && \
+    rm -rf "${EMBEDDING_MODEL_PATH}/.cache" && \
+    test -f "${EMBEDDING_MODEL_PATH}/onnx/model_quantized.onnx" && \
+    ls -laR "${EMBEDDING_MODEL_PATH}"
 
-ARG EMBEDDING_MODEL=mixedbread-ai/mxbai-embed-large-v1
-
-RUN mkdir -p "${HF_HOME}" && \
-    python -c "from sentence_transformers import SentenceTransformer; model = SentenceTransformer('${EMBEDDING_MODEL}', device='cpu'); vectors = model.encode(['QueryPilot build-time model verification']); assert len(vectors) == 1; print('Embedding model downloaded and verified: ${EMBEDDING_MODEL}')"
+# ------------------------------------------------------------
+# Verify the model loads from that folder with Hugging Face
+# offline, using the same ONNX settings as production.
+# The build fails here if anything is missing or needs the network.
+# ------------------------------------------------------------
+RUN HF_HUB_OFFLINE=1 python -c "import os, onnxruntime as ort; from sentence_transformers import SentenceTransformer; m = SentenceTransformer(os.environ['EMBEDDING_MODEL_PATH'], backend='onnx', model_kwargs={'file_name': 'onnx/model_quantized.onnx', 'provider': 'CPUExecutionProvider', 'session_options': ort.SessionOptions()}, local_files_only=True, trust_remote_code=False); v = m.encode(['QueryPilot build-time offline verification'], normalize_embeddings=True); assert v.shape == (1, 1024), v.shape; print('Offline ONNX load OK', v.shape)"
 
 
 # ============================================================
@@ -61,7 +73,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HUB_DISABLE_PROGRESS_BARS=1 \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_VERBOSITY=error \
-    TOKENIZERS_PARALLELISM=false
+    TOKENIZERS_PARALLELISM=false \
+    EMBEDDING_MODEL_PATH=/opt/models/mxbai-embed-large-v1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -78,10 +91,10 @@ WORKDIR /app
 # Copy installed Python dependencies.
 COPY --from=builder /usr/local /usr/local
 
-# Copy the model cache downloaded during the build.
+# Copy the verified ONNX model folder.
 COPY --from=builder --chown=querypilot:querypilot \
-    /home/querypilot/.cache/huggingface \
-    /home/querypilot/.cache/huggingface
+    /opt/models/mxbai-embed-large-v1 \
+    /opt/models/mxbai-embed-large-v1
 
 # Copy application source.
 COPY --chown=querypilot:querypilot . .

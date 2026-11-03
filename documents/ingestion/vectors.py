@@ -30,6 +30,10 @@ MAX_TABLE_NAME_CHARS = 200
 
 EMBEDDING_MODEL = "mixedbread-ai/mxbai-embed-large-v1"
 
+# When set (the Docker image sets it), the embedding model is loaded only
+# from this local folder. No Hugging Face network access is attempted.
+EMBEDDING_MODEL_PATH = os.getenv("EMBEDDING_MODEL_PATH", "").strip()
+
 EMBEDDING_BATCH_SIZE = getattr(
     settings,
     "EMBEDDING_BATCH_SIZE",
@@ -151,29 +155,49 @@ class VectorStore:
                         "provider": "CPUExecutionProvider",
                         "session_options": session_options,
                     }
-                    try:
+                    if EMBEDDING_MODEL_PATH:
+                        # Production image: the model is baked in. Load it
+                        # from the local folder only and fail loudly if it
+                        # is missing. Never fall back to the network.
+                        if not os.path.isdir(EMBEDDING_MODEL_PATH):
+                            raise ImproperlyConfigured(
+                                "EMBEDDING_MODEL_PATH does not exist: "
+                                f"{EMBEDDING_MODEL_PATH}"
+                            )
                         cls._embedder = SentenceTransformer(
-                            EMBEDDING_MODEL,
+                            EMBEDDING_MODEL_PATH,
                             backend="onnx",
                             model_kwargs=model_kwargs,
                             local_files_only=True,
                             trust_remote_code=False,
                         )
-                    except OSError:
+                    else:
+                        # Local development: use the HF cache, download
+                        # the model if it is not cached yet.
+                        try:
+                            cls._embedder = SentenceTransformer(
+                                EMBEDDING_MODEL,
+                                backend="onnx",
+                                model_kwargs=model_kwargs,
+                                local_files_only=True,
+                                trust_remote_code=False,
+                            )
+                        except OSError:
 
-                        cls._embedder = SentenceTransformer(
-                            EMBEDDING_MODEL,
-                            backend="onnx",
-                            model_kwargs=model_kwargs,
-                            trust_remote_code=False,
-                        )
+                            cls._embedder = SentenceTransformer(
+                                EMBEDDING_MODEL,
+                                backend="onnx",
+                                model_kwargs=model_kwargs,
+                                trust_remote_code=False,
+                            )
                     logger.info(
                         "[EMBEDDING] Model ready: %s "
                         "(backend=onnx, quantized=true, onnx_intra_threads=%s, "
-                        "batch_size=%s).",
+                        "batch_size=%s, source=%s).",
                         EMBEDDING_MODEL,
                         threads,
                         EMBEDDING_BATCH_SIZE,
+                        EMBEDDING_MODEL_PATH or "hf-cache",
                     )
         return cls._embedder
 
