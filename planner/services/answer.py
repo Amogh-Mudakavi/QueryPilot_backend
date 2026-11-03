@@ -89,11 +89,13 @@ SYSTEM_PROMPT = BASE_SYSTEM_PROMPT
 ANSWER_RESPONSE_FORMAT = None
 DEFAULT_REASONING_EFFORT = "low"
 CALCULATION_REASONING_EFFORT = "low"
+# A derivation that combines several sources (definition + contract terms +
+# records) needs real reasoning headroom; "low" is kept for plain lookups.
 COMPLEX_CALCULATION_REASONING_EFFORT = (
-    os.environ.get("QUERYPILOT_ANSWER_COMPLEX_CALC_EFFORT", "low").strip().lower()
+    os.environ.get("QUERYPILOT_ANSWER_COMPLEX_CALC_EFFORT", "medium").strip().lower()
 )
 if COMPLEX_CALCULATION_REASONING_EFFORT not in {"low", "medium", "high"}:
-    COMPLEX_CALCULATION_REASONING_EFFORT = "low"
+    COMPLEX_CALCULATION_REASONING_EFFORT = "medium"
 
 
 def _estimate_tokens(text: str) -> int:
@@ -110,6 +112,7 @@ def _completion_budget(
     query: str,
     evidence: list[Any],
     system_prompt: str = SYSTEM_PROMPT,
+    planner_requirements: list[dict[str, Any]] | None = None,
 ) -> tuple[int, int]:
     """Answer-output ceiling. NOT lowered from a local token estimate.
 
@@ -117,7 +120,7 @@ def _completion_budget(
     entirely on reasoning. If Groq rejects input + max_tokens as over the TPM
     limit, the provider lowers it by Groq's own reported excess instead.
     """
-    complexity = _calculation_complexity(query, evidence)
+    complexity = _calculation_complexity(query, evidence, planner_requirements)
     cap_key = complexity if complexity in ANSWER_OUTPUT_TOKEN_CAPS else "normal"
     max_tokens = min(
         ANSWER_OUTPUT_TOKEN_CAPS[cap_key],
@@ -1279,7 +1282,7 @@ def _prepare_request(
     _log_evidence_debug("final_payload", items)
     payload.update(extras)
     # QP-PATCH-V4: guidance for calculation questions
-    if _calculation_complexity(query, evidence) != "none":
+    if _calculation_complexity(query, evidence, planner_requirements) != "none":
         payload["guidance"] = _CALCULATION_GUIDANCE
     return (
         json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":")),
@@ -1428,17 +1431,63 @@ def _evidence_document_ids(evidence: list[Any] | None) -> set[Any]:
     return ids
 
 
-def _calculation_complexity(query: str, evidence: list[Any] | None = None) -> str:
+# Requirement types the planner assigns to facts that must be derived rather
+# than read. They signal a derivation even when the wording of the question
+# carries no arithmetic keyword ("how was the contract value worked out").
+_DERIVATION_REQUIREMENT_TYPES = frozenset({"numeric", "date", "comparison"})
+
+
+def _requirements_imply_derivation(
+    planner_requirements: list[dict[str, Any]] | None,
+) -> bool:
+    return any(
+        isinstance(item, dict)
+        and str(item.get("type") or "").strip().lower() in _DERIVATION_REQUIREMENT_TYPES
+        for item in planner_requirements or []
+    )
+
+
+def _evidence_mixes_tables_and_text(evidence: list[Any] | None) -> bool:
+    """True when usable evidence includes both table rows and text passages."""
+    kinds: set[str] = set()
+    for item in evidence or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("result_status") or "SUCCESS").upper() != "SUCCESS":
+            continue
+        source_type = str(item.get("source_type") or "").lower()
+        if source_type == "table_query":
+            kinds.add("table")
+        elif source_type == "text_chunk":
+            kinds.add("text")
+    return kinds >= {"table", "text"}
+
+
+def _calculation_complexity(
+    query: str,
+    evidence: list[Any] | None = None,
+    planner_requirements: list[dict[str, Any]] | None = None,
+) -> str:
     """Generic complexity class of the requested computation.
-    Looks only at the question's arithmetic intent and at how many distinct
-    source documents the evidence draws on; it knows nothing about any
+
+    Uses structure, not vocabulary: arithmetic wording in the question, the
+    planner's own requirement types, and whether the evidence combines table
+    rows with text rules from several documents. It knows nothing about any
     domain, column, file or format.
     """
-    if not _is_calculation_query(query):
+    document_count = len(_evidence_document_ids(evidence))
+    derivation = (
+        _is_calculation_query(query)
+        or _requirements_imply_derivation(planner_requirements)
+        or (document_count >= 2 and _evidence_mixes_tables_and_text(evidence))
+    )
+    if not derivation:
         return "none"
-    if len(_evidence_document_ids(evidence)) >= 2:
+    if document_count >= 2:
         return "multi_step"
     return "arithmetic"
+
+
 _EFFORT_BY_COMPLEXITY = {
     "none": lambda: DEFAULT_REASONING_EFFORT,
     "arithmetic": lambda: CALCULATION_REASONING_EFFORT,
@@ -1446,9 +1495,13 @@ _EFFORT_BY_COMPLEXITY = {
 }
 
 
-def _answer_effort(query: str, evidence: list[Any] | None = None) -> str:
+def _answer_effort(
+    query: str,
+    evidence: list[Any] | None = None,
+    planner_requirements: list[dict[str, Any]] | None = None,
+) -> str:
     """Reasoning effort for the first answer attempt."""
-    complexity = _calculation_complexity(query, evidence)
+    complexity = _calculation_complexity(query, evidence, planner_requirements)
     return _EFFORT_BY_COMPLEXITY[complexity]()
 
 
@@ -1468,7 +1521,21 @@ _CALCULATION_GUIDANCE = (
     "own values (a per-record flag or category can change a window, limit or fee), "
     "then list every record you leave out with one short reason. "
     "Keep money amounts at the precision of the source values; do not round a final "
-    "amount to whole units unless the question asks for it."
+    "amount to whole units unless the question asks for it. "
+    # Defined terms: a rule document may define the quantity being asked about.
+    "When a source DEFINES the quantity you are asked for (its basis, period, "
+    "inclusions, exclusions, or the date a change takes effect), compute exactly "
+    "that definition. Recorded rows (invoices, ledgers, logs) may cover only part "
+    "of the period the definition spans: check the period they cover against the "
+    "period required, take the remaining periods from the contract, schedule or "
+    "rate source in the evidence, and say plainly which parts came from records and "
+    "which from terms. Never present partial-period records as the full-period "
+    "figure. "
+    # Threshold comparisons: do them on plain numbers.
+    "Before comparing an amount with a threshold or band, write both as plain "
+    "digits without separators and compare those. Digit grouping differs by "
+    "locale (for example 50,00,000 is fifty lakh = 5000000, and 1,00,00,000 is "
+    "ten million), so never judge size by the number of commas."
 )
 
 
@@ -1535,6 +1602,7 @@ def generate_answer(
     query: str,
     evidence: list[Any],
     conversation_history: list[dict[str, Any]] | None = None,
+    planner_requirements: list[dict[str, Any]] | None = None,
 ) -> str:
     """Generate the complete user-facing answer in one request.
 
@@ -1546,6 +1614,7 @@ def generate_answer(
         query=query,
         evidence=evidence,
         conversation_history=conversation_history,
+        planner_requirements=planner_requirements,
     )
     indices = [item["citation_index"] for item in canon_items]
     logger.info(
@@ -1554,11 +1623,16 @@ def generate_answer(
         len(indices),
         len(payload),
     )
-    max_tokens, _ = _completion_budget(payload, query=query, evidence=evidence)
-    effort = _answer_effort(query, evidence)
+    max_tokens, _ = _completion_budget(
+        payload,
+        query=query,
+        evidence=evidence,
+        planner_requirements=planner_requirements,
+    )
+    effort = _answer_effort(query, evidence, planner_requirements)
     logger.info(
         "answer_effort: complexity=%s requested=%s",
-        _calculation_complexity(query, evidence),
+        _calculation_complexity(query, evidence, planner_requirements),
         effort,
     )
     content = ""
@@ -1656,15 +1730,20 @@ def generate_answer_stream(
         len(indices),
         len(payload),
     )
-    max_tokens, _ = _completion_budget(payload, query=query, evidence=evidence)
+    max_tokens, _ = _completion_budget(
+        payload,
+        query=query,
+        evidence=evidence,
+        planner_requirements=planner_requirements,
+    )
     # Same effort rule as generate_answer(): chosen by complexity class.
-    effort = _answer_effort(query, evidence)
+    effort = _answer_effort(query, evidence, planner_requirements)
     options = _router_options(effort, router.generate_stream)
     # "forwarded" is what is handed to the router, which places it in the
     # provider request ([LLM_REQUEST] ... reasoning_effort=...).
     logger.info(
         "answer_effort(stream): complexity=%s requested=%s forwarded=%s",
-        _calculation_complexity(query, evidence),
+        _calculation_complexity(query, evidence, planner_requirements),
         effort,
         options.get("reasoning_effort"),
     )

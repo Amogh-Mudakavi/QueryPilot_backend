@@ -34,6 +34,7 @@ from typing import Any, Callable, Iterable
 
 from retrieval.services.keys import (
     dedupe_keys,
+    drop_source_name_keys,
     extract_id_tokens,
     is_anchor_reference,
     is_id_column,
@@ -117,7 +118,14 @@ def collect_keys(
     table_items: list[dict[str, Any]],
     documents: list[dict[str, Any]],
     limit: int = MAX_JOIN_KEYS,
+    source_names: Iterable[str] = (),
 ) -> list[str]:
+    """Identifier keys used to look for companion evidence in other sources.
+
+    ``source_names`` are the titles/file names of the sources themselves. An
+    identifier-shaped fragment of a source name (a version tag, a year in a
+    file name) identifies the source, not a record, so it is never a key.
+    """
     keys: list[str] = []
     for text in [query, *[str(r) for r in references or []]]:
         keys.extend(token for _, _, token in extract_id_tokens(str(text)))
@@ -126,7 +134,7 @@ def collect_keys(
     for item in documents:
         keys.extend(keys_from_text(str(item.get("content", "")), anchors))
 
-    return dedupe_keys(keys)[:limit]
+    return drop_source_name_keys(dedupe_keys(keys), source_names)[:limit]
 
 
 _SQL_CELL_SEPARATORS = re.compile(r"[-_ ]")
@@ -573,6 +581,15 @@ def run_cross_document_join(
         for item in documents
         if _as_int(item.get("document_id")) not in rule_only_document_ids
     ]
+    source_names = [
+        *titles.values(),
+        *(
+            str(item.get("reference") or "")
+            for item in resolved_references or []
+            if isinstance(item, dict)
+            and (item.get("match") or {}).get("type") in {"document", "table"}
+        ),
+    ]
     keys = collect_keys(
         query=query,
         references=references,
@@ -580,6 +597,7 @@ def run_cross_document_join(
         table_items=key_source_tables,
         documents=key_source_documents,
         limit=MAX_JOIN_KEYS + 1,
+        source_names=source_names,
     )
     if len(keys) > MAX_JOIN_KEYS:
         keys = keys[:MAX_JOIN_KEYS]

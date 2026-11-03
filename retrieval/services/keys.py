@@ -21,8 +21,10 @@ MAX_KEY_LENGTH = 64
 _DASHES = "\u2010\u2011\u2012\u2013\u2014\u2212"
 _SEP = rf"[-_/{_DASHES}]"
 
+# Prefix segments may repeat ("KCS-INV-2604"); otherwise only the last prefix
+# segment and the number would match and the identifier would be truncated.
 _HYPHEN_ID = re.compile(
-    rf"(?<![A-Za-z0-9])[A-Za-z]{{1,10}}{_SEP}\d{{2,}}"
+    rf"(?<![A-Za-z0-9])[A-Za-z]{{1,10}}(?:{_SEP}[A-Za-z]{{1,10}})*{_SEP}\d{{2,}}"
     rf"(?:{_SEP}[A-Za-z0-9]+)*(?![A-Za-z0-9])"
 )
 
@@ -35,6 +37,12 @@ _LABELLED_ID = re.compile(
 
 _ID_COLUMN_TOKENS = frozenset({"id", "code", "key", "ref", "reference"})
 _FILE_LIKE = re.compile(r"\.(pdf|xlsx?|xlsm|csv|docx?|txt)\b", re.I)
+
+# A whole file name ("Vendor_Policy_VMP-07-1.pdf"). Fragments inside it look
+# like identifiers but name a source, not a record.
+_FILE_NAME_TOKEN = re.compile(
+    r"[^\s\"'<>|,;()\[\]{}]+\.(?:pdf|xlsx?|xlsm|csv|docx?|txt)\b", re.I
+)
 
 
 def _clean_token(token: str) -> str:
@@ -79,6 +87,15 @@ def extract_id_tokens(text: str) -> list[tuple[int, int, str]]:
     for m in _LABELLED_ID.finditer(text):
         found[(m.start("v"), m.end("v"))] = _clean_token(m.group("v"))
 
+    # Identifier-shaped fragments of a file name are source names, not keys.
+    file_spans = [m.span() for m in _FILE_NAME_TOKEN.finditer(text)]
+    if file_spans:
+        found = {
+            span: token
+            for span, token in found.items()
+            if not any(fs <= span[0] and span[1] <= fe for fs, fe in file_spans)
+        }
+
     spans = sorted(found, key=lambda s: (s[0], -(s[1] - s[0])))
     result: list[tuple[int, int, str]] = []
 
@@ -93,6 +110,27 @@ def extract_id_tokens(text: str) -> list[tuple[int, int, str]]:
         last_end = max(last_end, end)
 
     return result
+
+
+def drop_source_name_keys(
+    keys: Iterable[str], source_names: Iterable[str]
+) -> list[str]:
+    """Remove keys that are merely fragments of a source's own name.
+
+    A document called "Vendor_Policy_VMP-07-1.pdf" contains the identifier-shaped
+    token "VMP-07-1", but that token names the source; it is not an entity key
+    to search other sources for. Matching is separator/case-insensitive on the
+    normalized form, so it needs no knowledge of any domain or file format.
+    """
+    names = [normalize_key(name) for name in source_names if name]
+    names = [name for name in names if name]
+    kept: list[str] = []
+    for key in keys:
+        norm = normalize_key(key)
+        if norm and any(norm in name for name in names):
+            continue
+        kept.append(key)
+    return kept
 
 
 def key_pattern(key: str) -> re.Pattern[str]:

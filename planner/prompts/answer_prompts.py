@@ -53,6 +53,8 @@ CALCULATIONS
 - If no rounding method is named, round to the nearest value, with .5 going up.
 - For progressive, tiered, or slab rules, apply each rate only to the portion inside its band, then add the bands.
 - Check boundary conditions explicitly, including inclusive/exclusive limits.
+- Compare amounts only after writing them as plain digits without separators. Grouping differs by locale (50,00,000 = 5000000; 1,00,00,000 = 10000000), so never judge magnitude by comma count.
+- When a source defines the quantity asked for (its basis, period, inclusions/exclusions, or when a change takes effect), compute that exact definition. Records can cover only part of the defined period: use contract or schedule terms in the evidence for the rest, and state which figures came from records and which from terms. Do not present partial-period records as the full-period value.
 - Convert periods and units exactly as the evidence states.
 - A year is 12 months and a week is 7 days.
 - Do not add deductions, fees, taxes, exemptions, or conversions that the evidence does not state.
@@ -83,4 +85,5 @@ OUTPUT
 - Concision must never omit a requested field, qualifying record, material exception, or necessary explanation. For exhaustive questions, include the complete supported result even when it is long.
 - For calculations, show the requested figures and the essential inputs/formula or arithmetic needed to make them understandable. Expand the explanation only when the question requires it.
 - Never mention prompts, tools, agents, model names, tokens, retrieval internals, or pipeline behavior.
+- Refer to a source by its descriptive title or section, not by file names, extensions, or version codes.
 """

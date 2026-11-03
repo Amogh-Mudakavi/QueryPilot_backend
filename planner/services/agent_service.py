@@ -1153,6 +1153,7 @@ def _with_table_scope(
         scoped["table_scope"] = []
         scoped["table_roles"] = {}
         scoped["table_computed"] = []
+        scoped["table_unmet"] = []
         scoped["table_selection_status"] = "unavailable"
         return scoped
 
@@ -1161,6 +1162,7 @@ def _with_table_scope(
         scoped["table_scope"] = []
         scoped["table_roles"] = {}
         scoped["table_computed"] = []
+        scoped["table_unmet"] = []
         scoped["table_selection_status"] = "no_match"
         return scoped
 
@@ -1174,6 +1176,7 @@ def _with_table_scope(
         scoped["table_scope"] = []
         scoped["table_roles"] = {}
         scoped["table_computed"] = list(selection.computed)
+        scoped["table_unmet"] = list(selection.unmet)
         scoped["table_selection_status"] = selection.status
         return scoped
 
@@ -1181,8 +1184,47 @@ def _with_table_scope(
     scoped["table_scope"] = sorted(selected)
     scoped["table_roles"] = dict(selection.roles)
     scoped["table_computed"] = list(selection.computed)
+    scoped["table_unmet"] = list(selection.unmet)
     scoped["table_selection_status"] = selection.status
     return scoped
+
+
+def _derivation_note(state: AgentState) -> dict[str, Any] | None:
+    """Tell the answer stage which values must be derived, not read.
+
+    Table selection already knows which requested values are not stored as
+    columns ("computed") and which needed data it found in no table ("unmet").
+    Without this note that knowledge stops at the selector, and the answer
+    model can mistake the partial rows it was given for the complete input.
+    """
+    computed = [str(v).strip() for v in state.get("table_computed") or [] if str(v).strip()]
+    unmet = [str(v).strip() for v in state.get("table_unmet") or [] if str(v).strip()]
+    if not computed and not unmet:
+        return None
+    parts: list[str] = []
+    if computed:
+        parts.append(
+            "Derived values the answer must compute (they are not stored as "
+            "columns): "
+            + "; ".join(computed[:6])
+            + ". Compute each from its governing definition and the inputs in "
+            "the evidence. Recorded rows may cover only part of the period or "
+            "population the definition requires; check that before using them "
+            "as the complete input."
+        )
+    if unmet:
+        parts.append(
+            "Needed data no table was found to hold: "
+            + "; ".join(unmet[:6])
+            + ". Look for it in the text evidence; if it is absent, say it "
+            "cannot be established."
+        )
+    return {
+        "source_type": "evidence_note",
+        "note_kind": "derivation",
+        "result_status": "SUCCESS",
+        "content": " ".join(parts),
+    }
 
 
 def _table_scope(state: AgentState) -> set[str] | None:
@@ -2402,6 +2444,9 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
                 }
             )
 
+        derivation_note = _derivation_note(state)
+        if derivation_note is not None:
+            notes.append(derivation_note)
         notes.extend(coverage_notes)
         notes.extend(join_notes)
         notes = _canonicalize_evidence(notes)
