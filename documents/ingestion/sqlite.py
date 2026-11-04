@@ -226,6 +226,7 @@ class SQLiteManager:
         cls,
         table_name,
         columns,
+        comment=None,
     ):
         if not columns:
             raise ValueError(
@@ -287,6 +288,48 @@ class SQLiteManager:
 
         except Exception:
             raise
+
+        if comment:
+            cls.set_table_comment(table_name, comment)
+
+    @classmethod
+    def set_table_comment(
+        cls,
+        table_name,
+        comment,
+    ):
+        """Attach a short description to a physical table.
+
+        The description (where the table came from: sheet, heading, nearby
+        caption) is stored as the MySQL table comment, so it can be read back
+        from information_schema together with the table names. It is only a
+        label: failing to store it must never fail ingestion of the data.
+        """
+        table_name = cls.validate_identifier(
+            table_name,
+            "table name",
+        )
+
+        text = str(comment or "").strip()[:1800]
+
+        if not text:
+            return
+
+        try:
+            with cls.get_connection().cursor() as cursor:
+                cursor.execute(
+                    f"ALTER TABLE `{table_name}` COMMENT = %s",
+                    [text],
+                )
+
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "Could not store the description of table %s; "
+                "the table itself was created.",
+                table_name,
+            )
 
     @classmethod
     def insert_rows(

@@ -49,7 +49,9 @@ fallback and are logged. Callers can distinguish that path through
 ``strategy``.
 
 Document profiles are intentionally not used: they are per-document, so they
-cannot tell sibling tables of one document apart.
+cannot tell sibling tables of one document apart. Each table's own title and
+context (stored at ingestion) do, and tables of one document that share their
+columns are kept together (see ``close_sibling_tables``).
 """
 
 from __future__ import annotations
@@ -104,7 +106,8 @@ Selection must be minimal and query-specific:
 - Select a table only when it supplies a value explicitly requested, a filter needed to identify the requested records, an input needed for a requested calculation, a governing rule that changes the requested result, or a key required to connect already-selected evidence.
 - A table is NOT relevant merely because it belongs to a resolved/relevant document, shares a broad topic, or might contain generally useful background.
 - For role=rule, identify the exact requested decision/calculation that the rule governs. Do not select every policy/rules table in a document. Select only the rule tables needed for the conditions actually raised by the question or by the selected records.
-- Do not select alternative, unrelated, or merely adjacent rules “just in case”. If a requirement is genuinely ambiguous, prefer reporting it in "unmet" rather than reading unrelated tables.
+- Tables of one document that have the same columns are usually versions or parts of one rule set: an original and an amended schedule, or the same table for different periods, regions or categories. Each table's "title" and "context" say which records it governs (for example the dates from which it applies). When the records the question concerns fall under more than one of them, select ALL of those tables, because each one governs some of the records. Never pick one version of a rule when the records span several versions.
+- Do not select alternative, unrelated, or merely adjacent rules “just in case”. A version of a rule that governs some of the selected records is not an alternative. If a requirement is genuinely ambiguous, prefer reporting it in "unmet" rather than reading unrelated tables.
 - Do not add a table solely to ensure that every document contributes a table. A document may contribute text evidence only, or no evidence if none of its tables is needed.
 - Keep the selection as small as possible while still supporting every requested output and calculation.
 - Recorded rows can cover only part of the period or population that a derived value requires. When the governing definition or terms are text rather than a table, do not treat the selected rows as the complete input: still list the derived value in "computed" and name the missing remainder (for example the periods the rows do not cover) in "unmet".
@@ -443,6 +446,15 @@ def build_selection_payload(
                 "row_count": t.get("row_count"),
                 "sample_rows": samples,
             }
+            # Where the table came from (sheet, heading, the caption that
+            # introduces it). Without this, tables with identical columns
+            # differ only by sample values and cannot be told apart.
+            title = " ".join(str(t.get("table_title") or "").split())
+            context = " ".join(str(t.get("table_context") or "").split())
+            if title:
+                entry["title"] = title[:140]
+            if context:
+                entry["context"] = context[:420]
             table_payload.append(entry)
         documents_payload.append(
             {
@@ -615,7 +627,7 @@ def _rescue_unmet(
     return rescued
 
 
-def select_tables_detailed(
+def _select_tables_core(
     *,
     workspace_id: int,
     query: str,
@@ -748,6 +760,105 @@ def select_tables_detailed(
         status="selected",
         strategy="llm",
     )
+
+
+# Version/part tables are small lookup tables. Larger tables with identical
+# columns are data partitions (one sheet per month, say), which must not be
+# pulled in together just because one of them was needed.
+_SIBLING_MAX_GROUP = 6
+_SIBLING_MAX_ROWS = 60
+_ROLE_PRIORITY = ("rule", "input", "filter", "key", "output", "other")
+
+
+def _column_signature(columns: Any) -> tuple[str, ...]:
+    return tuple(str(column or "").strip().casefold() for column in (columns or []))
+
+
+def close_sibling_tables(
+    selection: "TableSelection | None",
+    candidates: list[dict[str, Any]],
+) -> "TableSelection | None":
+    """Keep sibling tables of one document together.
+
+    Tables of the same document with identical columns are versions or parts
+    of one thing (an original and an amended schedule, one table per
+    period). If any of them is selected, the others are needed too, since each
+    governs records the selected one does not. Applies only to groups of
+    small tables; the roles inside a group are made consistent.
+    """
+    if selection is None or selection.status != "selected" or not selection.tables:
+        return selection
+
+    groups: dict[tuple[Any, tuple[str, ...]], list[dict[str, Any]]] = defaultdict(list)
+    for item in candidates:
+        if not isinstance(item, dict) or not item.get("table_name"):
+            continue
+        signature = _column_signature(item.get("columns"))
+        if not signature:
+            continue
+        groups[(_as_int(item.get("document_id")), signature)].append(item)
+
+    tables = set(selection.tables)
+    roles = dict(selection.roles)
+    added: list[str] = []
+
+    for members in groups.values():
+        if len(members) < 2 or len(members) > _SIBLING_MAX_GROUP:
+            continue
+        names = [str(member["table_name"]) for member in members]
+        if not (set(names) & tables):
+            continue
+        sizes = [member.get("row_count") for member in members]
+        if any(not isinstance(size, int) or size > _SIBLING_MAX_ROWS for size in sizes):
+            continue
+
+        seed_roles = [roles[name] for name in names if name in tables and name in roles]
+        role = next(
+            (candidate for candidate in _ROLE_PRIORITY if candidate in seed_roles),
+            "rule",
+        )
+        for name in names:
+            if name not in tables:
+                tables.add(name)
+                added.append(name)
+            roles[name] = role
+
+    if added:
+        logger.info(
+            "table selection: kept sibling tables together, added=%s",
+            sorted(added),
+        )
+    return TableSelection(
+        tables=tables,
+        roles=roles,
+        computed=list(selection.computed),
+        unmet=list(selection.unmet),
+        status=selection.status,
+        strategy=selection.strategy,
+    )
+
+
+def select_tables_detailed(
+    *,
+    workspace_id: int,
+    query: str,
+    understanding: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    forced_table_names: set[str] | None = None,
+) -> TableSelection | None:
+    """Select the tables a question needs, keeping sibling tables together."""
+    selection = _select_tables_core(
+        workspace_id=workspace_id,
+        query=query,
+        understanding=understanding,
+        candidates=candidates,
+        forced_table_names=forced_table_names,
+    )
+    try:
+        return close_sibling_tables(selection, candidates)
+    except Exception:
+        logger.exception("sibling-table closure failed; keeping the original selection")
+        return selection
 
 
 def select_tables(

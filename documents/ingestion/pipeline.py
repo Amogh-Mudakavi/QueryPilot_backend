@@ -303,6 +303,7 @@ class IngestionPipeline:
                 SQLiteManager.create_table(
                     table_name=table_name,
                     columns=headers,
+                    comment=processed.get("table_comment"),
                 )
 
                 SQLiteManager.insert_rows(

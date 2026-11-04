@@ -16,6 +16,8 @@ from __future__ import annotations
 import re
 from typing import Any, Mapping, Sequence
 
+from planner.services.coverage import references_earlier_answer
+
 
 def _as_int(value: Any) -> int | None:
     try:
@@ -187,6 +189,10 @@ def contextual_planning_query(
     contextual = bool(_FOLLOWUP_REFERENCE.search(current)) and bool(
         _FOLLOWUP_INTENT.search(current)
     )
+    # A question about what the assistant said earlier ("reconcile your
+    # previous answers") is a follow-up however long it is.
+    refers_to_earlier_answers = references_earlier_answer(current)
+    contextual = contextual or refers_to_earlier_answers
     # Tiny follow-ups such as "why?" / "explain" are also contextual when a
     # prior task exists; they are not sufficient grounds to inherit long queries.
     contextual = contextual or (
@@ -195,7 +201,11 @@ def contextual_planning_query(
     if not contextual:
         return current
 
-    previous: str | None = None
+    # Usually the last task is the subject. A question about earlier answers
+    # (plural) is about the last few tasks, so keep them all in the planning
+    # query: each earlier task names the sources it needed.
+    wanted = 3 if refers_to_earlier_answers else 1
+    tasks: list[str] = []
     for message in reversed(conversation_history):
         if not isinstance(message, Mapping):
             continue
@@ -206,11 +216,15 @@ def contextual_planning_query(
             continue
         if candidate.casefold() in _GREETINGS or _CORRECTION.search(candidate):
             continue
-        previous = candidate
-        break
+        if candidate in tasks:
+            continue
+        tasks.append(candidate)
+        if len(tasks) >= wanted:
+            break
 
-    if not previous:
+    if not tasks:
         return current
+    previous = "\n\n".join(reversed(tasks))
     return f"{previous}\n\nContextual follow-up: {current}"
 
 

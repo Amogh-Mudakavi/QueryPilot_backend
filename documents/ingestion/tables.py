@@ -1,5 +1,6 @@
 """Ingestion Tables module for QueryPilot."""
 
+import json
 import logging
 import os
 import re
@@ -88,12 +89,71 @@ class TableProcessor:
         if not isinstance(headers, (list, tuple)):
             headers = [headers]
 
+        page = table_node.get("page", 0)
+        sheet = " ".join(str(table_node.get("sheet") or "").split())
+        heading = " ".join(str(table_node.get("heading") or "").split())
+        before = [
+            " ".join(str(value or "").split())
+            for value in (table_node.get("before") or [])
+        ]
+        before = [value for value in before if value]
+        after = " ".join(str(table_node.get("after") or "").split())
+
+        # A table is identified by what introduces it. The nearest text just
+        # before the table is the strongest signal (a caption or "the table
+        # below" sentence); the heading and sheet name come after it.
+        label = (
+            (before[-1] if before else "")
+            or heading
+            or sheet
+        )
+        label = label[:120].strip()
+        title = (
+            f"{label} (page {page})"
+            if label
+            else f"Table Page {page}"
+        )
+
         return {
-            "title": f"Table Page {table_node.get('page', 0)}",
-            "page": table_node.get("page", 0),
+            "title": title,
+            "page": page,
+            "sheet": sheet,
+            "heading": heading,
+            "before": before,
+            "after": after,
             "headers": list(headers),
             "rows": rows,
         }
+
+    @staticmethod
+    def build_comment(table: dict[str, Any]) -> str:
+        """Compact JSON describing where a table came from.
+
+        Stored as the physical table's comment, so the planner can read it
+        back from the same structured database without a schema migration.
+        Kept well under MySQL's 2048-character table comment limit.
+        """
+        payload = {
+            "title": str(table.get("title") or ""),
+            "sheet": str(table.get("sheet") or ""),
+            "heading": str(table.get("heading") or ""),
+            "before": [str(v) for v in (table.get("before") or [])],
+            "after": str(table.get("after") or ""),
+            "page": table.get("page"),
+        }
+        limit = 1500
+        for width in (320, 220, 140, 80, 40, 0):
+            payload["before"] = [v[:width] for v in payload["before"]] if width else []
+            payload["heading"] = payload["heading"][: max(width, 80)]
+            payload["after"] = payload["after"][:width]
+            text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            if len(text) <= limit:
+                return text
+        return json.dumps(
+            {"title": payload["title"][:200], "page": payload.get("page")},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
     @staticmethod
     def normalize_table(
@@ -239,10 +299,17 @@ class TableProcessor:
         title: str,
         headers: list[str],
         rows: list[list[str]],
+        context: str = "",
     ) -> str:
 
         lines = [
             f"Table: {title}",
+        ]
+
+        if context:
+            lines.extend(["", f"Context: {context}"])
+
+        lines += [
             "",
             "Columns:",
             ", ".join(headers),
@@ -308,11 +375,27 @@ class TableProcessor:
             rows=rows,
         )
 
+        context_parts = [
+            part
+            for part in (
+                f"sheet {table['sheet']}" if table.get("sheet") else "",
+                table.get("heading") or "",
+                " ".join(table.get("before") or []),
+                f"followed by: {table['after']}" if table.get("after") else "",
+            )
+            if part
+        ]
+        context_text = " | ".join(context_parts)[:900]
+
         semantic_text = cls.serialize_for_embedding(
             title=table["title"],
             headers=headers,
             rows=rows,
+            context=context_text,
         )
+
+        metadata["sheet"] = table.get("sheet") or ""
+        metadata["context"] = context_text
 
         payload = {
             "sqlite_payload": {
@@ -321,6 +404,7 @@ class TableProcessor:
             },
             "metadata": metadata,
             "semantic_text": semantic_text,
+            "table_comment": cls.build_comment(table),
         }
 
         logger.debug(
@@ -425,3 +509,45 @@ class TableProcessor:
         except Exception:
             logger.exception("Could not render table as text evidence.")
             return []
+
+def parse_table_comment(comment: Any) -> dict[str, str]:
+    """Read back the description stored with a table at ingestion time.
+
+    The comment is a small JSON object (title, sheet, heading, the text that
+    introduces the table and the text that follows it). Tables ingested
+    before descriptions existed, or comments that are not JSON, simply have
+    no description: both fields come back empty and nothing else changes.
+    """
+    empty = {"title": "", "context": ""}
+    if isinstance(comment, bytes):
+        comment = comment.decode("utf-8", "ignore")
+    text = str(comment or "").strip()
+    if not text.startswith("{"):
+        return empty
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return empty
+    if not isinstance(data, dict):
+        return empty
+
+    title = " ".join(str(data.get("title") or "").split())
+    parts: list[str] = []
+    sheet = " ".join(str(data.get("sheet") or "").split())
+    if sheet:
+        parts.append(f"sheet: {sheet}")
+    heading = " ".join(str(data.get("heading") or "").split())
+    if heading:
+        parts.append(f"heading: {heading}")
+    before = [
+        " ".join(str(value or "").split())
+        for value in (data.get("before") or [])
+        if isinstance(value, str)
+    ]
+    before = [value for value in before if value]
+    if before:
+        parts.append("introduced by: " + " ".join(before))
+    after = " ".join(str(data.get("after") or "").split())
+    if after:
+        parts.append(f"followed by: {after}")
+    return {"title": title, "context": " | ".join(parts)}

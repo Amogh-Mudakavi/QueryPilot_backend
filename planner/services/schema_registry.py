@@ -29,6 +29,7 @@ from typing import Any, Iterable
 from django.db import connections
 
 from documents.ingestion.sqlite import SQLiteManager
+from documents.ingestion.tables import parse_table_comment
 from documents.models import Document
 
 logger = logging.getLogger(__name__)
@@ -66,14 +67,16 @@ def _load_table_index(
     with connection.cursor() as cursor:
         cursor.execute(
             """
-            SELECT TABLE_NAME
+            SELECT TABLE_NAME, TABLE_COMMENT
             FROM information_schema.TABLES
             WHERE TABLE_SCHEMA = DATABASE()
               AND TABLE_TYPE = 'BASE TABLE'
             ORDER BY TABLE_NAME
             """
         )
-        all_table_names = [row[0] for row in cursor.fetchall()]
+        _rows = cursor.fetchall()
+        all_table_names = [row[0] for row in _rows]
+        comments_by_table = {row[0]: row[1] for row in _rows}
 
     table_names = [
         name
@@ -142,6 +145,7 @@ def _load_table_index(
             continue
         document_id = _get_document_id(table_name)
         document = documents.get(document_id)
+        described = parse_table_comment(comments_by_table.get(table_name))
         index.append(
             {
                 "document_id": document_id,
@@ -150,6 +154,8 @@ def _load_table_index(
                 "document_status": getattr(document, "status", None),
                 "table_name": table_name,
                 "columns": columns,
+                "table_title": described["title"],
+                "table_context": described["context"],
             }
         )
     return index
@@ -321,6 +327,8 @@ def _build_catalog(
                         "table_name": table["table_name"],
                         "columns": list(table["columns"]),
                         "row_count": table.get("row_count"),
+                        "table_title": table.get("table_title") or "",
+                        "table_context": table.get("table_context") or "",
                     }
                     for table in tables
                 ],

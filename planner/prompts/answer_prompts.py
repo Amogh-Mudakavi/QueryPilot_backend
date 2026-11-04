@@ -28,6 +28,8 @@ EVIDENCE AVAILABILITY
 ATTRIBUTES AND PRECEDENCE
 - A flag, tier, status, category, membership, payment method or similar attribute on a retrieved record can change a rule. If a rule in the evidence depends on such an attribute, apply it. If the evidence does not say what an attribute changes, say its effect is not established; never assume it has no effect.
 - When sources disagree, follow the one that states it overrides the other, otherwise the newer version or effective date, and say which statement was set aside. If neither applies, state the conflict.
+- A newer version or amendment governs only what it says it governs. If it applies from a stated date, period or condition, apply it only to the records inside that scope and keep applying the earlier version to the records outside it. Decide per record which version governs; never replace the earlier rule for every record.
+- Several tables of rules with the same columns are versions or parts of one rule set: use the title or description of each to decide which records it governs.
 
 SCOPE / POPULATION
 - Single-entity questions use that exact entity only.
@@ -66,6 +68,11 @@ CALCULATIONS
 - Sort numerically and keep source order for ties.
 - Dates stated in the question (such as "today") are valid inputs for window and deadline checks.
 - Missing input, rule, or denominator means do not guess; state that the result cannot be established.
+
+EARLIER ANSWERS IN THIS CONVERSATION
+- A prior_conclusions note records what was stated earlier in this conversation. It is not source evidence and proves nothing.
+- When your result differs from an earlier statement, say so plainly: name the figures that differ, give the reason only if the evidence shows it (for example a different rule version or an input that was missed earlier), and state which figures the evidence supports.
+- Do not invent an explanation for a difference. If the evidence does not show why the figures differ, say that.
 
 FOLLOW-UP EXPLANATIONS
 - The user payload may contain a prior task followed by "Contextual follow-up:". In that format, the text after the marker is the current request and the preceding task supplies its subject and context.

@@ -822,8 +822,22 @@ class LlamaParseService:
                     SimpleNamespace(type="text", md=str(text), value=str(text))
                 )
 
+            # Spreadsheet-style sources describe each sheet as a page. Keep the
+            # sheet name when the parser provides one, so the tables of that
+            # sheet can be told apart from the tables of its siblings.
+            page_name = ""
+            for key in ("page_name", "sheet_name", "name", "title"):
+                candidate = cls._value(page, key, None)
+                if isinstance(candidate, str) and candidate.strip():
+                    page_name = candidate.strip()
+                    break
+
             normalized_pages.append(
-                SimpleNamespace(page_number=page_number, items=normalized_items)
+                SimpleNamespace(
+                    page_number=page_number,
+                    items=normalized_items,
+                    page_name=page_name,
+                )
             )
 
         return SimpleNamespace(items=SimpleNamespace(pages=normalized_pages))
@@ -1104,16 +1118,58 @@ class LlamaAdapter:
 
         return text_nodes
 
-    @staticmethod
-    def extract_table_nodes(result) -> list[dict]:
+    # How much surrounding text is kept as a table's identity. Captions,
+    # headings and "the table below" sentences are what separate two tables
+    # that have identical columns (for example an original and an amended
+    # schedule), so they must travel with the table.
+    _CONTEXT_BEFORE_ITEMS = 2
+    _CONTEXT_ITEM_CHARS = 320
+    _CONTEXT_AFTER_CHARS = 200
+
+    @classmethod
+    def _context_text(cls, text, limit):
+        cleaned = " ".join(str(text or "").replace("#", " ").split())
+        return cleaned[:limit].strip()
+
+    @classmethod
+    def extract_table_nodes(cls, result) -> list[dict]:
+        """Return the tables of a parsed document, each with its context.
+
+        Besides the cells, every node carries where the table sits:
+        ``sheet`` (spreadsheet sheet name, when known), ``heading`` (nearest
+        preceding heading), ``before`` (up to two preceding text items) and
+        ``after`` (the text item that follows it). The text items are not
+        removed from the text stream; they are only copied as table context.
+        """
         table_nodes: list[dict] = []
         pages = getattr(getattr(result, "items", None), "pages", []) or []
 
         for page in pages:
             page_number = getattr(page, "page_number", None)
+            sheet = str(getattr(page, "page_name", "") or "").strip()
+            items = list(getattr(page, "items", None) or [])
 
-            for item in getattr(page, "items", None) or []:
+            heading = ""
+            recent: list[str] = []
+            pending: list[dict] = []
+
+            for item in items:
                 if getattr(item, "type", None) != "table":
+                    text = getattr(item, "md", None) or getattr(item, "value", None)
+                    if not text:
+                        continue
+                    raw = str(text).strip()
+                    cleaned = cls._context_text(raw, cls._CONTEXT_ITEM_CHARS)
+                    if not cleaned:
+                        continue
+                    for waiting in pending:
+                        if not waiting["after"]:
+                            waiting["after"] = cleaned[: cls._CONTEXT_AFTER_CHARS]
+                    pending = []
+                    if raw.lstrip().startswith("#"):
+                        heading = cleaned
+                    recent.append(cleaned)
+                    recent = recent[-cls._CONTEXT_BEFORE_ITEMS:]
                     continue
 
                 rows = getattr(item, "rows", []) or []
@@ -1125,14 +1181,20 @@ class LlamaAdapter:
                     len(rows[0]) if rows else 0,
                 )
 
-                table_nodes.append(
-                    {
-                        "page": page_number,
-                        "rows": rows,
-                        "csv": getattr(item, "csv", ""),
-                        "html": getattr(item, "html", ""),
-                        "markdown": getattr(item, "md", ""),
-                    }
-                )
+                node = {
+                    "page": page_number,
+                    "rows": rows,
+                    "csv": getattr(item, "csv", ""),
+                    "html": getattr(item, "html", ""),
+                    "markdown": getattr(item, "md", ""),
+                    "sheet": sheet,
+                    "heading": heading,
+                    "before": list(recent),
+                    "after": "",
+                }
+                table_nodes.append(node)
+                pending = [node]
+                # Text that precedes this table describes this table only.
+                recent = []
 
         return table_nodes

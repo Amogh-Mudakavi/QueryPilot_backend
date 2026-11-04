@@ -44,6 +44,11 @@ from planner.services.cross_document_join import (
     build_joined_view,
     run_cross_document_join,
 )
+from planner.services.coverage import (
+    document_coverage_note,
+    prior_conclusions_note,
+    requirement_coverage_note,
+)
 from planner.services.document_coverage import build_document_evidence
 from planner.services.entity_resolution import (
     resolve_entities_from_query,
@@ -1190,6 +1195,91 @@ def _with_table_scope(
     scoped["table_unmet"] = list(selection.unmet)
     scoped["table_selection_status"] = selection.status
     return scoped
+
+
+def _annotate_table_identity(
+    items: list[Any],
+    resources: WorkspaceResources | None,
+) -> list[Any]:
+    """Tell the answer stage which table each result came from.
+
+    Result items name the physical table only. The description stored with
+    the table at ingestion (sheet, heading, the caption that introduces it)
+    is what distinguishes, say, an original schedule from an amended one when
+    both have the same columns. Items without a stored description are left
+    unchanged.
+    """
+    if not items or resources is None:
+        return items
+    try:
+        described = {
+            str(entry.get("table_name")): entry
+            for entry in resources.table_index()
+            if entry.get("table_title") or entry.get("table_context")
+        }
+    except Exception:
+        logger.exception("table identity: table index unavailable")
+        return items
+    if not described:
+        return items
+
+    annotated: list[Any] = []
+    for item in items:
+        content = item.get("content") if isinstance(item, dict) else None
+        if not isinstance(content, dict):
+            annotated.append(item)
+            continue
+        entries = [
+            described[name]
+            for name in sorted(_evidence_table_names(item))
+            if name in described
+        ]
+        titles = list(dict.fromkeys(e["table_title"] for e in entries if e.get("table_title")))
+        contexts = list(dict.fromkeys(e["table_context"] for e in entries if e.get("table_context")))
+        if not titles and not contexts:
+            annotated.append(item)
+            continue
+        content = dict(content)
+        if titles:
+            content.setdefault("table_title", "; ".join(titles))
+        if contexts:
+            content.setdefault("table_context", "; ".join(contexts)[:600])
+        annotated.append({**item, "content": content})
+    return annotated
+
+
+def _evidence_check_notes(
+    state: AgentState,
+    resources: WorkspaceResources | None,
+    evidence: list[Any],
+) -> list[dict[str, Any]]:
+    """Factual notes about what collection did and did not produce.
+
+    These never gate the answer. They name needed sources that contributed
+    nothing, requested items no evidence mentions, and (for a question that
+    refers back to earlier answers) what was said earlier.
+    """
+    notes: list[dict[str, Any]] = []
+    try:
+        titles: dict[int, str] = {}
+        if resources is not None:
+            for entry in resources.catalog():
+                doc_id = _coerce_int(entry.get("document_id"))
+                if doc_id is not None:
+                    titles[doc_id] = str(entry.get("title") or f"source {doc_id}")
+        for note in (
+            document_coverage_note(_resolved_document_ids(state), titles, evidence),
+            requirement_coverage_note(state.get("evidence_requirements") or [], evidence),
+            prior_conclusions_note(
+                str(state.get("query") or ""),
+                state.get("conversation_history") or [],
+            ),
+        ):
+            if note is not None:
+                notes.append(note)
+    except Exception:
+        logger.exception("evidence check notes failed; continuing without them")
+    return notes
 
 
 def _derivation_note(state: AgentState) -> dict[str, Any] | None:
@@ -2480,6 +2570,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
 
         structured = _collapse_subsumed_table_items(structured)
         structured = _add_key_joined_view(structured)
+        structured = _annotate_table_identity(structured, resources)
 
         coverage_notes = reconcile_coverage_notes(
             coverage_notes,
@@ -2554,6 +2645,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             notes.append(derivation_note)
         notes.extend(coverage_notes)
         notes.extend(join_notes)
+        notes.extend(_evidence_check_notes(state, resources, structured + documents))
         notes = _canonicalize_evidence(notes)
         notes = _reconcile_source_notes(
             notes,
@@ -3899,7 +3991,7 @@ def _search_evidence_variants(
     # QP-GEN-1c: share the call budget fairly between documents so a later
     # document is never starved by the queries spent on an earlier one.
     _call_cap = max(0, min(MAX_TOOL_CALLS_PER_QUERY, int(max_calls)))
-    _per_target = max(1, min(_MAX_RETRIEVAL_QUERIES, _call_cap // max(1, len(targets))))
+    _per_target = max(1, min(_MAX_RETRIEVAL_QUERIES_CAP, _call_cap // max(1, len(targets))))
     for document_id in targets:
         for query in queries[:_per_target]:
             if calls >= max(0, min(MAX_TOOL_CALLS_PER_QUERY, int(max_calls))):
@@ -3959,25 +4051,35 @@ def _search_evidence_variants(
 # QP-GEN-1a: the planner's per-requirement queries (rules, exceptions, fees)
 # used to be cut off after the raw question + effective question + one more.
 _MAX_RETRIEVAL_QUERIES = 6
+_MAX_RETRIEVAL_QUERIES_CAP = 10
 
 
 def _retrieval_queries_for_state(state: AgentState) -> list[str]:
     original = str(state.get("query") or "").strip()
     effective = effective_planning_query(state)
-    requirements = state.get("evidence_requirements") or []
-    candidates = [original, effective]
-    candidates.extend(
-        query
-        for requirement in requirements
+    requirements = [
+        requirement
+        for requirement in (state.get("evidence_requirements") or [])
         if requirement.get("kind") in {"text", "either"}
-        for query in requirement.get("queries", [])
-    )
+    ]
+    candidates = [original, effective]
+    # Take requirement queries in rounds: every requirement's first query
+    # before any requirement's second. Listing them requirement by
+    # requirement let the first requirements use up the whole budget, so the
+    # later ones were never searched.
+    per_requirement = [list(requirement.get("queries", [])) for requirement in requirements]
+    depth = max((len(queries) for queries in per_requirement), default=0)
+    for level in range(depth):
+        for queries in per_requirement:
+            if level < len(queries):
+                candidates.append(queries[level])
+    limit = min(_MAX_RETRIEVAL_QUERIES_CAP, max(_MAX_RETRIEVAL_QUERIES, 2 + len(per_requirement)))
     queries: list[str] = []
     for candidate in candidates:
         value = str(candidate or "").strip()
         if value and value.casefold() not in {item.casefold() for item in queries}:
             queries.append(value)
-        if len(queries) >= _MAX_RETRIEVAL_QUERIES:  # QP-GEN-1b
+        if len(queries) >= limit:  # QP-GEN-1b
             break
     return queries or [effective] if effective else queries
 
