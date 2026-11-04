@@ -407,25 +407,6 @@ def _prior_tool_history(conversation) -> list[dict[str, Any]]:
         return []
 
 
-def _has_meaningful_conversation_context(
-    conversation_history: list[dict[str, str]],
-) -> bool:
-    """
-    Return True when prior user/assistant content is available for context.
-
-    A system summary alone is not enough. At least one real
-    user/assistant turn must be present. (Kept as a helper; routing no
-    longer depends on it.)
-    """
-    if not conversation_history:
-        return False
-    return any(
-        isinstance(item, dict)
-        and str(item.get("role") or "").lower() in {"user", "assistant"}
-        and bool(str(item.get("content") or "").strip())
-        for item in conversation_history
-    )
-
 
 # ---------------------------------------------------------------------------
 # Live workspace facts + recent chat (used by the conversational responder)

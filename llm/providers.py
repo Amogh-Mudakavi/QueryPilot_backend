@@ -1,46 +1,32 @@
 """Groq provider adapter for QueryPilot.
-
 Owns the Groq clients, pins each logical task to its configured API key,
 classifies provider failures, and applies a bounded retry policy. Prompt-size
 estimates and token usage are observability only; Groq is authoritative for
 TPM, request-size, and context-window enforcement. Transient retries remain on
 the same task-assigned key. Rate-limit and authentication failures are surfaced
 without switching accounts.
-
 Streaming retries cover only establishment of the stream. Once Groq accepts
 the stream, partial output is never replayed. Usage is logged when the stream
 ends, closes early, or fails.
 """
-
 import logging
 import random
 import re
 import threading
 import time
 from collections.abc import Callable, Iterator  # QP-FIX-1
-
 from groq import Groq
-
 from . import usage as usage_log
 from .config import (
-    ADMISSION_MAX_BYPASS,
-    AUTH_COOLDOWN_SECONDS,
     CHARS_PER_TOKEN_ESTIMATE,
-    DEFAULT_COOLDOWN_SECONDS,
-    DEFAULT_TPM_LIMIT,
     FIT_MARGIN_TOKENS,
     GROQ_API_KEYS,
-    MAX_ADMISSION_WAIT_SECONDS,
     MAX_ATTEMPTS,
-    MAX_COOLDOWN_SECONDS,
     MESSAGE_OVERHEAD_TOKENS,
     MIN_USEFUL_COMPLETION_TOKENS,
-    MODEL_TPM_LIMITS,
     REQUEST_TIMEOUT,
     RETRY_BACKOFF_SECONDS,
     RETRY_LIMITS,
-    TPM_ADMISSION_RATIO,
-    TPM_WINDOW_SECONDS,
     TASK_API_KEY_INDEX,
 )
 from .exceptions import (
@@ -52,12 +38,8 @@ from .exceptions import (
     RequestTooLargeError,
     TimeoutError,
 )
-from .scheduler import Lease, QuotaScheduler
-
 logger = logging.getLogger(__name__)
-
 _TRANSIENT_KINDS = frozenset({"timeout", "connection", "provider_5xx"})
-
 _TOO_LARGE_MARKERS = (
     "context length",
     "maximum context",
@@ -68,12 +50,8 @@ _TOO_LARGE_MARKERS = (
 )
 
 
-def _tpm_limit(model: str) -> int:
-    return int(MODEL_TPM_LIMITS.get(model, DEFAULT_TPM_LIMIT))
-
-
 def _estimate_input_tokens(messages) -> int:
-    """Cheap pre-flight estimate used only for admission and diagnostics."""
+    """Cheap pre-flight estimate used only for diagnostics."""
     messages = messages or []
     chars = sum(
         len(str(m.get("content", ""))) for m in messages if isinstance(m, dict)
@@ -83,8 +61,6 @@ def _estimate_input_tokens(messages) -> int:
         + 1
         + MESSAGE_OVERHEAD_TOKENS * len(messages)
     )
-
-
 def _extract_usage(usage) -> dict:
     """Read token accounting without depending on SDK internals."""
     empty = dict.fromkeys(
@@ -99,19 +75,16 @@ def _extract_usage(usage) -> dict:
     )
     if usage is None:
         return empty
-
     prompt = getattr(usage, "prompt_tokens", None)
     completion = getattr(usage, "completion_tokens", None)
     cached = getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", None)
     reasoning = getattr(
         getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None
     )
-
     rate_limit_tokens = None
     if prompt is not None and completion is not None:
         billed_prompt = max(prompt - cached, 0) if cached is not None else prompt
         rate_limit_tokens = billed_prompt + completion
-
     return {
         "prompt_tokens": prompt,
         "cached_tokens": cached,
@@ -120,13 +93,9 @@ def _extract_usage(usage) -> dict:
         "total_tokens": getattr(usage, "total_tokens", None),
         "rate_limit_tokens": rate_limit_tokens,
     }
-
-
 def _status_code(exc) -> int | None:
     status = getattr(exc, "status_code", None)
     return int(status) if isinstance(status, int) else None
-
-
 def _exception_text(exc) -> str:
     parts = [str(exc)]
     for attr in ("message", "body", "code", "type"):
@@ -137,11 +106,8 @@ def _exception_text(exc) -> str:
         except Exception:
             pass
     return " ".join(parts).lower()
-
-
 def _parse_rate_limit_details(text: str) -> dict[str, float | int]:
     """Pull limit / used / requested / retry hint out of a Groq 429 body.
-
     Example body: "... Limit 8000, Used 5807, Requested 4026. Please try again
     in 2.1s". `text` must already be lower-cased.
     """
@@ -150,16 +116,13 @@ def _parse_rate_limit_details(text: str) -> dict[str, float | int]:
         match = re.search(rf"\b{name}\s*[:=]?\s*(\d+)", text)
         if match:
             details[name] = int(match.group(1))
-
     hint = re.search(r"try again in\s+([0-9hms.\s]{1,24})", text)
     if hint:
         units = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
-        found = re.findall(r"(\d+(?:\.\d+)?)(ms|h|m|s)", hint.group(1))
+        found = re.findall(r"(\d+(?:.\d+)?)(ms|h|m|s)", hint.group(1))
         if found:
             details["retry_after"] = sum(float(v) * units[u] for v, u in found)
     return details
-
-
 def _retry_after_header(exc) -> float | None:
     try:
         headers = getattr(getattr(exc, "response", None), "headers", None)
@@ -170,8 +133,6 @@ def _retry_after_header(exc) -> float | None:
     except (TypeError, ValueError):
         pass
     return None
-
-
 def _is_too_large(exc, status: int | None, text: str) -> bool:
     """True when the request itself can never fit, so retrying is futile."""
     if isinstance(exc, RequestTooLargeError) or status == 413:
@@ -184,8 +145,6 @@ def _is_too_large(exc, status: int | None, text: str) -> bool:
     ):
         return True
     return status in (400, 422) and any(m in text for m in _TOO_LARGE_MARKERS)
-
-
 def _classify(exc) -> str:
     """Map an exception to a failure kind; each kind has its own policy."""
     if isinstance(exc, InvalidResponseError):
@@ -210,8 +169,6 @@ def _classify(exc) -> str:
     if any(marker in name for marker in ("connect", "network", "protocol", "transport")):
         return "connection"
     return "unexpected"
-
-
 def _terminal_error(kind: str, exc) -> Exception:
     """The exception raised once a failure will not be retried."""
     if isinstance(exc, LLMError) and kind in ("invalid_response", "request_too_large"):
@@ -229,32 +186,18 @@ def _terminal_error(kind: str, exc) -> Exception:
     if kind in ("invalid_request", "invalid_response"):
         return InvalidResponseError(str(exc))
     return ProviderUnavailableError(f"Groq request failed: {exc}")
-
-
 class GroqProvider:
     """Groq adapter with deterministic per-task API-key affinity."""
-
-    def __init__(self, clients=None, scheduler: QuotaScheduler | None = None):
+    def __init__(self, clients=None):
         self.clients = clients or [
             Groq(api_key=key, timeout=REQUEST_TIMEOUT, max_retries=0)
             for key in GROQ_API_KEYS
         ]
-        self.scheduler = scheduler or QuotaScheduler(
-            key_count=len(self.clients),
-            limit_for=_tpm_limit,
-            admission_ratio=TPM_ADMISSION_RATIO,
-            window_seconds=TPM_WINDOW_SECONDS,
-            max_wait=MAX_ADMISSION_WAIT_SECONDS,
-            max_bypass=ADMISSION_MAX_BYPASS,
-        )
         self._sleep = time.sleep  # replaceable in tests
-
     # -- Groq call -----------------------------------------------------------
-
     @staticmethod
     def _create(client, kwargs: dict):
         """Call Groq, returning (response, headers).
-
         Uses the SDK's raw-response wrapper when present to capture provider
         headers for diagnostics.
         """
@@ -264,35 +207,26 @@ class GroqProvider:
             response = raw.create(**kwargs)
             return response.parse(), getattr(response, "headers", None) or {}
         return completions.create(**kwargs), {}
-
-    def _sync_from_headers(self, lease: Lease, headers) -> None:
-        """Record provider headers for diagnostics without local quota admission.
-
-        Groq's response headers are authoritative. They are intentionally not
-        mirrored into a per-process scheduler because that would create a
-        second, potentially stale TPM gate.
-        """
+    def _sync_from_headers(self, key_index: int, model: str, headers) -> None:
+        """Log Groq rate-limit headers for diagnostics only."""
         if headers:
             logger.debug(
                 "[LLM_PROVIDER_LIMITS] key=%s model=%s remaining_tokens=%s limit_tokens=%s",
-                lease.key_index,
-                lease.model,
+                key_index,
+                model,
                 headers.get("x-ratelimit-remaining-tokens"),
                 headers.get("x-ratelimit-limit-tokens"),
             )
-
     # -- failure policy ------------------------------------------------------
-
     def _backoff(self, n: int) -> float:
         return RETRY_BACKOFF_SECONDS * (2 ** (n - 1)) + random.uniform(0, 0.25)
-
     def _after_failure(
         self,
         *,
         exc,
         task: str,
         model: str,
-        lease: Lease,
+        key_index: int,
         attempt: int,
         retries: dict[str, int],
         started: float,
@@ -301,19 +235,17 @@ class GroqProvider:
         kind = _classify(exc)
         status = _status_code(exc)
         text = _exception_text(exc)
-
         logger.warning(
             "[LLM_FAILURE] task=%s model=%s key=%s assigned_key=%s attempt=%s/%s status=%s "
-            "failure_type=%s reserved_tokens=%s latency_seconds=%.3f error=%s",
+            "failure_type=%s latency_seconds=%.3f error=%s",
             task,
             model,
-            lease.key_index,
+            key_index,
             TASK_API_KEY_INDEX.get(task),
             attempt,
             MAX_ATTEMPTS,
             status,
             kind,
-            lease.reserved,
             time.monotonic() - started,
             exc,
             exc_info=(kind == "unexpected"),
@@ -322,13 +254,12 @@ class GroqProvider:
             usage_log.CallUsage(
                 task=task,
                 model=model,
-                key_index=lease.key_index,
+                key_index=key_index,
                 attempt=attempt,
                 status="failed",
                 latency_seconds=time.monotonic() - started,
             )
         )
-
         if kind == "rate_limit":
             details = _parse_rate_limit_details(text)
             hint = _retry_after_header(exc)
@@ -337,10 +268,10 @@ class GroqProvider:
             logger.warning(
                 "[LLM_RATE_LIMIT] task=%s model=%s key=%s provider_retry_after=%s "
                 "provider_limit=%s provider_used=%s provider_requested=%s; "
-                "no key rotation or local cooldown",
+                "no key rotation",
                 task,
                 model,
-                lease.key_index,
+                key_index,
                 hint,
                 details.get("limit"),
                 details.get("used"),
@@ -352,14 +283,12 @@ class GroqProvider:
                 "no cross-account fallback",
                 task,
                 model,
-                lease.key_index,
+                key_index,
                 status,
             )
-
         used = retries.get(kind, 0)
         if used >= RETRY_LIMITS.get(kind, 0) or attempt >= MAX_ATTEMPTS:
             raise _terminal_error(kind, exc) from exc
-
         retries[kind] = used + 1
         delay = 0.0
         if kind in _TRANSIENT_KINDS:
@@ -369,22 +298,20 @@ class GroqProvider:
             "delay_seconds=%.2f",
             task,
             model,
-            lease.key_index,
+            key_index,
             kind,
             attempt + 1,
             MAX_ATTEMPTS,
             delay,
         )
         return delay
-
     # -- accounting ------------------------------------------------------------
-
     def _account(
         self,
         *,
         task: str,
         model: str,
-        lease: Lease,
+        key_index: int,
         attempt: int,
         usage,
         finish: str | None,
@@ -393,25 +320,18 @@ class GroqProvider:
         started: float,
         status: str,
     ) -> None:
-        """Settle the reservation with actual usage, then log and record it.
-
-        Observability only: nothing here can change a request.
-        """
+        """Log provider usage; accounting never gates or changes requests."""
         tokens = _extract_usage(usage)
-        # Close the zero-token scheduler lease. Actual provider usage is still
-        # recorded below, but never feeds a local TPM admission calculation.
-        bucket_used = self.scheduler.settle(lease, 0)
         latency = time.monotonic() - started
         try:
             logger.info(
                 "[LLM_USAGE] task=%s model=%s key=%s attempt=%s status=%s finish=%s "
                 "estimated_input=%s input_tokens=%s max_tokens=%s "
                 "completion_tokens=%s reasoning_tokens=%s total_tokens=%s "
-                "cached_tokens=%s rate_limit_tokens=%s bucket_window_used=%s "
-                "queue_wait_seconds=%.3f latency_seconds=%.3f",
+                "cached_tokens=%s rate_limit_tokens=%s latency_seconds=%.3f",
                 task,
                 model,
-                lease.key_index,
+                key_index,
                 attempt,
                 status,
                 finish,
@@ -423,8 +343,6 @@ class GroqProvider:
                 tokens["total_tokens"],
                 tokens["cached_tokens"],
                 tokens["rate_limit_tokens"],
-                bucket_used,
-                lease.waited,
                 latency,
             )
             if finish == "length":
@@ -433,7 +351,7 @@ class GroqProvider:
                     "output was cut off",
                     task,
                     model,
-                    lease.key_index,
+                    key_index,
                     max_tokens,
                     tokens["reasoning_tokens"],
                 )
@@ -441,7 +359,7 @@ class GroqProvider:
                 usage_log.CallUsage(
                     task=task,
                     model=model,
-                    key_index=lease.key_index,
+                    key_index=key_index,
                     attempt=attempt,
                     status=status,
                     prompt_tokens=tokens["prompt_tokens"],
@@ -454,9 +372,7 @@ class GroqProvider:
             )
         except Exception:
             pass
-
     # -- public API ------------------------------------------------------------
-
     def generate(
         self,
         *,
@@ -472,7 +388,6 @@ class GroqProvider:
         input_hint: int | None = None,
     ):
         """Run one Groq request with bounded, per-failure-kind retries.
-
         stream=False returns the Groq completion. stream=True returns a live
         iterator of Groq chunks (see module docstring for retry semantics).
         `max_tokens` is used exactly as given, with one exception: if Groq
@@ -481,10 +396,7 @@ class GroqProvider:
         estimate), provided a usable completion remains.
         """
         estimated_input = _estimate_input_tokens(messages)
-        # Prompt estimates are observability only. Groq is the authority for
-        # TPM/context limits; the local scheduler must not reject valid calls.
-        reserved = 0
-
+        # Prompt estimates are diagnostic only; Groq enforces its own limits.
         if input_hint and estimated_input > input_hint:
             logger.info(
                 "[LLM_PROMPT_SIZE] task=%s estimated_input_tokens=%s input_hint=%s; "
@@ -493,7 +405,6 @@ class GroqProvider:
                 estimated_input,
                 input_hint,
             )
-
         kwargs = {
             "model": model,
             "messages": messages,
@@ -507,61 +418,41 @@ class GroqProvider:
             kwargs["reasoning_effort"] = reasoning_effort
         if stream:
             kwargs["stream"] = True
-
         retries: dict[str, int] = {}
         shrunk = False
-
         for attempt in range(1, MAX_ATTEMPTS + 1):
-            try:
-                assigned_key = TASK_API_KEY_INDEX.get(task)
-                if assigned_key is None:
-                    raise ValueError(
-                        f"LLM task {task!r} has no dedicated Groq API-key assignment."
-                    )
-                lease = self.scheduler.acquire(
-                    model, reserved, key_index=assigned_key
+            assigned_key = TASK_API_KEY_INDEX.get(task)
+            if assigned_key is None:
+                raise ValueError(
+                    f"LLM task {task!r} has no dedicated Groq API-key assignment."
                 )
-            except LLMError as exc:
-                logger.error(
-                    "[LLM_FAILURE] task=%s model=%s attempt=%s/%s failure_type=%s "
-                    "reserved_tokens=%s not sent: %s",
-                    task,
-                    model,
-                    attempt,
-                    MAX_ATTEMPTS,
-                    type(exc).__name__,
-                    reserved,
-                    exc,
+            if not isinstance(assigned_key, int) or not 0 <= assigned_key < len(self.clients):
+                raise ValueError(
+                    f"LLM task {task!r} has invalid Groq API-key index {assigned_key!r}."
                 )
-                raise
+            key_index = assigned_key
             started = time.monotonic()
             logger.info(
                 "[LLM_REQUEST] task=%s model=%s key=%s assigned_key=%s attempt=%s/%s "
-                "estimated_input=%s max_tokens=%s reserved=%s bucket_window_used=%s "
-                "queue_wait_seconds=%.3f stream=%s reasoning_effort=%s",
+                "estimated_input=%s max_tokens=%s stream=%s reasoning_effort=%s",
                 task,
                 model,
-                lease.key_index,
+                key_index,
                 TASK_API_KEY_INDEX.get(task),
                 attempt,
                 MAX_ATTEMPTS,
                 estimated_input,
                 max_tokens,
-                reserved,
-                lease.bucket_used,
-                lease.waited,
                 stream,
                 # What is actually placed in the provider request (None means
                 # the parameter is omitted and the model default applies).
                 kwargs.get("reasoning_effort"),
             )
-
             try:
-                response, headers = self._create(self.clients[lease.key_index], kwargs)
+                response, headers = self._create(self.clients[key_index], kwargs)
                 if not stream and not getattr(response, "choices", None):
                     raise InvalidResponseError("Groq returned no choices.")
             except Exception as exc:
-                self.scheduler.release(lease)
                 # Provider-guided fit: Groq counts input + max_tokens against
                 # the TPM limit and reports "Limit L, Requested R". Lower
                 # max_tokens by exactly R - L (once) instead of failing.
@@ -592,7 +483,7 @@ class GroqProvider:
                     exc=exc,
                     task=task,
                     model=model,
-                    lease=lease,
+                    key_index=key_index,
                     attempt=attempt,
                     retries=retries,
                     started=started,
@@ -600,26 +491,22 @@ class GroqProvider:
                 if delay:
                     self._sleep(delay)
                 continue
-
             if stream:
-                # Headers arrive with the response head, so they already count
-                # this request's reservation; sync now.
-                self._sync_from_headers(lease, headers)
+                self._sync_from_headers(key_index, model, headers)
                 return self._wrap_stream(
                     stream=response,
                     task=task,
                     model=model,
-                    lease=lease,
+                    key_index=key_index,
                     attempt=attempt,
                     max_tokens=max_tokens,
                     estimated_input=estimated_input,
                     started=started,
                 )
-
             self._account(
                 task=task,
                 model=model,
-                lease=lease,
+                key_index=key_index,
                 attempt=attempt,
                 usage=getattr(response, "usage", None),
                 finish=getattr(response.choices[0], "finish_reason", None),
@@ -628,33 +515,23 @@ class GroqProvider:
                 started=started,
                 status="success",
             )
-            # After settling: the bucket's tracked total now holds actual usage,
-            # so the provider's figure can only raise it to the true level.
-            self._sync_from_headers(lease, headers)
+            self._sync_from_headers(key_index, model, headers)
             return response
-
         # Unreachable: the final attempt always returns or raises above.
         raise ProviderUnavailableError("Groq request failed.")
-
     def _wrap_stream(
         self,
         *,
         stream,
         task: str,
         model: str,
-        lease: Lease,
+        key_index: int,
         attempt: int,
         max_tokens: int,
         estimated_input: int,
         started: float,
     ) -> Iterator:
-        """Forward a live Groq stream, capturing the terminal usage chunk.
-
-        Text chunks pass through untouched. The reservation is settled and usage
-        logged exactly once, in `finally`, whether the stream finishes, the
-        consumer closes it early, or it fails midway. If Groq never sent usage
-        the reservation is kept as the conservative charge.
-        """
+        """Forward a live Groq stream and log usage exactly once in `finally`."""
         usage = None
         finish = None
         completed = False
@@ -681,7 +558,7 @@ class GroqProvider:
             self._account(
                 task=task,
                 model=model,
-                lease=lease,
+                key_index=key_index,
                 attempt=attempt,
                 usage=usage,
                 finish=finish,
@@ -690,7 +567,6 @@ class GroqProvider:
                 started=started,
                 status="success" if completed else "stream_incomplete",
             )
-
     def generate_text_stream(
         self,
         *,
@@ -705,7 +581,6 @@ class GroqProvider:
         on_finish: Callable[[str | None], None] | None = None,  # QP-FIX-1
     ) -> Iterator[str]:
         """Yield plain text deltas; Groq chunk structures stay in this file.
-
         Nothing is retried once data has been yielded, since a transparent retry
         would duplicate part of the answer. Failures while establishing the
         stream are handled by `generate`; failures after it started surface as
@@ -745,12 +620,8 @@ class GroqProvider:
             raise ProviderUnavailableError("Groq streaming request failed.") from exc
         finally:
             response.close()  # runs _wrap_stream's finally if we stopped early
-
-
 _provider: GroqProvider | None = None
 _provider_lock = threading.Lock()
-
-
 def get_provider() -> GroqProvider:
     global _provider
     if _provider is None:

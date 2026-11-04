@@ -44,7 +44,11 @@ DELIVERABLE
   "in Python", or "based on the file" does not change this. Prose is never
   software: study/exam answers, essays, explanations, summaries, evaluations,
   grading, critiques, corrections and rewrites of text (including an earlier
-  QueryPilot answer) are NOT authored_software.
+  QueryPilot answer) are NOT authored_software. A report, reconciliation,
+  table, list, total or other calculation computed FROM the user's uploaded
+  data is an answer (answer_from_documents) even when phrased "prepare",
+  "generate", "build" or "create"; authored_software needs executable or
+  reusable code/formula text to be written.
 - not_applicable: social, product, workspace, conversation, or nothing substantive.
 Topic never decides deliverable: "average salary from salary.xlsx" is an answer;
 "write code for average salary" is authored software.

@@ -21,6 +21,7 @@ Metadata is built in two tiers so a request only pays for what it uses:
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from typing import Any, Iterable
@@ -168,11 +169,76 @@ def _load_table_details(
         cursor.execute(f"SELECT * FROM `{table_name}` LIMIT 5")
         sample_rows = cursor.fetchall()
 
+    numeric_columns = _detect_numeric_columns(columns, sample_rows)
+    row_count = _count_rows(connection, table_name)
     return {
-        "numeric_columns": _detect_numeric_columns(columns, sample_rows),
-        "row_count": _count_rows(connection, table_name),
+        "numeric_columns": numeric_columns,
+        "row_count": row_count,
         "sample_rows": [dict(zip(columns, row)) for row in sample_rows[:5]],
+        "categorical_values": _load_categorical_values(
+            connection, table_name, columns, numeric_columns, row_count
+        ),
     }
+
+
+_CATEGORY_MAX_VALUES = 12
+_CATEGORY_MAX_COLUMNS = 12
+_CATEGORY_MAX_ROWS = 5000
+_CATEGORY_VALUE_CHARS = 40
+_IDENTIFIER_WORDS = {
+    "id", "ids", "code", "key", "ref", "reference", "no", "number", "num",
+    "sku", "uid", "uuid", "time", "date", "timestamp", "email", "phone",
+    "name", "description", "reason", "note", "notes", "comment", "address",
+}
+
+
+def _load_categorical_values(
+    connection,
+    table_name: str,
+    columns: list[str],
+    numeric_columns: list[str],
+    row_count: int,
+) -> dict[str, list[str]]:
+    """Exact stored values of short status/category-style text columns.
+
+    Lets SQL generation spell filters exactly as stored (for example
+    ``Processed`` or ``Success``) instead of guessing from the question's
+    wording. Skips numeric, identifier-like, date-like and free-text columns and
+    large tables, so the cost stays at a few tiny DISTINCT reads. Best effort:
+    any failure just means no hints for that table.
+    """
+    if not row_count or row_count > _CATEGORY_MAX_ROWS:
+        return {}
+    numeric = set(numeric_columns)
+    found: dict[str, list[str]] = {}
+    checked = 0
+    for column in columns:
+        if column in numeric or checked >= _CATEGORY_MAX_COLUMNS:
+            continue
+        words = re.split(r"[^a-z0-9]+", re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", column).lower())
+        if words and words[-1] in _IDENTIFIER_WORDS:
+            continue
+        checked += 1
+        quoted = "`" + column.replace("`", "``") + "`"
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT DISTINCT {quoted} FROM `{table_name}` "
+                    f"WHERE {quoted} IS NOT NULL LIMIT {_CATEGORY_MAX_VALUES + 1}"
+                )
+                values = [row[0] for row in cursor.fetchall()]
+        except Exception:
+            logger.debug("categorical values skipped for %s.%s", table_name, column)
+            continue
+        if not values or len(values) > _CATEGORY_MAX_VALUES:
+            continue
+        texts = [str(v) for v in values]
+        if all(t.replace(".", "", 1).replace("-", "", 1).isdigit() for t in texts):
+            continue
+        if any(len(t) > _CATEGORY_VALUE_CHARS for t in texts):
+            continue
+        found[column] = sorted(texts)
+    return found
 
 
 def _schema_item(
@@ -184,6 +250,11 @@ def _schema_item(
     item["columns"] = list(index_item["columns"])  # never alias the cache
     item["numeric_columns"] = list(details["numeric_columns"])
     item["row_count"] = details["row_count"]
+    if details.get("categorical_values"):
+        item["categorical_values"] = {
+            column: list(values)
+            for column, values in details["categorical_values"].items()
+        }
     if include_sample_rows:
         item["sample_rows"] = [dict(row) for row in details["sample_rows"]]
     return item

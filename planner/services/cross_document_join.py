@@ -804,3 +804,432 @@ def run_cross_document_join(
     outcome["tables"] = new_tables
     outcome["documents"] = new_docs
     return outcome
+
+
+# ---------------------------------------------------------------------------
+# Deterministic key join across complete tables (any mix of documents).
+#
+# Questions such as "which orders were late, and what was refunded for each?"
+# need rows from several tables related through a shared identifier. Aligning
+# them by eye in the answer model is slow and error prone, and an LLM-written
+# JOIN across documents is unsafe. This joins rows that were already read
+# through the authorized table tools, in plain Python: no SQL, no LLM. Keys are
+# discovered from the data (same column name + identifier-like name + real
+# value overlap), only complete tables take part, the join is a LEFT join from a
+# hub table so no hub row is lost, and a source table is replaced only when
+# every one of its rows is present in the joined view.
+# ---------------------------------------------------------------------------
+
+_KJ_MAX_ROWS = 400
+_KJ_MAX_COLUMNS = 40
+_KJ_MIN_OVERLAP = 0.5
+
+# Last word of a column name that marks it as an identifier-like column.
+_KJ_KEY_TOKENS = {
+    "id", "ids", "code", "key", "ref", "reference", "no", "number", "num",
+    "sku", "uid", "uuid",
+}
+
+
+def _kj_col_tokens(name: str) -> list[str]:
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", str(name or ""))
+    return [t for t in re.split(r"[^A-Za-z0-9]+", text.lower()) if t]
+
+
+def _kj_norm_col(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+
+
+def _kj_looks_like_key(name: str) -> bool:
+    tokens = _kj_col_tokens(name)
+    return bool(tokens) and tokens[-1] in _KJ_KEY_TOKENS
+
+
+def _kj_norm_val(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    text = str(value).strip().upper()
+    if not text or text in {"NULL", "NONE", "NAN"}:
+        return None
+    return re.sub(r"[\s_\-]", "", text)
+
+
+def _kj_rows(item: dict[str, Any]) -> list[dict[str, Any]]:
+    content = item.get("content")
+    rows = content.get("rows") if isinstance(content, dict) else None
+    if not isinstance(rows, list):
+        return []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _kj_columns(item: dict[str, Any], rows: list[dict[str, Any]]) -> list[str]:
+    content = item.get("content") or {}
+    cols = content.get("columns")
+    if isinstance(cols, list) and cols and all(isinstance(c, str) for c in cols):
+        return list(cols)
+    return list(rows[0].keys()) if rows else []
+
+
+def _kj_table_name(item: dict[str, Any]) -> str:
+    for source in item.get("sources") or []:
+        if isinstance(source, dict) and source.get("table_name"):
+            return str(source["table_name"])
+    return ""
+
+
+def _kj_eligible(item: Any) -> bool:
+    """A complete, successful, raw table read (never an aggregate/filtered result)."""
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("source_type") or "").lower() != "table_query":
+        return False
+    if str(item.get("result_status") or "").upper() != "SUCCESS":
+        return False
+    content = item.get("content")
+    if not isinstance(content, dict) or content.get("truncated"):
+        return False
+    if content.get("evidence_role") != "document_table":
+        return False
+    return bool(_kj_rows(item)) and bool(_kj_table_name(item))
+
+
+def _kj_distinct(rows: list[dict[str, Any]], column: str) -> tuple[set[str], int, int]:
+    values: set[str] = set()
+    non_null = 0
+    for row in rows:
+        value = _kj_norm_val(row.get(column))
+        if value is None:
+            continue
+        non_null += 1
+        values.add(value)
+    return values, non_null, len(values)
+
+
+def _kj_find_edges(tables: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Join candidates between every pair of tables."""
+    edges: list[dict[str, Any]] = []
+    for i in range(len(tables)):
+        for j in range(i + 1, len(tables)):
+            a, b = tables[i], tables[j]
+            for col_a in a["columns"]:
+                if not _kj_looks_like_key(col_a):
+                    continue
+                for col_b in b["columns"]:
+                    if _kj_norm_col(col_a) != _kj_norm_col(col_b):
+                        continue
+                    vals_a, nn_a, d_a = _kj_distinct(a["rows"], col_a)
+                    vals_b, nn_b, d_b = _kj_distinct(b["rows"], col_b)
+                    if not vals_a or not vals_b:
+                        continue
+                    overlap = len(vals_a & vals_b)
+                    if overlap == 0:
+                        continue
+                    if overlap / min(len(vals_a), len(vals_b)) < _KJ_MIN_OVERLAP:
+                        continue
+                    # At least one side must be a real key (one row per value),
+                    # otherwise this is two fact tables sharing a label column.
+                    unique_a = nn_a > 0 and d_a / nn_a >= 0.9
+                    unique_b = nn_b > 0 and d_b / nn_b >= 0.9
+                    if not (unique_a or unique_b):
+                        continue
+                    edges.append(
+                        {
+                            "a": i, "col_a": col_a,
+                            "b": j, "col_b": col_b,
+                            "overlap": overlap,
+                            "distinct_a": d_a, "distinct_b": d_b,
+                        }
+                    )
+    return edges
+
+
+def _kj_components(count: int, edges: list[dict[str, Any]]) -> list[list[int]]:
+    parent = list(range(count))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for edge in edges:
+        parent[find(edge["a"])] = find(edge["b"])
+    groups: dict[int, list[int]] = {}
+    for index in range(count):
+        groups.setdefault(find(index), []).append(index)
+    return [sorted(g) for g in groups.values() if len(g) >= 2]
+
+
+def _kj_label(table: dict[str, Any]) -> str:
+    title = str(table.get("title") or "").strip()
+    title = re.sub(r"\.[A-Za-z0-9]{2,5}$", "", title)
+    name = table["name"]
+    suffix = re.search(r"(table_\d+)$", name)
+    base = re.sub(r"[^A-Za-z0-9]+", "_", title).strip("_") or name
+    return f"{base}.{suffix.group(1)}" if suffix else base
+
+
+def _kj_join_component(
+    tables: list[dict[str, Any]],
+    members: list[int],
+    edges: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    member_set = set(members)
+    local_edges = [e for e in edges if e["a"] in member_set and e["b"] in member_set]
+
+    # Hub: the table that owns the most distinct key values (ties: more rows).
+    def hub_score(index: int) -> tuple[int, int]:
+        best = 0
+        for e in local_edges:
+            if e["a"] == index:
+                best = max(best, e["distinct_a"])
+            elif e["b"] == index:
+                best = max(best, e["distinct_b"])
+        return best, len(tables[index]["rows"])
+
+    hub = max(members, key=hub_score)
+
+    used_names: set[str] = set()
+    out_columns: list[str] = []
+    origin: dict[str, str] = {}
+
+    def claim(table_index: int, column: str) -> str:
+        if column not in used_names:
+            used_names.add(column)
+            return column
+        candidate = f"{_kj_label(tables[table_index])}.{column}"
+        n = 2
+        unique = candidate
+        while unique in used_names:
+            unique = f"{candidate}_{n}"
+            n += 1
+        used_names.add(unique)
+        return unique
+
+    # Output name of every (table index, source column) already in the view.
+    name_of: dict[tuple[int, str], str] = {}
+    joined: list[dict[str, Any]] = []
+    hub_rows = tables[hub]["rows"]
+    for column in tables[hub]["columns"]:
+        out = claim(hub, column)
+        name_of[(hub, column)] = out
+        out_columns.append(out)
+        origin[out] = tables[hub]["name"]
+    for row in hub_rows:
+        joined.append({name_of[(hub, c)]: row.get(c) for c in tables[hub]["columns"]})
+
+    in_view = {hub}
+    absorbed: dict[int, bool] = {hub: True}  # table index -> every row represented
+    keys_used: list[str] = []
+    pending = set(members) - in_view
+
+    while pending:
+        # Next table connected to something already in the view (best overlap first).
+        candidates = []
+        for e in local_edges:
+            if e["a"] in in_view and e["b"] in pending:
+                candidates.append((e["overlap"], e["b"], e["a"], e["col_a"], e["col_b"]))
+            elif e["b"] in in_view and e["a"] in pending:
+                candidates.append((e["overlap"], e["a"], e["b"], e["col_b"], e["col_a"]))
+        if not candidates:
+            break
+        candidates.sort(key=lambda c: (-c[0], c[1]))
+        _, new_index, have_index, have_col, new_col = candidates[0]
+        new_table = tables[new_index]
+        view_key = name_of[(have_index, have_col)]
+
+        index_by_key: dict[str, list[dict[str, Any]]] = {}
+        for row in new_table["rows"]:
+            key = _kj_norm_val(row.get(new_col))
+            if key is not None:
+                index_by_key.setdefault(key, []).append(row)
+
+        # A column that already exists in the view under the same name and holds
+        # the same value on every matched row (for example a payment method or
+        # transaction id repeated in a second table) adds nothing: keep one copy.
+        duplicate_columns: set[str] = set()
+        for column in new_table["columns"]:
+            if column == new_col or column not in used_names:
+                continue
+            compared = 0
+            same = True
+            for row in joined:
+                key = _kj_norm_val(row.get(view_key))
+                for match in index_by_key.get(key, []) if key is not None else []:
+                    left, right = _kj_norm_val(row.get(column)), _kj_norm_val(match.get(column))
+                    if left is None or right is None:
+                        continue
+                    compared += 1
+                    if left != right:
+                        same = False
+                        break
+                if not same:
+                    break
+            if same and compared > 0:
+                duplicate_columns.add(column)
+
+        new_columns = [
+            c for c in new_table["columns"]
+            if c != new_col and c not in duplicate_columns
+        ]
+        added: dict[str, str] = {}
+        for column in new_columns:
+            out = claim(new_index, column)
+            added[column] = out
+            name_of[(new_index, column)] = out
+            out_columns.append(out)
+            origin[out] = new_table["name"]
+        for column in duplicate_columns:
+            name_of[(new_index, column)] = column
+        # The shared key already lives in the view under the existing name.
+        name_of[(new_index, new_col)] = view_key
+
+        matched_keys: set[str] = set()
+        next_rows: list[dict[str, Any]] = []
+        for row in joined:
+            key = _kj_norm_val(row.get(view_key))
+            matches = index_by_key.get(key, []) if key is not None else []
+            if not matches:
+                merged = dict(row)
+                for out in added.values():
+                    merged[out] = None
+                next_rows.append(merged)
+                continue
+            matched_keys.add(key)
+            for match in matches:
+                merged = dict(row)
+                for column, out in added.items():
+                    merged[out] = match.get(column)
+                next_rows.append(merged)
+            if len(next_rows) > _KJ_MAX_ROWS:
+                return None
+        if len(next_rows) > _KJ_MAX_ROWS or len(out_columns) > _KJ_MAX_COLUMNS:
+            return None
+
+        orphan = any(
+            (_kj_norm_val(r.get(new_col)) is None)
+            or (_kj_norm_val(r.get(new_col)) not in matched_keys)
+            for r in new_table["rows"]
+        )
+        absorbed[new_index] = not orphan
+        joined = next_rows
+        in_view.add(new_index)
+        pending.discard(new_index)
+        if view_key not in keys_used:
+            keys_used.append(view_key)
+
+    if len(in_view) < 2:
+        return None
+    return {
+        "hub": hub,
+        "members": sorted(in_view),
+        "rows": joined,
+        "columns": out_columns,
+        "origin": origin,
+        "keys": keys_used,
+        "absorbed": {i for i, ok in absorbed.items() if ok},
+    }
+
+
+def build_joined_view(
+    items: list[Any],
+) -> tuple[dict[str, Any], set[int]] | None:
+    """Join the complete raw tables found in ``items`` on discovered keys.
+
+    Returns ``(evidence_item, absorbed_positions)`` or ``None`` when fewer than
+    two tables relate to each other. ``absorbed_positions`` are the positions in
+    ``items`` whose rows are fully contained in the evidence item.
+    """
+    positions = [i for i, item in enumerate(items) if _kj_eligible(item)]
+    if len(positions) < 2:
+        return None
+
+    tables: list[dict[str, Any]] = []
+    for position in positions:
+        item = items[position]
+        rows = _kj_rows(item)
+        content = item.get("content") or {}
+        source = next(
+            (s for s in item.get("sources") or [] if isinstance(s, dict)), {}
+        )
+        tables.append(
+            {
+                "position": position,
+                "name": _kj_table_name(item),
+                "document_id": source.get("document_id"),
+                "title": content.get("document_title") or "",
+                "rows": rows,
+                "columns": _kj_columns(item, rows),
+            }
+        )
+
+    edges = _kj_find_edges(tables)
+    if not edges:
+        return None
+    groups = _kj_components(len(tables), edges)
+    if not groups:
+        return None
+
+    # One joined view per request: the largest connected group.
+    groups.sort(key=lambda g: (-len(g), g))
+    result = _kj_join_component(tables, groups[0], edges)
+    if result is None:
+        return None
+
+    members = result["members"]
+    sources = [
+        {
+            "table_name": tables[i]["name"],
+            "document_id": tables[i]["document_id"],
+        }
+        for i in members
+    ]
+    titles = list(
+        dict.fromkeys(str(tables[i]["title"]) for i in members if tables[i]["title"])
+    )
+    described = "; ".join(
+        f"{tables[i]['title'] or tables[i]['name']} ({tables[i]['name']})"
+        for i in members
+    )
+    hub_title = tables[result["hub"]]["title"] or tables[result["hub"]]["name"]
+    item = {
+        "source_type": "table_query",
+        "workspace_id": next(
+            (
+                items[tables[i]["position"]].get("workspace_id")
+                for i in members
+                if items[tables[i]["position"]].get("workspace_id") is not None
+            ),
+            None,
+        ),
+        "sources": sources,
+        "content": {
+            "success": True,
+            "columns": result["columns"],
+            "rows": result["rows"],
+            "row_count": len(result["rows"]),
+            "rows_returned": len(result["rows"]),
+            "truncated": False,
+            "tables_used": [s["table_name"] for s in sources],
+            "evidence_role": "key_joined",
+            "join_keys": result["keys"],
+            "document_title": " + ".join(titles) if titles else None,
+            "column_sources": result["origin"],
+            "interpretation": (
+                "Complete rows of several source tables joined deterministically "
+                "on the shared identifier column(s) "
+                + ", ".join(result["keys"])
+                + f", starting from {hub_title}. One output row per matching "
+                "combination; an empty cell means the other table has no row for "
+                "that key. Tables joined: "
+                + described
+                + ". Use this view for cross-table questions (filter, compare, "
+                "list); values are exact source values and nothing is estimated."
+            ),
+        },
+        "result_status": "SUCCESS",
+    }
+    absorbed = {tables[i]["position"] for i in members if i in result["absorbed"]}
+    return item, absorbed

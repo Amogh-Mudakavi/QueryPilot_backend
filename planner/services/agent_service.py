@@ -40,7 +40,10 @@ from planner.services.answer import (
     _parse_answer_response,
     generate_answer_stream,
 )
-from planner.services.cross_document_join import run_cross_document_join
+from planner.services.cross_document_join import (
+    build_joined_view,
+    run_cross_document_join,
+)
 from planner.services.document_coverage import build_document_evidence
 from planner.services.entity_resolution import (
     resolve_entities_from_query,
@@ -1277,6 +1280,78 @@ def _documents_without_text(coverage: Any) -> set[int]:
     return ids
 
 
+_TABULAR_SOURCE_TYPES = {"xlsx", "xls", "xlsm", "csv", "tsv", "ods", "excel", "spreadsheet"}
+_TABULAR_SUFFIXES = (".xlsx", ".xls", ".xlsm", ".csv", ".tsv", ".ods")
+
+
+def _is_tabular_document(document: dict[str, Any]) -> bool:
+    """Spreadsheet-style source: its content lives only in tables, never in text."""
+    source_type = str(document.get("source_type") or "").strip().lower().lstrip(".")
+    if source_type in _TABULAR_SOURCE_TYPES or any(
+        token in source_type for token in ("spreadsheet", "excel", "csv")
+    ):
+        return True
+    title = str(document.get("title") or document.get("document_title") or "")
+    return title.strip().lower().endswith(_TABULAR_SUFFIXES)
+
+
+def _scope_is_table_only(state: AgentState, resources: WorkspaceResources) -> bool:
+    """True when every document this request is about is a spreadsheet/CSV.
+
+    Such a scope has no prose to search, so a text search can only come back
+    empty and must not be reported as missing evidence, and no policy document
+    can exist for the request to wait on. Unknown or unresolved scope returns
+    False so the previous behavior is kept.
+    """
+    document_ids = {
+        document_id
+        for document_id in (
+            _coerce_int(value) for value in _document_ids_for_search(state)
+        )
+        if document_id is not None
+    }
+    if not document_ids:
+        return False
+    by_id = {
+        _coerce_int(entry.get("document_id")): entry
+        for entry in resources.catalog()
+        if isinstance(entry, dict)
+    }
+    for document_id in document_ids:
+        entry = by_id.get(document_id)
+        if entry is None or not _is_tabular_document(entry):
+            return False
+    return True
+
+
+def _add_key_joined_view(items: list[Any]) -> list[Any]:
+    """Relate complete tables of different sources on their shared key columns.
+
+    Deterministic (no SQL, no LLM). Source tables whose every row is contained
+    in the joined view are replaced by it so the answer stage gets one compact,
+    already-aligned table instead of several raw ones; anything else is kept.
+    """
+    try:
+        built = build_joined_view(items)
+    except Exception:
+        logger.exception("key-joined view failed; keeping the raw tables")
+        return items
+    if not built:
+        return items
+    view, absorbed = built
+    kept = [item for position, item in enumerate(items) if position not in absorbed]
+    content = view.get("content") or {}
+    logger.info(
+        "key_joined_view: tables=%d rows=%d columns=%d keys=%s replaced_raw=%d",
+        len(view.get("sources") or []),
+        int(content.get("row_count") or 0),
+        len(content.get("columns") or []),
+        content.get("join_keys"),
+        len(absorbed),
+    )
+    return [view] + kept
+
+
 def _evidence_table_names(item: Any) -> set[str]:
     if not isinstance(item, dict):
         return set()
@@ -2084,6 +2159,31 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
     state = {**state, "resource_context": resources}
     state = _with_table_scope(state, capabilities)
 
+    # Spreadsheet/CSV-only scope: there is no prose to search and no policy
+    # document to wait for. Searching text there only produces a fake
+    # "insufficient evidence" note, so answer from the tables alone.
+    table_only_scope = False
+    if "TABLE_QUERY" in capabilities and "DOCUMENT_SEARCH" in capabilities:
+        try:
+            table_only_scope = _scope_is_table_only(state, resources)
+        except Exception:
+            logger.exception("table-only scope check failed; keeping the plan")
+    if table_only_scope:
+        capabilities = [c for c in capabilities if c != "DOCUMENT_SEARCH"]
+        plan = dict(state.get("execution_plan") or {})
+        plan["capabilities"] = list(capabilities)
+        plan["actions"] = [
+            action for action in plan.get("actions", []) if action != "document_search"
+        ]
+        plan["fallback_capabilities"] = [
+            c for c in plan.get("fallback_capabilities", []) if c != "DOCUMENT_SEARCH"
+        ]
+        state = {**state, "execution_plan": plan}
+        logger.info(
+            "table-only scope: every in-scope document is a spreadsheet/CSV; "
+            "skipping text search and rule-document dependency"
+        )
+
     # An explicit empty selection means the candidate tables were examined
     # and none could support this question. Do not let _run_table interpret an
     # absent table restriction as "all tables" and manufacture an aggregate
@@ -2379,6 +2479,7 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         )
 
         structured = _collapse_subsumed_table_items(structured)
+        structured = _add_key_joined_view(structured)
 
         coverage_notes = reconcile_coverage_notes(
             coverage_notes,
@@ -2399,7 +2500,11 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         # part while explicitly identifying unsupported facts.
         notes: list[Any] = []
 
-        if requires_dependency_discovery(state) and not dependency_evidence_found:
+        if (
+            requires_dependency_discovery(state)
+            and not dependency_evidence_found
+            and not table_only_scope
+        ):
             notes.append(
                 {
                     "source_type": "evidence_note",
@@ -2518,15 +2623,6 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
             "route": "ERROR",
         }
 
-
-# QP-FIX-2: said to the user when even the fitted evidence cannot be answered
-# in one pass. Nothing is guessed from partial data.
-_EVIDENCE_TOO_LARGE_MESSAGE = (
-    "The evidence needed for this question is too large for me to answer "
-    "reliably in one pass, so I stopped instead of guessing from partial data. "
-    "Please ask about fewer items at a time (for example one record or one "
-    "category per question)."
-)
 
 
 def _stream_answer_with_fit(

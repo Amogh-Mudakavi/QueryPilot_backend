@@ -8,7 +8,6 @@ import logging
 import math
 import os
 import re
-from collections import Counter
 from collections.abc import Iterable, Iterator
 from typing import Any
 
@@ -22,7 +21,6 @@ from llm.config import (
 from llm.router import router
 from planner.prompts.answer_prompts import SYSTEM_PROMPT as BASE_SYSTEM_PROMPT
 from planner.services.history import bound_history_for_answer
-from retrieval.services.keys import is_id_column
 
 logger = logging.getLogger(__name__)
 
@@ -44,39 +42,6 @@ MIN_ROWS_WHEN_TRIMMED = 3
 MIN_TEXT_CHARS_WHEN_TRIMMED = 900
 MIN_TEXT_CHARS_LAST_RESORT = 300
 MIN_ROWS_FOR_COVERAGE_REDUCTION = 6
-# Column projection is only an emergency payload-compaction step. These terms
-# identify requests where schema/content completeness matters more than lexical
-# overlap with the question.
-_FULL_CONTENT_QUERY_RE = re.compile(
-    r"\b(?:all available content|all available data|full content|complete content|"
-    r"entire content|full workbook|entire workbook|whole workbook|everything|"
-    r"whatever is there|whatever is available|all cell values|all columns and rows|"
-    r"all rows and columns|every sheet|every column)\b",
-    re.IGNORECASE,
-)
-_TABLE_CONTENT_QUERY_RE = re.compile(
-    r"\b(?:workbook|spreadsheet|sheet|table|row|rows|column|columns|header|headers|cell|cells|content|data|value|values)\b",
-    re.IGNORECASE,
-)
-_SCHEMA_QUERY_RE = re.compile(
-    r"\b(?:headers?|column names|sheet names|list columns|available columns)\b",
-    re.IGNORECASE,
-)
-_ANALYTIC_QUERY_RE = re.compile(
-    r"\b(?:average|avg|mean|sum|total|count|highest|lowest|top|rank|compare|comparison|"
-    r"breach(?:ed|es|ing)?|sla|credit|owe|owed|threshold|compliance|calculate|calculation|"
-    r"eligible|below|above|percentage|percent|rate|variance|difference|shortfall|"
-    r"exceed(?:s|ed|ing)?)\b",
-    re.IGNORECASE,
-)
-_MEASURE_COLUMN_WORDS = frozenset(
-    {
-        "amount", "average", "balance", "charge", "cost", "count", "credit",
-        "day", "delay", "distance", "duration", "fee", "hour", "latency",
-        "percent", "price", "quantity", "rate", "revenue", "score", "time",
-        "total", "uptime", "availability", "value", "variance", "volume", "weight",
-    }
-)
 _CELL_VALUE_STOPWORDS = frozenset(
     {"system", "systems", "service", "services", "company", "companies", "limited", "ltd", "inc", "llc", "corp", "corporation"}
 )
@@ -101,9 +66,6 @@ if COMPLEX_CALCULATION_REASONING_EFFORT not in {"low", "medium", "high"}:
 def _estimate_tokens(text: str) -> int:
     return int(math.ceil(len(text) / CHARS_PER_TOKEN))
 
-
-def _system_tokens() -> int:
-    return _estimate_tokens(SYSTEM_PROMPT)
 
 
 def _completion_budget(
@@ -189,9 +151,6 @@ def _answer_history(
             }
         )
     return trimmed
-_NUMERIC_ONLY = re.compile(r"^[\s\d.,%₹$€£+\-]+$")
-_NOTE_TYPES = {"evidence_note", "source_resolution", "retrieval_assessment"}
-
 
 def _size(value: Any) -> int:
     try:
@@ -202,286 +161,15 @@ def _size(value: Any) -> int:
         return len(str(value))
 
 
-def _cell(value: Any) -> Any:
-    if (
-        isinstance(value, float)
-        and math.isfinite(value)
-        and value.is_integer()
-        and abs(value) < 1e15
-    ):
-        return int(value)
-    return value[:MAX_CELL_CHARS] if isinstance(value, str) else value
-
 
 def _empty(value: Any) -> bool:
     return value is None or value == "" or value == [] or value == {}
 
 
-def _slim(value: Any) -> Any:
-    """Drop empty values and clip long strings, recursively."""
-    if isinstance(value, dict):
-        out = {k: _slim(v) for k, v in value.items()}
-        return {k: v for k, v in out.items() if not _empty(v)}
-    if isinstance(value, list):
-        return [_slim(v) for v in value]
-    if isinstance(value, str):
-        return value[: MAX_CELL_CHARS * 2]
-    return value
-
 
 def _norm(value: Any) -> str:
     return str(value).strip().lower()
 
-
-def _collect_strings(value: Any, out: set[str], depth: int = 0) -> None:
-    """Non-numeric identifying strings inside a value (cells, aggregate parts)."""
-    if depth > 6:
-        return
-    if isinstance(value, str):
-        text = _norm(value)
-        if 2 <= len(text) <= 80 and not _NUMERIC_ONLY.match(text):
-            out.add(text)
-    elif isinstance(value, dict):
-        for inner in value.values():
-            _collect_strings(inner, out, depth + 1)
-    elif isinstance(value, (list, tuple)):
-        for inner in value:
-            _collect_strings(inner, out, depth + 1)
-
-
-def _short_table_ref(name: Any) -> str | None:
-    parts = str(name or "").split("_")
-    if "table" in parts:
-        try:
-            return "table " + parts[parts.index("table") + 1]
-        except IndexError:
-            return None
-    return None
-
-
-def _compact_table(item: dict[str, Any], content: dict[str, Any]) -> dict[str, Any]:
-    columns = [str(c) for c in content.get("columns") or []]
-    rows = content.get("rows") if isinstance(content.get("rows"), list) else []
-    if not columns and rows and isinstance(rows[0], dict):
-        columns = [str(c) for c in rows[0]]
-    packed: list[Any] = []
-    for row in rows:
-        if isinstance(row, dict):
-            packed.append([_cell(row.get(c)) for c in columns])
-        elif isinstance(row, (list, tuple)):
-            packed.append([_cell(v) for v in row])
-        else:
-            packed.append(row)
-    if (
-        columns
-        and packed
-        and all(isinstance(r, list) and len(r) == len(columns) for r in packed)
-    ):
-        keep = [j for j in range(len(columns)) if any(not _empty(r[j]) for r in packed)]
-        if len(keep) != len(columns):
-            columns = [columns[j] for j in keep]
-            packed = [[r[j] for j in keep] for r in packed]
-    document = content.get("document_title")
-    if not document:
-        for source in item.get("sources") or []:
-            if isinstance(source, dict) and source.get("table_name"):
-                document = (
-                    _short_table_ref(source["table_name"]) or source["table_name"]
-                )
-                break
-    out: dict[str, Any] = {
-        "document": document,
-        "scope": content.get("population_scope"),
-        "columns": columns,
-        "rows": packed,
-    }
-    source_rows = content.get("source_rows")
-    if source_rows is None:
-        counts = content.get("source_table_row_counts")
-        if isinstance(counts, dict) and len(counts) == 1:
-            source_rows = next(iter(counts.values()))
-    if source_rows is not None and source_rows != len(packed):
-        out["source_rows"] = source_rows
-    if content.get("truncated"):
-        out["truncated"] = True
-    semantics = content.get("query_semantics")
-    if isinstance(semantics, dict) and semantics.get("type") not in (
-        None,
-        "table_result",
-    ):
-        out["query_type"] = semantics.get("type")
-        if semantics.get("selection") is not None:
-            out["selection"] = semantics.get("selection")
-        if semantics.get("direction"):
-            out["direction"] = semantics.get("direction")
-        if semantics.get("limit") is not None:
-            out["limit"] = semantics.get("limit")
-    if content.get("message"):
-        out["message"] = str(content["message"])[:300]
-    return {k: v for k, v in out.items() if not _empty(v) or k in ("rows", "columns")}
-
-
-def _compact_metadata(content: dict[str, Any]) -> dict[str, Any]:
-    documents = []
-    for doc in content.get("documents", []) or []:
-        if not isinstance(doc, dict):
-            continue
-        entry = {
-            "document_name": doc.get("document_name") or doc.get("title"),
-            "file_type": doc.get("file_type") or doc.get("source_type"),
-            "document_id": doc.get("document_id"),
-        }
-        if doc.get("tables"):
-            entry["tables"] = [
-                {
-                    "table": _short_table_ref(t.get("table_name"))
-                    or t.get("table_name"),
-                    "columns": t.get("columns"),
-                    "rows": t.get("row_count"),
-                }
-                for t in doc["tables"]
-                if isinstance(t, dict)
-            ]
-        elif doc.get("table_count"):
-            entry["table_count"] = doc.get("table_count")
-        documents.append(entry)
-    out: dict[str, Any] = {
-        "document_count": content.get("document_count", len(documents)),
-        "documents": documents,
-    }
-    if content.get("available_documents"):
-        out["available_documents"] = content["available_documents"]
-    return out
-
-
-def _compact_item(item: Any) -> dict[str, Any]:
-    """Compatibility helper that preserves the complete evidence item."""
-    return dict(item) if isinstance(item, dict) else {"content": item}
-
-_compact_item_for_prompt = _compact_item
-_PRODUCT_SECTION_HEADER = re.compile(r"^[A-Z][A-Z0-9 /&'().\-]{2,60}$")
-_PRODUCT_QUERY_STOPWORDS = frozenset(
-    {
-        "about",
-        "and",
-        "are",
-        "be",
-        "by",
-        "can",
-        "could",
-        "did",
-        "do",
-        "does",
-        "for",
-        "give",
-        "how",
-        "in",
-        "is",
-        "it",
-        "its",
-        "list",
-        "me",
-        "of",
-        "on",
-        "or",
-        "please",
-        "show",
-        "tell",
-        "that",
-        "the",
-        "this",
-        "to",
-        "was",
-        "were",
-        "what",
-        "when",
-        "where",
-        "which",
-        "who",
-        "whom",
-        "whose",
-        "why",
-        "would",
-        "you",
-        "your",
-    }
-)
-
-
-def _split_product_sections(content: str) -> list[tuple[str, str]]:
-    """[(header, body)] in document order. A header is a short ALL-CAPS
-    line; everything up to the next header is that section's body."""
-    sections: list[tuple[str, str]] = []
-    header = ""
-    body: list[str] = []
-    def flush() -> None:
-        text = "\n".join(body).strip("\n")
-        if header or text:
-            sections.append((header, text))
-    for raw_line in str(content).splitlines():
-        line = raw_line.strip()
-        if line and _PRODUCT_SECTION_HEADER.match(line):
-            flush()
-            header = line
-            body = []
-        else:
-            body.append(raw_line)
-    flush()
-    return sections
-
-
-def _section_score(header: str, body: str, tokens: list[str]) -> int:
-    """Header hits count double: the header names the section's topic."""
-    header_lower = header.lower()
-    body_lower = body.lower()
-    score = 0
-    for token in tokens:
-        if token in header_lower:
-            score += 2
-        score += body_lower.count(token)
-    return score
-
-
-def _relevant_product_sections(content: str, query: str, max_chars: int) -> str:
-    """
-    Reduce an over-budget product knowledge document to whole sections,
-    most relevant to the current query first (document order on ties;
-    the result keeps document order). At least one section - the most
-    relevant - is always kept even if it alone exceeds max_chars: the
-    fact the query needs is never deleted to satisfy a character budget.
-    """
-    sections = _split_product_sections(content)
-    if not sections:
-        return content
-    tokens = [
-        token
-        for token in re.findall(r"[a-z0-9]+", str(query or "").lower())
-        if len(token) > 2 and token not in _PRODUCT_QUERY_STOPWORDS
-    ]
-    if tokens:
-        ranked = sorted(
-            range(len(sections)),
-            key=lambda i: (
-                -_section_score(sections[i][0], sections[i][1], tokens),
-                i,
-            ),
-        )
-    else:
-        ranked = list(range(len(sections)))
-    def section_text(index: int) -> str:
-        header, body = sections[index]
-        return f"{header}\n\n{body}".strip() if header else body
-    selected: list[int] = []
-    used = 0
-    for index in ranked:
-        length = len(section_text(index)) + 2
-        if selected and used + length > max_chars:
-            continue
-        selected.append(index)
-        used += length
-    if not selected:
-        return content
-    return "\n\n".join(section_text(index) for index in sorted(selected))
 
 
 def _is_table(item: dict[str, Any]) -> bool:
@@ -494,233 +182,7 @@ def _is_table(item: dict[str, Any]) -> bool:
     )
 
 
-def _anchor_strings(evidence: list[Any]) -> set[str]:
-    """
-    Identifying values of the records the question is actually about:
-    matched join keys, the rows of focused results (entity / key-joined /
-    query results) and the named rows inside validated aggregates (extremes,
-    related records). Domain-neutral: values only, never column names.
-    """
-    anchors: set[str] = set()
-    for item in evidence:
-        if not isinstance(item, dict):
-            continue
-        content = item.get("content")
-        metadata = item.get("metadata")
-        if isinstance(metadata, dict):
-            _collect_strings(metadata.get("matched_keys"), anchors)
-        if not isinstance(content, dict):
-            continue
-        _collect_strings(content.get("matched_keys"), anchors)
-        _collect_strings(content.get("join_keys"), anchors)
-        role = content.get("evidence_role")
-        if role == "aggregate_result":
-            _collect_strings(content.get("aggregates"), anchors)
-            _collect_strings(content.get("relationships"), anchors)
-        elif role == "selection_result":
-            _collect_strings(content.get("selection_result"), anchors)
-        elif role in {"entity_row", "key_joined", "query_result"}:
-            _collect_strings(content.get("rows"), anchors)
-    return anchors
 
-
-def _anchored_rows(rows: list[Any], anchors: set[str]) -> list[bool]:
-    """
-    A row is anchored when it holds an anchor value that is selective in this
-    table (so a value shared by most rows, such as a category, does not pull
-    the whole table in).
-    """
-    per_row: list[set[str]] = []
-    for row in rows:
-        found: set[str] = set()
-        _collect_strings(row, found)
-        per_row.append(found)
-    counts = Counter(s for found in per_row for s in found)
-    limit = max(1, len(rows) // 3)
-    return [
-        any(s in anchors and counts[s] <= limit for s in found) for found in per_row
-    ]
-
-
-def _dedupe_notes(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    seen: set[tuple[Any, ...]] = set()
-    out = []
-    for item in items:
-        content = item.get("content")
-        if isinstance(content, str):
-            key = (item.get("source_type"), item.get("result_status"), content)
-            if key in seen:
-                continue
-            seen.add(key)
-        out.append(item)
-    return out
-
-
-def _reduce_covered_tables(
-    items: list[dict[str, Any]], anchors: set[str]
-) -> list[dict[str, Any]]:
-    """
-    When a validated aggregate already covers a table's whole population, the
-    other rows of that table are redundant raw representations of the same
-    facts. Keep the rows the question is about (anchored) and say, explicitly,
-    that population figures live in the aggregate item. Tables without such
-    coverage are never reduced here.
-    """
-    coverage: dict[str, tuple[int, str]] = {}
-    for item in items:
-        content = item.get("content")
-        if not isinstance(content, dict) or content.get("scope") != "aggregate_result":
-            continue
-        document = content.get("document")
-        try:
-            population = int(content.get("population_rows"))
-        except (TypeError, ValueError):
-            continue
-        if document:
-            text = json.dumps(
-                [content.get("aggregates"), content.get("formulas")],
-                ensure_ascii=False,
-                default=str,
-            ).lower()
-            previous = coverage.get(document)
-            coverage[document] = (
-                max(population, previous[0]) if previous else population,
-                (previous[1] if previous else "") + text,
-            )
-    if not coverage or not anchors:
-        return items
-    for item in items:
-        if not _is_table(item):
-            continue
-        content = item["content"]
-        rows = content["rows"]
-        entry = coverage.get(content.get("document"))
-        if entry is None or len(rows) <= MIN_ROWS_FOR_COVERAGE_REDUCTION:
-            continue
-        population, aggregate_text = entry
-        if population < len(rows):
-            continue
-        if not any(str(c).lower() in aggregate_text for c in content["columns"]):
-            continue
-        flags = _anchored_rows(rows, anchors)
-        kept = [row for row, flag in zip(rows, flags) if flag]
-        if not kept or len(kept) == len(rows):
-            continue
-        content["source_rows"] = content.get("source_rows", len(rows))
-        content["rows_covered_by_aggregate"] = len(rows) - len(kept)
-        content["scope"] = "aggregate_covered_subset"
-        content["rows"] = kept
-    return items
-
-
-def _dedupe_rows_across_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    One authoritative representation per row: a row that already appears in a
-    larger item of the same source and column set is not sent twice. An item
-    left with nothing but duplicates is dropped unless it carries its own
-    semantics (ranking/aggregate type, message); then it keeps that and points
-    to the item that holds the rows.
-    Ranking / positional execution results are never touched: their rows ARE
-    the answer (an ordered, limited selection), not a redundant copy.
-    """
-    tables = [(pos, item) for pos, item in enumerate(items) if _is_table(item)]
-    tables.sort(key=lambda pair: -len(pair[1]["content"]["rows"]))
-    seen: dict[tuple[Any, ...], dict[str, int]] = {}
-    drop: set[int] = set()
-    for pos, item in tables:
-        content = item["content"]
-        if content.get("query_type") in {"ranking", "positional"}:
-            continue
-        identity = (content.get("document"), tuple(content["columns"]))
-        registry = seen.setdefault(identity, {})
-        fresh, owners = [], []
-        for row in content["rows"]:
-            key = json.dumps(row, ensure_ascii=False, default=str)
-            if key in registry:
-                owners.append(registry[key])
-            else:
-                registry[key] = item["citation_index"]
-                fresh.append(row)
-        if not owners:
-            continue
-        if fresh:
-            content["rows"] = fresh
-            content["other_rows_in"] = sorted(set(owners))
-        elif any(k in content for k in ("query_type", "message", "truncated")):
-            content["rows"] = []
-            content["rows_in"] = sorted(set(owners))
-        else:
-            drop.add(pos)
-    return [item for pos, item in enumerate(items) if pos not in drop]
-_QUESTION_FILLER = frozenset(
-    {
-        "a",
-        "an",
-        "the",
-        "of",
-        "for",
-        "to",
-        "and",
-        "or",
-        "in",
-        "on",
-        "with",
-        "by",
-        "me",
-        "my",
-        "give",
-        "show",
-        "list",
-        "tell",
-        "all",
-        "those",
-        "these",
-        "that",
-        "their",
-        "them",
-        "also",
-        "what",
-        "who",
-        "which",
-        "is",
-        "are",
-        "was",
-        "were",
-        "please",
-        "then",
-        "than",
-        "from",
-        "who",
-        "whose",
-        "each",
-        "every",
-    }
-)
-
-
-def _word_roots(text: Any) -> set[str]:
-    """Normalize common column/query wording before matching schema terms."""
-    spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(text or ""))
-    words = re.findall(r"[a-z0-9]+", spaced.lower())
-    aliases = {
-        "monthly": "month",
-        "quarterly": "quarter",
-        "percentage": "percent",
-        "percentages": "percent",
-        "pct": "percent",
-        "avg": "average",
-        "q1": "quarter",
-        "q2": "quarter",
-        "q3": "quarter",
-        "q4": "quarter",
-    }
-    roots: set[str] = set()
-    for word in words:
-        if word in _QUESTION_FILLER or word.isdigit():
-            continue
-        root = word[:-1] if len(word) > 3 and word.endswith("s") else word
-        roots.add(aliases.get(root, root))
-    return roots
 
 
 def _cell_is_mentioned(cell: Any, question: str) -> bool:
@@ -745,144 +207,7 @@ def _cell_is_mentioned(cell: Any, question: str) -> bool:
     return False
 
 
-def _columns_to_keep(
-    columns: list[str],
-    rows: list[list[Any]],
-    question: str,
-    question_words: set[str],
-) -> list[int]:
-    """Choose safe columns to retain during last-resort budget compaction.
-    Full-content requests retain every column. Calculation/decision queries
-    also retain numeric measure columns even when the user describes the
-    business rule (for example, an SLA breach) rather than the exact header
-    (for example, ``uptime_pct``).
-    """
-    full_content_request = bool(
-        _FULL_CONTENT_QUERY_RE.search(question)
-        and _TABLE_CONTENT_QUERY_RE.search(question)
-    )
-    schema_request = bool(_SCHEMA_QUERY_RE.search(question))
-    if full_content_request or schema_request:
-        return list(range(len(columns)))
-    analytic_query = bool(_ANALYTIC_QUERY_RE.search(question))
-    keep: list[int] = []
-    for position, column in enumerate(columns):
-        roots = _word_roots(column)
-        is_key_or_identity = is_id_column(column) or "name" in roots
-        is_named = bool(roots & question_words)
-        has_mentioned_value = any(
-            _cell_is_mentioned(row[position], question) for row in rows
-        )
-        is_measure = bool(roots & _MEASURE_COLUMN_WORDS)
-        has_numeric_value = any(
-            (isinstance(row[position], (int, float)) and not isinstance(row[position], bool))
-            or (
-                isinstance(row[position], str)
-                and bool(_NUMERIC_ONLY.fullmatch(row[position].strip()))
-                and any(ch.isdigit() for ch in row[position])
-            )
-            for row in rows
-        )
-        keep_measure_for_calculation = analytic_query and is_measure and has_numeric_value
-        if (
-            is_key_or_identity
-            or is_named
-            or has_mentioned_value
-            or keep_measure_for_calculation
-        ):
-            keep.append(position)
-    return keep
 
-
-def _project_columns(
-    item: dict[str, Any], question: str, question_words: set[str]
-) -> bool:
-    """Narrow one table to the columns the question needs. Returns whether
-    anything was removed. Every row stays; the removal is flagged."""
-    content = item["content"]
-    if content.get("query_type") is not None:
-        return False
-    columns = [str(c) for c in content["columns"]]
-    rows = content["rows"]
-    if not all(isinstance(row, list) and len(row) == len(columns) for row in rows):
-        return False
-    keep = _columns_to_keep(columns, rows, question, question_words)
-    if not keep or len(keep) == len(columns):
-        return False
-    content["columns_omitted_from_prompt"] = [
-        c for j, c in enumerate(columns) if j not in keep
-    ]
-    content["columns"] = [columns[j] for j in keep]
-    content["rows"] = [[row[j] for j in keep] for row in rows]
-    return True
-
-
-def _project_largest_table(items: list[dict[str, Any]], question: str) -> bool:
-    """One step of the budget loop: narrow the biggest table not yet narrowed."""
-    question_words = _word_roots(question)
-    if not question_words:
-        return False
-    candidates = [
-        item
-        for item in items
-        if _is_table(item) and "columns_omitted_from_prompt" not in item["content"]
-    ]
-    for item in sorted(candidates, key=lambda i: -_size(i["content"]["rows"])):
-        if _project_columns(item, question, question_words):
-            return True
-    return False
-
-
-def _query_row_match_scores(
-    columns: list[str], rows: list[Any], question: str
-) -> list[int]:
-    """Score rows by how many explicit query values they contain.
-    This keeps a named entity and its requested period together when the final
-    budget fallback must remove unrelated rows from a large table.
-    """
-    if not question:
-        return [0] * len(rows)
-    scores: list[int] = []
-    for row in rows:
-        if not isinstance(row, list) or len(row) != len(columns):
-            scores.append(0)
-            continue
-        scores.append(
-            sum(_cell_is_mentioned(value, question) for value in row)
-        )
-    return scores
-
-
-def _rows_that_fit(rows: list[Any], deficit: int) -> int:
-    """How many rows to KEEP so the table shrinks by about `deficit` chars.
-    Only what the budget needs is removed (never half a table by default);
-    always at least one row goes, so the budget loop makes progress."""
-    average_row = max(_size(rows) // max(len(rows), 1), 1)
-    rows_to_drop = max(math.ceil(max(deficit, 1) / average_row), 1)
-    return max(MIN_ROWS_WHEN_TRIMMED, len(rows) - rows_to_drop)
-
-
-def _fit_to_budget(
-    items: list[dict[str, Any]],
-    budget_chars: int,
-    anchors: set[str],
-    query: str = "",
-) -> list[dict[str, Any]]:
-    """Compatibility no-op: answer evidence is never trimmed to a size hint."""
-    if _size(items) > budget_chars:
-        logger.warning(
-            "answer_evidence_over_hint: chars=%d hint=%d; preserving all evidence",
-            _size(items),
-            budget_chars,
-        )
-    return items
-
-_NOTE_SOURCE_TYPES = _NOTE_TYPES | {
-    "evidence_note",
-    "document_coverage",
-    "coverage_note",
-    "coverage",
-}
 _NON_DATA_STATUSES = {
     "",
     "NOT_FOUND",
@@ -891,43 +216,6 @@ _NON_DATA_STATUSES = {
     "INSUFFICIENT_EVIDENCE",
 }
 
-
-def _is_note(item: Any) -> bool:
-    if not isinstance(item, dict):
-        return False
-    kind = str(item.get("source_type") or "").lower()
-    return kind in _NOTE_SOURCE_TYPES or "coverage" in kind
-
-
-def _available_source_titles(evidence: list[Any]) -> set[str]:
-    """Titles of sources whose structured rows are actually in the evidence."""
-    titles: set[str] = set()
-    for item in evidence:
-        if not isinstance(item, dict) or _is_note(item):
-            continue
-        if str(item.get("result_status") or "SUCCESS").upper() != "SUCCESS":
-            continue
-        content = item.get("content")
-        if not isinstance(content, dict):
-            continue
-        title = content.get("document_title")
-        if title and (content.get("rows") or content.get("aggregates")):
-            titles.add(str(title).strip().lower())
-    return {t for t in titles if len(t) >= 3}
-
-
-def _contradicted_note(item: Any, titles: set[str]) -> bool:
-    """
-    A retrieval/coverage note that says a source has no passages / no match /
-    nothing included, about a source whose rows ARE in the evidence, describes
-    the text search only. Sent as evidence it reads as 'source unavailable'.
-    """
-    if not titles or not _is_note(item):
-        return False
-    if str(item.get("result_status") or "").upper() not in _NON_DATA_STATUSES:
-        return False
-    blob = json.dumps(item.get("content"), ensure_ascii=False, default=str).lower()
-    return any(title in blob for title in titles)
 
 
 def _log_evidence_debug(stage: str, items: list[dict[str, Any]]) -> None:
@@ -985,9 +273,6 @@ def _canonical_answer_evidence(
     _log_evidence_debug("preserved_for_answer", items)
     return items
 
-
-def _bound_evidence(evidence: list[Any]) -> list[dict[str, Any]]:
-    return _canonical_answer_evidence(evidence)
 
 
 def _population_contract(*, evidence: list[Any]) -> dict[str, Any] | None:
@@ -1809,28 +1094,6 @@ def generate_answer_stream(
         yield STREAM_TRUNCATED_NOTICE
 
 
-# ---------------------------------------------------------------------------
-# QP-PATCH: last-resort fallback used only AFTER _completion_budget has already
-# failed closed. Never touches tables. Logged, and the model is told passages
-# were omitted so it does not claim a fact is absent from the documents.
-# ---------------------------------------------------------------------------
-_FIT_OMISSION_NOTE = (
-    "Some retrieved document passages were left out to fit the size limit. "
-    "If the answer needs content that is not in the provided passages, say it "
-    "was not found in the provided passages; never say it does not exist."
-)
-
-
-def _text_chunk_set(item: Any) -> tuple[Any, set[int]]:
-    if not isinstance(item, dict) or item.get("source_type") != "text_chunk":
-        return None, set()
-    meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-    doc = item.get("document_id", meta.get("document_id"))
-    indexes = meta.get("chunk_indexes")
-    if not isinstance(indexes, list):
-        single = meta.get("chunk_index")
-        indexes = [single] if isinstance(single, int) else []
-    return doc, {i for i in indexes if isinstance(i, int)}
 
 
 _SPREADSHEET_TITLE = re.compile(r"\.(xlsx|xlsm|xls|csv|tsv)$", re.IGNORECASE)  # QP-PATCH-V2
@@ -1849,55 +1112,6 @@ def _row_cell_values(row: Any) -> list[Any]:
         return list(row)
     return [row]
 
-
-def _narrow_spreadsheet_tables(
-    items: list[Any], query: str
-) -> tuple[list[Any], int]:
-    """Keep only the rows of big SPREADSHEET tables that the question names.
-
-    Business-data tables (xlsx/csv) are narrowed when the question mentions
-    specific cell values; document-extracted policy/rule tables (pdf, docx) are
-    never touched. Skipped for population questions. A narrowed table is marked
-    truncated, so the answer prompt treats it as a partial sample (no counting).
-    """
-    if _POPULATION_CUE.search(query or ""):
-        return items, 0
-    out: list[Any] = []
-    changed = 0
-    for item in items:
-        if not (isinstance(item, dict) and _is_table(item)):
-            out.append(item)
-            continue
-        content = item["content"]
-        title = str(content.get("document") or content.get("document_title") or "")
-        rows = content["rows"]
-        if (
-            not _SPREADSHEET_TITLE.search(title)
-            or len(rows) <= _NARROW_MIN_ROWS
-            or content.get("query_type") in {"ranking", "positional"}
-        ):
-            out.append(item)
-            continue
-        scores = [
-            sum(_cell_is_mentioned(cell, query) for cell in _row_cell_values(row))
-            for row in rows
-        ]
-        keep = [i for i, score in enumerate(scores) if score > 0]
-        if not keep or len(keep) > max(3, len(rows) // 2):
-            out.append(item)
-            continue
-        new_content = dict(content)
-        new_content["rows"] = [rows[i] for i in keep]
-        new_content["source_rows"] = content.get("source_rows", len(rows))
-        new_content["rows_omitted_from_prompt"] = len(rows) - len(keep)
-        new_content["truncated"] = True
-        if "row_count" in new_content:
-            new_content["row_count"] = len(keep)
-        new_item = dict(item)
-        new_item["content"] = new_content
-        out.append(new_item)
-        changed += 1
-    return out, changed
 
 
 _ID_LIKE_CELL_V3 = re.compile(  # QP-PATCH-V3
@@ -2004,21 +1218,6 @@ def _narrow_spreadsheet_tables_v3(
     return out, changed
 
 
-
-def _is_trim_protected(item: Any) -> bool:  # QP-FIX-5
-    return isinstance(item, dict) and bool(item.get("protect_from_trim"))
-
-
-def _describe_passage(item: Any) -> str:  # QP-FIX-5
-    """One log line for a text passage: document, chunks, score, protection, start of text."""
-    if not isinstance(item, dict):
-        return repr(type(item).__name__)
-    doc, chunks = _text_chunk_set(item)
-    text = " ".join(str(item.get("content") or "").split())[:100]
-    return (
-        f"doc={doc} chunks={sorted(chunks)} score={item.get('score')} "
-        f"protected={_is_trim_protected(item)} text={text!r}"
-    )
 
 
 def fit_evidence_to_budget(

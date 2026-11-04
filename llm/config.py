@@ -2,14 +2,14 @@
 
 Three things live here:
 
-* the Groq keys and per-model rate limits (the real provider constraints),
+* the Groq API keys and per-task API-key assignments,
 * one ``TaskProfile`` per logical task (model, output cap, timeout, reasoning),
-* retry / cooldown policy.
+* bounded retry policy for transient provider failures.
 
-There is deliberately NO request-wide token budget. Every task owns its
-generation settings, and nothing that happened earlier in the same user
-message can lower them. ``input_hint`` is an observability threshold only: the
-provider logs a warning when a prompt exceeds it, it never truncates or refuses.
+There is deliberately NO request-wide token budget, local TPM scheduler, or
+API-key rotation. Groq is authoritative for rate-limit enforcement.
+``input_hint`` is an observability threshold only: the provider logs a warning
+when a prompt exceeds it; it never truncates or refuses the prompt.
 """
 
 from dataclasses import dataclass
@@ -25,17 +25,6 @@ GROQ_API_KEYS = [
 if not all(GROQ_API_KEYS):
     raise ValueError("All Groq API keys must be configured.")
 
-MODEL_TPM_LIMITS = {
-    "openai/gpt-oss-120b": 8000,
-    "openai/gpt-oss-20b": 8000,
-}
-DEFAULT_TPM_LIMIT = 8000
-
-TPM_ADMISSION_RATIO = 0.90
-TPM_WINDOW_SECONDS = 60.0
-
-MAX_ADMISSION_WAIT_SECONDS = 20.0
-ADMISSION_MAX_BYPASS = 3
 CHARS_PER_TOKEN_ESTIMATE = 3.5
 MESSAGE_OVERHEAD_TOKENS = 4
 
@@ -57,16 +46,15 @@ ANSWER_OUTPUT_TOKEN_CAPS = {
 # Maximum task ceiling also bounds the single retry after a length finish.
 ANSWER_MAX_OUTPUT_TOKENS = 4000
 
-# Deprecated: the application no longer estimates TPM headroom, so these two
-# are no longer used by answer.py. Kept only so stray imports do not break.
+# Deprecated: retained for compatibility with any remaining imports.
 ANSWER_MIN_OUTPUT_TOKENS = 256
 ANSWER_TPM_SAFETY_MARGIN_TOKENS = 256
 ANSWER_RETRY_MULTIPLIER = 2
 
 # Provider-guided fitting: when Groq rejects a request because input +
-# max_tokens exceeds the TPM limit, the provider lowers max_tokens by exactly
-# the excess Groq reports (plus this margin), but only if what is left is still
-# a usable completion for a reasoning model. Otherwise the error is raised.
+# max_tokens exceeds the provider limit, the provider lowers max_tokens by
+# exactly the excess Groq reports (plus this margin), but only if what remains
+# is still a usable completion for a reasoning model.
 MIN_USEFUL_COMPLETION_TOKENS = 1500
 FIT_MARGIN_TOKENS = 50
 
@@ -78,7 +66,7 @@ DEFAULT_TEMPERATURE = 0.0
 class TaskProfile:
     """Generation settings owned by one logical task.
 
-    model            which tier runs it (the tier decides the quota pool)
+    model            which model runs this task
     max_tokens       maximum completion ceiling for this task, including any
                      reasoning tokens counted by the provider.
     timeout          per-attempt HTTP timeout in seconds
@@ -133,9 +121,8 @@ TASK_PROFILES: dict[str, TaskProfile] = {
         input_hint=3000,
     ),
 
-    # Table selection now uses GPT-OSS 120B.
-    # It shares the structured-data lane with SQL generation.
-    # Its model fallback stays on this same key.
+    # Table selection uses GPT-OSS 120B and shares the structured-data lane
+    # with SQL generation. Its model fallback stays on this same key.
     "table_selection": TaskProfile(
         MODEL_120B,
         max_tokens=TABLE_SELECTION_MAX_COMPLETION_TOKENS,
@@ -154,9 +141,8 @@ TASK_PROFILES: dict[str, TaskProfile] = {
 
 
 # Zero-based indices into GROQ_API_KEYS (GROQ_API_KEY_1 is index 0).
-# Every configured task is pinned to exactly one independent API key.
-# Model fallback retains the same task assignment and never borrows another key.
-
+# Every configured task is pinned to exactly one API key. Model fallback
+# retains the same task assignment and never borrows another key.
 TASK_API_KEY_INDEX: dict[str, int] = {
     # Key 1: planning and scope/control tasks.
     "planner": 0,
@@ -203,7 +189,8 @@ if set(TASK_API_KEY_INDEX) != set(TASK_PROFILES):
 
 
 # Table-selection fallback may change the model, but the provider keeps the
-# table_selection task pinned to key 2. No fallback changes API-key identity.
+# table_selection task pinned to key 2 (zero-based index 1). No fallback
+# changes API-key identity.
 TASK_FALLBACK_MODELS: dict[str, tuple[str, ...]] = {
     "table_selection": (MODEL_20B,),
 }
@@ -222,10 +209,3 @@ RETRY_LIMITS = {
 }
 
 RETRY_BACKOFF_SECONDS = 1.0
-
-# Used when a 429 carries no retry hint.
-DEFAULT_COOLDOWN_SECONDS = 20.0
-MAX_COOLDOWN_SECONDS = 3600.0
-
-# A key that returned 401/403 is taken out of rotation for this long.
-AUTH_COOLDOWN_SECONDS = 300.0

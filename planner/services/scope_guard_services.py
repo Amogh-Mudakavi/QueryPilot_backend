@@ -29,6 +29,20 @@ from planner.services.history import bound_history_for_planner
 
 logger = logging.getLogger(__name__)
 
+
+_SOFTWARE_ARTIFACT_RE = re.compile(
+    r"\b(code|script|scripts|function|functions|program|programs|app|application|"
+    r"api|endpoint|class|classes|snippet|regex|regular expression|sql|formula|"
+    r"macro|vba|python|javascript|typescript|java|golang|rust|bash|shell|html|css|"
+    r"react|django|algorithm|notebook|pseudo-?code|dockerfile|yaml)\b",
+    re.IGNORECASE,
+)
+
+
+def _names_software_artifact(query: str) -> bool:
+    """True when the request names code, a script, a formula or similar."""
+    return bool(_SOFTWARE_ARTIFACT_RE.search(str(query or "")))
+
 # One source of truth for route labels: the JSON schema, the validator and the
 # retry reminder all read this tuple.
 ROUTE_LABELS = (
@@ -1066,6 +1080,24 @@ class ScopeGuard:
 
         # 3) The user wants new software authored, not an answer from
         #    the documents. The subject is irrelevant; the deliverable decides.
+
+        # A report, reconciliation, table or calculation computed FROM the
+        # user's own documents is an answer. The model's authored_software label
+        # only stands when the request actually names something to write.
+        if (
+            deliverable == "authored_software"
+            and str(route).upper() == "DOCUMENT"
+            and target == "documents_or_subject"
+            and threat_category == "none"
+            and not _names_software_artifact(query)
+        ):
+            logger.info(
+                "Scope Guard: authored_software label overridden, request "
+                "names no code artifact workspace=%s query=%r",
+                workspace_id,
+                query,
+            )
+            deliverable = "answer_from_documents"
 
         if deliverable == "authored_software":
             logger.info(
