@@ -564,7 +564,11 @@ _CONVERSATION_ROUTE_RULES = (
     "1-4 sentence limit does not apply to this: be complete but compact. For "
     "an estimated score give a reasoned range, say what drives it, and state "
     "that you do not know the real marking scheme. If the message being "
-    "discussed is not in the chat shown to you, say so instead of guessing."
+    "discussed is not in the chat shown to you, say so instead of guessing. "
+    "Never calculate, estimate, rebuild or look up a figure that the earlier "
+    "messages do not state. If the request needs new figures or a new "
+    "calculation from the documents, say it has to be checked against the "
+    "documents instead of answering it."
 )
 
 _CONVERSATIONAL_SYSTEM_PROMPT = (

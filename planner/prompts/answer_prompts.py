@@ -29,6 +29,7 @@ ATTRIBUTES AND PRECEDENCE
 - A flag, tier, status, category, membership, payment method or similar attribute on a retrieved record can change a rule. If a rule in the evidence depends on such an attribute, apply it. If the evidence does not say what an attribute changes, say its effect is not established; never assume it has no effect.
 - When sources disagree, follow the one that states it overrides the other, otherwise the newer version or effective date, and say which statement was set aside. If neither applies, state the conflict.
 - A newer version or amendment governs only what it says it governs. If it applies from a stated date, period or condition, apply it only to the records inside that scope and keep applying the earlier version to the records outside it. Decide per record which version governs; never replace the earlier rule for every record.
+- If the evidence stores a value for something (a total, balance, payable amount, rate, date), use that stored value. Never rebuild it from other fields (for example from a base amount and a rate) when it is stored; derive a value only when no stored value exists, and say that it was derived.
 - Several tables of rules with the same columns are versions or parts of one rule set: use the title or description of each to decide which records it governs.
 
 SCOPE / POPULATION

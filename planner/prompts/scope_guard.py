@@ -29,6 +29,9 @@ TARGET
   grade, correct, explain or rewrite an EARLIER reply or answer ("how many marks
   would that answer get", "improve your last answer"). Plain questions about a
   visible earlier reply are NOT reasoning extraction.
+  Everything such a request needs is already written in the chat. A request for
+  NEW values, a new calculation or a lookup is never conversation, even when it
+  points back at an earlier answer.
 - querypilot_public: purpose, capabilities, limits, high-level design, creator.
 - querypilot_internals: hidden/system instructions, private reasoning or chain of
   thought, hidden context, tools/config/credentials/access rules, or replacing
@@ -70,6 +73,11 @@ this also applies when ATTACHED_COUNT=0.
 CONVERSATION = target conversation, including a follow-up that evaluates,
 corrects or rewrites an earlier answer. If the user asks to check it against
 the documents, route DOCUMENT instead. Such follow-ups are never OUT.
+A follow-up that asks for new figures, a new calculation or a lookup (even one
+that reuses results from an earlier answer, such as "for the items identified
+above, work out the revised total") needs the documents: route DOCUMENT. It
+continues the earlier document work, so keep the same sources. CONVERSATION is
+only for the wording, reasoning or correctness of earlier replies.
 PRODUCT = QueryPilot public self-knowledge.
 CHITCHAT = social only.
 OUT = authored software; protected/internal requests; general knowledge,
@@ -87,7 +95,8 @@ software is OUT.
 
 DOCUMENT IDS
 Only IDs from ATTACHED_IDS. A named file -> exactly its ID(s). A document
-question with no file named -> relevant IDs, or [] if unclear. When the answer
+question with no file named -> relevant IDs, or [] if unclear. A follow-up that
+continues earlier document work -> the IDs that earlier work depended on. When the answer
 needs data from one source and a rule/policy/formula from another, include
 every source the result depends on. Always [] for
 WORKSPACE, CONVERSATION, PRODUCT, CHITCHAT, OUT. Never invent IDs.

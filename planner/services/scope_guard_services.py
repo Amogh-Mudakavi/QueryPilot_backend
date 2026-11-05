@@ -43,6 +43,66 @@ def _names_software_artifact(query: str) -> bool:
     """True when the request names code, a script, a formula or similar."""
     return bool(_SOFTWARE_ARTIFACT_RE.search(str(query or "")))
 
+# --------------------------------------------------------------------------
+# Can the conversation alone answer this?
+#
+# CONVERSATION means "answer from the chat itself". That is only possible
+# when the question is about the wording of earlier answers (explain, rephrase,
+# shorten, why did you say that). A question that asks for new values or a new
+# derivation needs the source documents, even when it points back at an earlier
+# answer ("for the violations identified above, calculate ..."). The classifier
+# is a small model reading assistant text cut to a few characters, so it cannot
+# tell these apart reliably; this check is the structural backstop.
+# --------------------------------------------------------------------------
+
+# Base forms only. "explain how you calculated it" asks about an earlier
+# answer and stays conversational; "calculate the new total" does not.
+_DERIVATION_VERB_RE = re.compile(
+    r"\b(?:re-?calculate|re-?compute|calculate|compute|determine|derive|"
+    r"quantify|reconcile|tabulate|re-?check|verify|extract)\b",
+    re.IGNORECASE,
+)
+
+_QUANTITY_NOUN = (
+    r"(?:amounts?|totals?|sums?|payables?|balances?|rates?|percentages?|"
+    r"prices?|costs?|fees?|numbers?|counts?|dates?|values?|figures?|"
+    r"differences?|reductions?|shortfalls?|credits?|charges?|salar(?:y|ies)|"
+    r"scores?|quantit(?:y|ies)|days?|hours?|minutes?)"
+)
+
+# "What was the original payable amount ...", "How many days ...".
+_VALUE_QUESTION_RE = re.compile(
+    r"\b(?:what|which|how\s+(?:much|many))\b[^?.!\n]{0,80}?\b"
+    + _QUANTITY_NOUN
+    + r"\b",
+    re.IGNORECASE,
+)
+
+# "... from the invoice workbook", "according to the contract".
+_SOURCE_PHRASE_RE = re.compile(
+    r"\b(?:from|in|per|using|according\s+to|based\s+on)\s+the\s+"
+    r"(?:[\w\-]+\s+){0,3}?(?:workbook|spreadsheet|worksheet|sheet|table|"
+    r"records?|data|file|document|contract|policy|agreement)\b",
+    re.IGNORECASE,
+)
+
+_QUANTITY_RE = re.compile(r"\b" + _QUANTITY_NOUN + r"\b", re.IGNORECASE)
+
+
+def _requests_new_values(query: str) -> bool:
+    """True when the question asks for new values or a new derivation.
+
+    Such a question cannot be answered from conversation text alone. Pure
+    language-level follow-ups (explain, why, rephrase, summarize) do not match.
+    """
+    text = str(query or "")
+    if _DERIVATION_VERB_RE.search(text):
+        return True
+    if _VALUE_QUESTION_RE.search(text):
+        return True
+    return bool(_SOURCE_PHRASE_RE.search(text) and _QUANTITY_RE.search(text))
+
+
 # One source of truth for route labels: the JSON schema, the validator and the
 # retry reminder all read this tuple.
 ROUTE_LABELS = (
@@ -1134,6 +1194,31 @@ class ScopeGuard:
 
         elif target == "querypilot_public" and route == "CHITCHAT":
             repaired_route = "PRODUCT"
+
+        # 4b) CONVERSATION answers from the chat text only. When documents are
+        #     attached and the question asks for new values or a new
+        #     derivation, the chat text cannot be the source: route it to the
+        #     documents. Questions about the wording of earlier answers are
+        #     untouched. (Seen in production: "calculate the revised amount
+        #     for the violations identified above" went to the chitchat model,
+        #     which rebuilt source values from memory.)
+        if (
+            route == "CONVERSATION"
+            and allowed_document_ids
+            and threat_category == "none"
+            and _requests_new_values(query)
+        ):
+            logger.info(
+                "Scope Guard: CONVERSATION overridden, the question asks for "
+                "new values or a derivation and documents are attached; "
+                "workspace=%s query=%r",
+                workspace_id,
+                query,
+            )
+            repaired_route = "DOCUMENT"
+            target = "documents_or_subject"
+            deliverable = "answer_from_documents"
+            document_ids = []
 
         if repaired_route != route:
             logger.info(
