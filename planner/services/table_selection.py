@@ -767,6 +767,15 @@ def _select_tables_core(
 # pulled in together just because one of them was needed.
 _SIBLING_MAX_GROUP = 6
 _SIBLING_MAX_ROWS = 60
+# A question about a whole population (list, count, total, compare) must read
+# EVERY part of a dataset that is split into same-column tables, whatever
+# their size: an answer from some of them is silently wrong. Only a question
+# about one located record may leave the other parts alone.
+_POPULATION_OPERATIONS = frozenset({
+    "list", "calculate", "aggregate", "count", "total", "compare",
+    "comparison", "rank", "ranking", "population",
+})
+_FAMILY_MAX_TABLES = 40
 _ROLE_PRIORITY = ("rule", "input", "filter", "key", "output", "other")
 
 
@@ -777,6 +786,8 @@ def _column_signature(columns: Any) -> tuple[str, ...]:
 def close_sibling_tables(
     selection: "TableSelection | None",
     candidates: list[dict[str, Any]],
+    *,
+    population: bool = False,
 ) -> "TableSelection | None":
     """Keep sibling tables of one document together.
 
@@ -803,13 +814,16 @@ def close_sibling_tables(
     added: list[str] = []
 
     for members in groups.values():
-        if len(members) < 2 or len(members) > _SIBLING_MAX_GROUP:
+        group_limit = _FAMILY_MAX_TABLES if population else _SIBLING_MAX_GROUP
+        if len(members) < 2 or len(members) > group_limit:
             continue
         names = [str(member["table_name"]) for member in members]
         if not (set(names) & tables):
             continue
         sizes = [member.get("row_count") for member in members]
-        if any(not isinstance(size, int) or size > _SIBLING_MAX_ROWS for size in sizes):
+        if not population and any(
+            not isinstance(size, int) or size > _SIBLING_MAX_ROWS for size in sizes
+        ):
             continue
 
         seed_roles = [roles[name] for name in names if name in tables and name in roles]
@@ -854,8 +868,10 @@ def select_tables_detailed(
         candidates=candidates,
         forced_table_names=forced_table_names,
     )
+    operation = str((understanding or {}).get("operation") or "").strip().lower()
+    population = operation in _POPULATION_OPERATIONS and not forced_table_names
     try:
-        return close_sibling_tables(selection, candidates)
+        return close_sibling_tables(selection, candidates, population=population)
     except Exception:
         logger.exception("sibling-table closure failed; keeping the original selection")
         return selection

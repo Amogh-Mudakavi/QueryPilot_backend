@@ -4825,6 +4825,58 @@ def _is_empty_result(result: dict[str, Any] | None) -> bool:
     return bool(rows) and all(all(v is None for v in r.values()) for r in rows)
 
 
+def _family_coverage(
+    all_tables: list[dict[str, Any]],
+    read_names: set[str],
+) -> dict[str, Any]:
+    """Say so when a result was read from only part of a split dataset.
+
+    Tables of one document with the same columns are parts of one dataset
+    (one table per page, sheet or period). A result read from some of them is
+    not the whole population, even when it contains every row of the tables
+    it did read.
+    """
+    def signature(item: dict[str, Any]) -> tuple[str, ...]:
+        return tuple(
+            re.sub(r"[^a-z0-9]+", "", str(c).casefold())
+            for c in (item.get("columns") or [])
+        )
+
+    try:
+        read = [t for t in all_tables if str(t.get("table_name")) in read_names]
+        unread: dict[str, int] = {}
+        for table in read:
+            sig = signature(table)
+            if not sig:
+                continue
+            document_id = _coerce_int(table.get("document_id"))
+            for other in all_tables:
+                name = str(other.get("table_name"))
+                if name in read_names or name in unread:
+                    continue
+                if (
+                    _coerce_int(other.get("document_id")) == document_id
+                    and signature(other) == sig
+                ):
+                    unread[name] = int(other.get("row_count") or 0)
+        if not unread:
+            return {}
+        read_rows = sum(int(t.get("row_count") or 0) for t in read)
+        return {
+            "coverage_partial": True,
+            "coverage_note": (
+                f"Read {len(read)} table(s) ({read_rows} rows) but {len(unread)} more "
+                f"table(s) of the same document with the same columns "
+                f"({sum(unread.values())} rows) were NOT read. They are parts of "
+                "the same dataset, so this result is not the complete list or "
+                "count for the source."
+            ),
+        }
+    except Exception:
+        logger.exception("family coverage check failed; continuing without it")
+        return {}
+
+
 def _probe_stored_values(
     state: AgentState,
     schema_for_sql: list[dict[str, Any]],
@@ -5870,6 +5922,9 @@ def _run_table(
                         operation=operation,
                     ),
                     "evidence_role": "query_result",
+                    **_family_coverage(
+                        schema, {str(n) for n in result.get("tables_used", [])}
+                    ),
                 },
                 "result_status": status,
             }

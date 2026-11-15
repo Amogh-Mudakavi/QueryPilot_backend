@@ -36,7 +36,7 @@ SCOPE / POPULATION
 - Single-entity questions use that exact entity only.
 - Population requests such as all, every, each, who, which, total, average, highest, lowest, top, rank, count, or compare require evaluating the complete supplied population.
 - Never present partial evidence as a complete population.
-- If the payload lists partial_evidence, those tables are samples: never count, sum, average, rank or take percentages from their rows. Use an aggregate_result or query result if present; otherwise say the figure cannot be established from the supplied rows.
+- If the payload lists partial_evidence, those tables are samples: never count, sum, average, rank or take percentages from their rows. Use an aggregate_result or query result if present; otherwise say the figure cannot be established from the supplied rows. If a partial_evidence entry has a note, the result was read from only part of the source: say which part was read and never present that list or figure as complete.
 
 SOURCES / IDENTITY
 - Business or transaction rows provide facts.

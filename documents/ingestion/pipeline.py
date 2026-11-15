@@ -50,6 +50,7 @@ from documents.ingestion.parser import (
     LlamaAdapter,
     LlamaParseService,
 )
+from documents.ingestion.table_structure import restructure_table_nodes
 from documents.ingestion.sqlite import (
     SQLiteManager,
 )
@@ -237,6 +238,14 @@ class IngestionPipeline:
             not in _DATASET_SOURCE_TYPES
         )
 
+        # Document tables often have a title, a note or a blank band above
+        # the real header row, or several stacked tables that repeat it.
+        # Recover the real structure (and keep any notes as text) before the
+        # first row is taken as the header. Spreadsheets are datasets already.
+        structure_notes = []
+        if strict_tables:
+            table_nodes, structure_notes = restructure_table_nodes(table_nodes)
+
         for index, table_node in enumerate(
             table_nodes,
             start=1,
@@ -363,6 +372,8 @@ class IngestionPipeline:
             table_metadata.append(
                 processed["metadata"]
             )
+
+        fallback_nodes.extend(structure_notes)
 
         del table_nodes
 

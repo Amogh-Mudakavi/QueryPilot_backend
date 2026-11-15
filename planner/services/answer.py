@@ -374,6 +374,17 @@ def _partial_evidence_notice(items: list[dict[str, Any]]) -> dict[str, Any] | No
         for item in items
         if _is_table(item) and item["content"].get("truncated")
     ]
+    partial.extend(
+        {
+            "document": item["content"].get("document"),
+            "rows_sent": len(item["content"]["rows"]),
+            "note": item["content"].get("coverage_note"),
+        }
+        for item in items
+        if _is_table(item)
+        and item["content"].get("coverage_partial")
+        and not item["content"].get("truncated")
+    )
     if not partial:
         return None
     return {"tables": partial}

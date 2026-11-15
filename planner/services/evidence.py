@@ -1345,6 +1345,8 @@ def _scope_of(item: dict[str, Any]) -> str:
         return SCOPE_FOCUSED_SUBSET
     if semantics in {"ranking", "positional"}:
         return SCOPE_FILTERED
+    if content.get("coverage_partial"):
+        return SCOPE_FILTERED
     if is_complete_table(item):
         return SCOPE_COMPLETE
     return SCOPE_FILTERED
