@@ -324,11 +324,6 @@ def _population_hint(
     return hint
 
 
-def _missing_population_keys(answer: str, contract: dict[str, Any] | None) -> list[str]:
-    if not contract:
-        return []
-    text = str(answer or "")
-    return [str(k) for k in contract.get("matched_keys", []) if str(k) not in text]
 _FOREIGN_CURRENCY = re.compile(r"(?:USD|US\$|\$\s?\d|EUR|€|£|GBP)")
 _CURRENCY_PREFIX = re.compile(r"(?<![A-Za-z])(?:US\$|\$|₹|Rs\.?|INR)\s?(?=\d)")
 
@@ -355,10 +350,6 @@ def _currency_symbol_for(evidence: list[Any]) -> str | None:
     ):
         return None
     return _default_currency_symbol()
-
-
-def _normalize_currency(answer: str, symbol: str | None) -> str:
-    return _CURRENCY_PREFIX.sub(symbol, answer) if symbol else answer
 
 
 def _partial_evidence_notice(items: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -644,41 +635,6 @@ _EXHAUSTION_MARKERS = (
 )
 
 
-def _is_generation_exhaustion(exc: BaseException) -> bool:
-    """
-    True when the provider ran out of COMPLETION tokens before finishing the
-    output (the reasoning model spent the budget), as opposed to a request
-    that was too large or a transport failure.
-    """
-    parts = [str(exc), repr(exc)]
-    for name in ("body", "response", "failed_generation", "error", "detail"):
-        value = getattr(exc, name, None)
-        if value is not None:
-            parts.append(str(value))
-    cause = exc.__cause__ or exc.__context__
-    if cause is not None and cause is not exc:
-        parts.append(str(cause))
-    blob = " ".join(parts).lower()
-    return any(marker in blob for marker in _EXHAUSTION_MARKERS)
-
-
-def _failed_generation_text(exc: BaseException) -> str | None:
-    """Text the provider reports as the failed generation, if it exposes it."""
-    for holder in (exc, exc.__cause__, exc.__context__):
-        if holder is None:
-            continue
-        value = getattr(holder, "failed_generation", None)
-        if isinstance(value, str) and value.strip():
-            return value
-        body = getattr(holder, "body", None)
-        if isinstance(body, dict):
-            error = body.get("error") if isinstance(body.get("error"), dict) else body
-            value = error.get("failed_generation") if isinstance(error, dict) else None
-            if isinstance(value, str) and value.strip():
-                return value
-    return None
-
-
 def _router_options(effort: str | None, method: Any = None) -> dict[str, Any]:
     """Pass reasoning_effort only if the router method declares it explicitly.
     `method` defaults to router.generate; the streaming path passes
@@ -844,165 +800,6 @@ RETRY_SYSTEM_PROMPT = (
     "plain text/Markdown. No JSON. No citation markers. No citations array. "
     "State each requested result once."
 )
-
-
-def _request_answer(
-    payload: str,
-    *,
-    max_tokens: int,
-    concise: bool = False,
-    effort: str = DEFAULT_REASONING_EFFORT,
-) -> tuple[str, str | None]:
-    """One plain-text generation. Returns (content, finish_reason)."""
-    system = RETRY_SYSTEM_PROMPT if concise else SYSTEM_PROMPT
-    response = router.generate(
-        task="answer_generation",
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": payload},
-        ],
-        temperature=0.0,
-        max_tokens=max_tokens,
-        response_format=ANSWER_RESPONSE_FORMAT,
-        include_reasoning=False,
-        **_router_options(effort),
-    )
-    try:
-        choice = response.choices[0]
-        content = choice.message.content
-    except (AttributeError, IndexError) as exc:
-        raise ValueError("Answer LLM returned an invalid response.") from exc
-    finish = getattr(choice, "finish_reason", None)
-    return (content or ""), (str(finish) if finish is not None else None)
-
-
-def _retry_budget(payload: str, initial_cap: int) -> int:
-    """One retry with a larger allowance, bounded by the task ceiling."""
-    return min(initial_cap * ANSWER_RETRY_MULTIPLIER, ANSWER_MAX_OUTPUT_TOKENS)
-
-
-def _partial_answer(
-    text: str | None, *, valid: set[int], items: list[dict[str, Any]]
-) -> str | None:
-    """Best-effort answer from truncated output, clearly marked as cut short."""
-    if not RETURN_PARTIAL_ON_BUDGET_EXHAUSTION or not text:
-        return None
-    if len(text.strip()) < PARTIAL_ANSWER_MIN_CHARS:
-        return None
-    answer, _ = _parse_answer(text, valid=valid, items=items)
-    return answer.rstrip() + PARTIAL_ANSWER_NOTICE
-
-
-def generate_answer(
-    *,
-    query: str,
-    evidence: list[Any],
-    conversation_history: list[dict[str, Any]] | None = None,
-    planner_requirements: list[dict[str, Any]] | None = None,
-) -> str:
-    """Generate the complete user-facing answer in one request.
-
-    Normal path: one call. A single larger retry is allowed after finish=length,
-    bounded by the task's configured answer-output ceiling. Provider TPM and
-    context limits are enforced by Groq, not estimated here.
-    """
-    payload, canon_items, contract = _prepare_request(
-        query=query,
-        evidence=evidence,
-        conversation_history=conversation_history,
-        planner_requirements=planner_requirements,
-    )
-    indices = [item["citation_index"] for item in canon_items]
-    logger.info(
-        "answer_payload: stored_items=%d sent_items=%d payload_chars=%d",
-        len(evidence),
-        len(indices),
-        len(payload),
-    )
-    max_tokens, _ = _completion_budget(
-        payload,
-        query=query,
-        evidence=evidence,
-        planner_requirements=planner_requirements,
-    )
-    effort = _answer_effort(query, evidence, planner_requirements)
-    logger.info(
-        "answer_effort: complexity=%s requested=%s",
-        _calculation_complexity(query, evidence, planner_requirements),
-        effort,
-    )
-    content = ""
-    exhausted = False
-    partial_text: str | None = None
-    try:
-        content, finish = _request_answer(
-            payload, max_tokens=max_tokens, effort=effort
-        )
-        exhausted = finish == "length"
-        if exhausted:
-            partial_text = content
-    except Exception as exc:
-        if not _is_generation_exhaustion(exc):
-            raise
-        exhausted = True
-        logger.warning(
-            "answer completion exhausted (%s); attempting recovery", type(exc).__name__
-        )
-        partial = _failed_generation_text(exc)
-        partial_text = partial
-        if partial:
-            try:
-                candidate, _ = _parse_answer(
-                    partial, valid=set(indices), items=canon_items
-                )
-                return _finish_answer(candidate, evidence, contract)
-            except ValueError:
-                pass
-    if exhausted or not content.strip():
-        retry_tokens = _retry_budget(payload, max_tokens)
-        if retry_tokens <= max_tokens:
-            logger.warning(
-                "answer_retry skipped: this retry cannot fit the per-call provider "
-                "ceiling with a usable completion allowance",
-            )
-            partial_answer = _partial_answer(
-                partial_text, valid=set(indices), items=canon_items
-            )
-            if partial_answer:
-                return _finish_answer(partial_answer, evidence, contract)
-            raise ValueError("Answer generation exhausted its completion budget.")
-        logger.warning(
-            "answer_retry: completion=%d (single bounded retry, compact system "
-            "prompt)",
-            retry_tokens,
-        )
-        content, finish = _request_answer(
-            payload, max_tokens=retry_tokens, concise=True
-        )
-        if finish == "length" or not content.strip():
-            partial_answer = _partial_answer(
-                content or partial_text, valid=set(indices), items=canon_items
-            )
-            if partial_answer:
-                return _finish_answer(partial_answer, evidence, contract)
-            raise ValueError("Answer generation exhausted its completion budget.")
-    if not content.strip():
-        raise ValueError("Answer LLM returned an empty answer.")
-    answer, _ = _parse_answer(content, valid=set(indices), items=canon_items)
-    return _finish_answer(answer, evidence, contract)
-
-
-def _finish_answer(
-    answer: str, evidence: list[Any], contract: dict[str, Any] | None
-) -> str:
-    missing = _missing_population_keys(answer, contract)
-    if missing:
-        logger.info(
-            "Matched population keys not mentioned in the answer "
-            "(may be legitimately filtered out): %s",
-            missing,
-        )
-    return _normalize_currency(_clean_answer(answer), _currency_symbol_for(evidence))
 
 
 def generate_answer_stream(
@@ -1230,16 +1027,3 @@ def _narrow_spreadsheet_tables_v3(
 
 
 
-
-def fit_evidence_to_budget(
-    *,
-    query: str,
-    evidence: list[Any],
-    conversation_history: list[dict[str, Any]] | None = None,
-) -> list[Any]:
-    """Compatibility no-op: never remove retrieved evidence to fit an estimate."""
-    logger.info(
-        "answer_evidence_preserved: items=%d; provider enforces actual request limits",
-        len(evidence),
-    )
-    return evidence

@@ -86,6 +86,11 @@ MAX_FALLBACK_TABLES = None
 
 ROLES = ("output", "filter", "input", "rule", "key")
 _CALCULATION_ROLES = {"input", "rule"}
+# A document with only a few tables is handed to SQL generation whole: the
+# model sees every schema and picks what it needs, which cannot miss a table
+# and costs no selector call. Larger or multi-document scopes still go through
+# the selector.
+_WHOLE_DOCUMENT_MAX_TABLES = 4
 _ROLE_ALIASES = {
     "inputs": "input",
     "rules": "rule",
@@ -627,6 +632,39 @@ def _rescue_unmet(
     return rescued
 
 
+def _complete_roles(
+    roles: dict[str, str],
+    chosen: set[str],
+    forced: set[str],
+    candidates: list[dict[str, Any]],
+    all_computed: list[str],
+    understanding: dict[str, Any],
+) -> None:
+    """Give every chosen table a role (in place).
+
+    Rescued, forced and whole-document tables have no model-assigned role. The
+    join stage uses roles to tell a rule source from a data source, so a table
+    left unclassified can cause unnecessary sibling-table scans.
+    """
+    for name in chosen:
+        if name in roles:
+            continue
+        item = next(
+            (c for c in candidates if str(c.get("table_name")) == name), {}
+        )
+        feature_tokens = set(_tokens(name)) | set(_tokens(item.get("document_title") or ""))
+        for column in item.get("columns") or []:
+            feature_tokens.update(_tokens(column))
+        if name in forced:
+            roles[name] = "filter"
+        elif feature_tokens & _RULE_SCHEMA_TOKENS:
+            roles[name] = "rule"
+        elif all_computed or str(understanding.get("operation") or "").lower() in _CALCULATION_OPERATIONS:
+            roles[name] = "input"
+        else:
+            roles[name] = "output"
+
+
 def _select_tables_core(
     *,
     workspace_id: int,
@@ -666,6 +704,29 @@ def _select_tables_core(
         candidates=candidates,
     )
     deterministic_computed = payload.get("computed_fields") or []
+
+    if (
+        len({item.get("document_id") for item in candidates}) == 1
+        and len(names) <= _WHOLE_DOCUMENT_MAX_TABLES
+    ):
+        whole = set(names)
+        whole_roles: dict[str, str] = {}
+        _complete_roles(
+            whole_roles, whole, forced, candidates,
+            list(deterministic_computed), understanding,
+        )
+        logger.info(
+            "table selection: whole document (%d table(s)) goes to SQL generation; no selector call",
+            len(names),
+        )
+        return TableSelection(
+            tables=whole,
+            roles=whole_roles,
+            computed=list(deterministic_computed),
+            unmet=[],
+            status="selected",
+            strategy="document",
+        )
 
     try:
         response = router.generate(
@@ -720,6 +781,15 @@ def _select_tables_core(
 
     all_computed = list(dict.fromkeys(deterministic_computed + computed))
     must_compute = bool(all_computed)
+    if must_compute and not (set(roles.values()) & _CALCULATION_ROLES):
+        # The model named the table(s) holding the data and labelled them
+        # output. A computed value (a count, a total) is derived FROM the data
+        # those tables hold, so they are its inputs. Rejecting a correct
+        # choice for its label wasted a call and swapped it for a weaker
+        # metadata ranking.
+        for name, role in list(roles.items()):
+            if role == "output":
+                roles[name] = "input"
     if not chosen or (must_compute and not (set(roles.values()) & _CALCULATION_ROLES)):
         reason = "empty model selection" if not chosen else "computed outputs lack input/rule table"
         logger.warning("table selector result needs metadata fallback: %s", reason)
@@ -728,24 +798,7 @@ def _select_tables_core(
             forced=forced, computed=all_computed, unmet=unmet, reason=reason,
         )
 
-    # Rescue and forced tables also need explicit roles. The join stage uses
-    # these roles to distinguish a rule source from a data source; leaving a
-    # selected table unclassified can cause unnecessary sibling-table scans.
-    for name in chosen:
-        if name in roles:
-            continue
-        item = next((candidate for candidate in candidates if str(candidate.get("table_name")) == name), {})
-        feature_tokens = set(_tokens(name)) | set(_tokens(item.get("document_title") or ""))
-        for column in item.get("columns") or []:
-            feature_tokens.update(_tokens(column))
-        if name in forced:
-            roles[name] = "filter"
-        elif feature_tokens & _RULE_SCHEMA_TOKENS:
-            roles[name] = "rule"
-        elif all_computed or str(understanding.get("operation") or "").lower() in _CALCULATION_OPERATIONS:
-            roles[name] = "input"
-        else:
-            roles[name] = "output"
+    _complete_roles(roles, chosen, forced, candidates, all_computed, understanding)
 
     logger.info(
         "table selection: selected=%d/%d names=%s roles=%s rescued=%s forced=%s computed=%s reason=%s",

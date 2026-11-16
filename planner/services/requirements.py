@@ -134,23 +134,6 @@ def normalize_requirements(raw: Any) -> list[dict[str, Any]]:
     return normalized
 
 
-def retrieval_queries(requirements: list[dict[str, Any]], raw_query: str, limit: int = 3) -> list[str]:
-    """Return bounded unique text/either queries, always retaining raw query first."""
-    result: list[str] = []
-    for value in [raw_query] + [
-        query
-        for requirement in requirements
-        if requirement.get("kind") in {"text", "either"}
-        for query in requirement.get("queries", [])
-    ]:
-        query = str(value or "").strip()
-        if query and query.casefold() not in {item.casefold() for item in result}:
-            result.append(query)
-        if len(result) >= max(1, int(limit)):
-            break
-    return result
-
-
 def ensure_query_fallback_requirement(
     requirements: list[dict[str, Any]],
     *,

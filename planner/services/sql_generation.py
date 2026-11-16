@@ -43,6 +43,7 @@ HARD RULES
 15. SEVERAL FIGURES: When the question asks for more than one figure (a total per status, a count per category, a total and then a net or difference), return EVERY requested figure as its own aliased column or its own grouped row. Use conditional aggregation such as SUM(CASE WHEN <status column> = <exact stored value> THEN <amount> ELSE 0 END) so each figure applies only the filter the question names for it. Never collapse several requested figures into one overall total, and never include rows in a figure that the question's wording excludes (a figure for one status must not add other statuses). Compute a requested net or difference in SQL from those same filtered figures.
 16. DERIVED VALUES: When a requested value is not a column (a delay, a difference, a share, a count of matches), derive it in SQL from the columns that hold its parts instead of omitting it.
 17. SAME-COLUMN TABLES: Tables with identical columns are parts of ONE dataset (one table per page, sheet or period). A count, list, total or ranking over the dataset must combine ALL of them, for example SELECT ... FROM (SELECT ... FROM a UNION ALL SELECT ... FROM b) AS t. Never answer from only some of them unless the question names one part.
+18. STORED VALUE MATCHES: when stored_value_matches is present it lists where words of the question really occur in the stored data: the table, the column, the exact stored values and how many rows hold them. Use it to decide WHICH column holds a concept. When a word matches a stored value as a whole value, filter that column with the value exactly as stored instead of guessing a column or running LIKE on a name column. When the same word appears in several columns, use the column whose stored value is the whole concept the question names, and combine columns with OR only when the question is genuinely ambiguous. Matches are evidence about the data, not a replacement for the question.
 
 OUTPUT
 Return exactly one JSON object matching the provided schema. `needs_sql` must be true whenever the planner requested SQL. Keep SQL as short as correctness allows.
@@ -393,6 +394,7 @@ def generate_sql(
     sql_required: bool = False,
     planner_notes: list[str] | None = None,
     query_semantics: dict[str, Any] | None = None,
+    value_matches: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "user_question": query,
@@ -401,6 +403,9 @@ def generate_sql(
 
     if resolved_entities:
         payload["resolved_entities"] = resolved_entities
+
+    if value_matches:
+        payload["stored_value_matches"] = value_matches
 
     if sql_required:
         payload["sql_required"] = True
