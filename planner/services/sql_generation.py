@@ -46,7 +46,7 @@ HARD RULES
 18. STORED VALUE MATCHES: when stored_value_matches is present it lists where words of the question really occur in the stored data: the table, the column, the exact stored values and how many rows hold them. Use it to decide WHICH column holds a concept. When a word matches a stored value as a whole value, filter that column with the value exactly as stored instead of guessing a column or running LIKE on a name column. When the same word appears in several columns, use the column whose stored value is the whole concept the question names, and combine columns with OR only when the question is genuinely ambiguous. Matches are evidence about the data, not a replacement for the question.
 
 OUTPUT
-Return exactly one JSON object matching the provided schema. `needs_sql` must be true whenever the planner requested SQL. Keep SQL as short as correctness allows.
+Return exactly one JSON object matching the provided schema. Set `needs_sql` to true when the supplied tables can answer the request, even partly. If NONE of the supplied tables hold the information the request asks for (judge by column names, sample rows and stored_value_matches), return `needs_sql` false and `sql` null. Never write placeholder SQL such as NULL columns or a query that only mimics the requested fields; the answer will then come from the document text. Keep SQL as short as correctness allows.
 """
 
 SQL_GENERATION_SCHEMA = {

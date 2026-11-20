@@ -11,6 +11,7 @@ independent of Django, Chroma, and LLM provider behavior.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Any, Callable, Iterable
 
@@ -20,6 +21,11 @@ logger = logging.getLogger(__name__)
 
 
 SEGMENT_CHAR_LIMIT = 8_000
+# Sources this small are read whole, in reading order. Ranking exists to find
+# a passage in a corpus too big to read; on a few pages it only risks missing
+# the one chunk whose wording differs from the question (a label such as
+# "Booked From" for a question that says "boarding station").
+SMALL_CORPUS_CHARS = int(os.getenv("QUERYPILOT_SMALL_CORPUS_CHARS", "14000") or 14000)
 NEIGHBOUR_SEEDS = 3
 
 
@@ -208,6 +214,7 @@ def build_document_evidence(
     budget: int | None = None,
     segment_char_limit: int = SEGMENT_CHAR_LIMIT,
     require_complete: bool = False,
+    max_total_chars: int | None = None,
 ) -> dict[str, Any] | None:
     """
     Returns {"evidence", "notes", "coverage", "confidence", "degraded",
@@ -229,6 +236,15 @@ def build_document_evidence(
             by_doc[chunk["document_id"]].append(chunk)
 
     sizes = {d: sum(len(c["content"]) for c in cs) for d, cs in by_doc.items() if cs}
+    if max_total_chars is not None and sum(sizes.values()) > max_total_chars:
+        # Not a small corpus: the caller keeps its ranked search.
+        logger.info(
+            "document coverage: %d chars exceed the small-corpus limit (%d); "
+            "using ranked search",
+            sum(sizes.values()),
+            max_total_chars,
+        )
+        return None
     allocation = (
         {document_id: size for document_id, size in sizes.items()}
         if budget is None

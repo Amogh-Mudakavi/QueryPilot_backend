@@ -314,6 +314,7 @@ def _attempt_sql(
         "parameters": [],
         "result": None,
         "error": None,
+        "declined": False,
     }
 
     # Where do the question's own words really occur in the stored data? No
@@ -385,6 +386,7 @@ def _attempt_sql(
             "SQL generator returned needs_sql=false for a planned TABLE_QUERY"
         )
         outcome["error"] = _SQL_DECLINED
+        outcome["declined"] = True
         return outcome
 
     sql = decision.get("sql")
@@ -394,6 +396,7 @@ def _attempt_sql(
 
     if not sql:
         outcome["error"] = "SQL generator returned no SQL."
+        outcome["declined"] = True
         return outcome
 
     logger.info(
@@ -1117,6 +1120,22 @@ def _run_table(
     )
 
     chosen = first
+
+    # The model says no supplied table holds what was asked (a ticket, a
+    # letter or a policy has text and a few layout tables, not the fact
+    # itself). Repairing would only force it to invent SQL. When document text
+    # is part of the plan the text answers it; otherwise keep the old repair.
+    plan_capabilities = state.get("execution_plan", {}) or {}
+    text_planned = "DOCUMENT_SEARCH" in (
+        list(plan_capabilities.get("capabilities") or [])
+        + list(plan_capabilities.get("fallback_capabilities") or [])
+    )
+    if first.get("declined") and first["result"] is None and text_planned:
+        logger.info(
+            "table_query: no supplied table holds the requested information; "
+            "continuing with document text"
+        )
+        return {"evidence": [], "status": "NOT_FOUND"}
 
     operation = str(
         state.get("query_understanding", {}).get("operation") or "answer"

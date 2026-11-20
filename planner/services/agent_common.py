@@ -653,6 +653,7 @@ def _run_documents_with_coverage(
     *,
     answer_sized: bool = False,
     require_complete: bool = False,
+    max_total_chars: int | None = None,
 ) -> dict[str, Any] | None:
     """Load full chunks from the already-authorized, resolved documents.
 
@@ -705,6 +706,7 @@ def _run_documents_with_coverage(
         fetch_chunks=fetch_document_chunks,
         boost_lookup=boost,
         require_complete=require_complete,
+        max_total_chars=max_total_chars,
         **sizing,
     )
     return _built

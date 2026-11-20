@@ -8,6 +8,7 @@ from typing import Any
 from planner.services.intent import OVERVIEW_OPERATIONS, normalized_operation
 from planner.services.source_scope import authorized_document_ids, dependency_discovery_query, effective_planning_query, requires_dependency_discovery
 from planner.services.state import AgentState
+from planner.services.document_coverage import SMALL_CORPUS_CHARS
 from planner.services.agent_common import (
     MAX_TOOL_CALLS_PER_QUERY,
     MIN_RETRIEVAL_CONFIDENCE,
@@ -214,6 +215,12 @@ def _run_documents(
         )
     )
 
+    # A small corpus is read whole whatever the question is; a larger one keeps
+    # ranked retrieval (coverage hands back None when it is over the limit).
+    small_corpus_try = bool(primary_ids) and not use_coverage
+    if small_corpus_try:
+        use_coverage = True
+
     if use_coverage:
         try:
             covered = _run_documents_with_coverage(
@@ -222,6 +229,7 @@ def _run_documents(
                 primary_query,
                 answer_sized=wants_whole_document,
                 require_complete=wants_whole_document,
+                max_total_chars=SMALL_CORPUS_CHARS if small_corpus_try else None,
             )
         except Exception:
             logger.exception("document coverage failed; using ranked search")
