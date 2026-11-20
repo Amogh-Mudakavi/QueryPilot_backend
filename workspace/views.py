@@ -1,7 +1,10 @@
 """Views module for QueryPilot."""
 
+from django.db import IntegrityError, transaction
+from django.db.models.functions import Lower
 from django.shortcuts import get_object_or_404
 from rest_framework import status
+from rest_framework.exceptions import APIException
 from rest_framework.generics import ListAPIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -16,6 +19,19 @@ from .serializers import (
 )
 
 
+class WorkspaceNameConflict(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = "A workspace with that name already exists. Choose a different name."
+    default_code = "workspace_name_conflict"
+
+
+def title_taken(owner, title, exclude_id=None):
+    qs = Workspace.objects.filter(owner=owner).annotate(t=Lower("title")).filter(t=title.lower())
+    if exclude_id is not None:
+        qs = qs.exclude(id=exclude_id)
+    return qs.exists()
+
+
 class WorkspaceCreateAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -23,10 +39,19 @@ class WorkspaceCreateAPIView(APIView):
         serializer = WorkspaceCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        workspace = Workspace.objects.create(
-            owner=request.user,
-            title=serializer.validated_data["title"],
-        )
+        title = serializer.validated_data["title"]
+
+        # Friendly fast path; the database constraint below is what actually guarantees it.
+        if title_taken(request.user, title):
+            raise WorkspaceNameConflict()
+
+        try:
+            with transaction.atomic():
+                workspace = Workspace.objects.create(owner=request.user, title=title)
+        except IntegrityError:
+            if title_taken(request.user, title):
+                raise WorkspaceNameConflict()
+            raise
 
         return Response(
             WorkspaceSerializer(workspace).data,
@@ -64,7 +89,18 @@ class WorkspaceDetailAPIView(APIView):
             partial=True,
         )
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+
+        title = serializer.validated_data.get("title")
+        if title is not None and title_taken(request.user, title, exclude_id=workspace.id):
+            raise WorkspaceNameConflict()
+
+        try:
+            with transaction.atomic():
+                serializer.save()
+        except IntegrityError:
+            if title is not None and title_taken(request.user, title, exclude_id=workspace.id):
+                raise WorkspaceNameConflict()
+            raise
 
         return Response(
             WorkspaceSerializer(workspace).data,

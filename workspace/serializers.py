@@ -1,8 +1,25 @@
 """Serializers module for QueryPilot."""
 
+import re
+
 from rest_framework import serializers
 
 from .models import Workspace
+
+
+def normalize_title(value: str) -> str:
+    """Trim and collapse runs of whitespace so "My  docs " and "My docs" are the same name."""
+    return re.sub(r"\s+", " ", value).strip()
+
+
+class WorkspaceTitleMixin:
+    def validate_title(self, value):
+        value = normalize_title(value)
+
+        if not value:
+            raise serializers.ValidationError("Workspace title cannot be empty.")
+
+        return value
 
 
 class WorkspaceSerializer(serializers.ModelSerializer):
@@ -22,7 +39,7 @@ class WorkspaceSerializer(serializers.ModelSerializer):
         ]
 
 
-class WorkspaceCreateSerializer(serializers.ModelSerializer):
+class WorkspaceCreateSerializer(WorkspaceTitleMixin, serializers.ModelSerializer):
     class Meta:
         model = Workspace
         fields = [
@@ -30,20 +47,12 @@ class WorkspaceCreateSerializer(serializers.ModelSerializer):
         ]
 
 
-class WorkspaceUpdateSerializer(serializers.ModelSerializer):
+class WorkspaceUpdateSerializer(WorkspaceTitleMixin, serializers.ModelSerializer):
     class Meta:
         model = Workspace
         fields = [
             "title",
         ]
-
-    def validate_title(self, value):
-        value = value.strip()
-
-        if not value:
-            raise serializers.ValidationError("Workspace title cannot be empty.")
-
-        return value
 
 
 class WorkspaceSettingsSerializer(serializers.ModelSerializer):
