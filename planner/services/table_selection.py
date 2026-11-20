@@ -86,7 +86,14 @@ MAX_CONTEXT_CHARS = 240
 # Recall bias: a missing table gives a wrong answer, an extra one costs tokens.
 MAX_SELECTED_TABLES = 5
 MAX_SIBLING_EXTRAS = 5
-MAX_GROUNDING_RESCUES = 2
+# Siblings are bounded by size (rows x columns), so a few tiny status/claims
+# tables fit but a large lookup sheet does not: the answer prompt has a hard
+# token ceiling and every extra table is read in full.
+MAX_EXTRA_CELLS = 150
+# A coverage rescue needs at least this many distinct ungrounded question terms
+# in one table; a single shared word is a coincidence, not grounding.
+MAX_GROUNDING_RESCUES = 1
+MIN_RESCUE_TERM_HITS = 2
 
 MAX_COMPUTED_FIELDS = None
 MAX_FALLBACK_TABLES_PER_DOCUMENT = None
@@ -692,7 +699,10 @@ def _question_terms(query: str, understanding: dict[str, Any]) -> set[str]:
     terms = set(_tokens(query))
     for field_name in _requested_fields(understanding):
         terms |= _tokens(field_name)
-    return {t for t in terms - _SELECTION_STOPWORDS if len(t) >= 4 and not t.isdigit()}
+    return {
+        t for t in terms - _SELECTION_STOPWORDS
+        if len(t) >= 5 and not t.isdigit() and not t.endswith("ly")
+    }
 
 
 def _rescue_ungrounded(
@@ -728,7 +738,7 @@ def _rescue_ungrounded(
         if name in chosen:
             continue
         hits = len(ungrounded & _table_vocabulary(table))
-        if hits:
+        if hits >= MIN_RESCUE_TERM_HITS:
             scored.append((hits, name))
     scored.sort(key=lambda x: (-x[0], x[1]))
     rescued = {name for _, name in scored[:MAX_GROUNDING_RESCUES]}
@@ -745,16 +755,21 @@ def _same_document_small_tables(
     understanding: dict[str, Any],
     candidates: list[dict[str, Any]],
     chosen: set[str],
+    anchors: set[str],
 ) -> set[str]:
-    """Pull in small sibling tables of documents that already contribute one.
+    """Pull in small sibling tables of documents the MODEL chose a table from.
 
     Summary, claims and invoice tables of one source concern the same
-    entities, and a column-name match alone misses them. Only small tables are
-    added (cheap to read), best question overlap first, bounded globally.
+    entities, and a column-name match alone misses them. ``anchors`` are the
+    tables the model (or entity resolution) picked; documents that only gained
+    a table through a rescue pass are not anchors, so a stray match cannot
+    drag in a whole unrelated document. Candidates are ranked by question
+    overlap, with a bonus for tables that record stored states (status or
+    category values), then by size, and are bounded by ``MAX_EXTRA_CELLS``.
     """
     by_name = {str(c.get("table_name")): c for c in candidates}
     documents = {
-        _as_int(by_name[n].get("document_id")) for n in chosen if n in by_name
+        _as_int(by_name[n].get("document_id")) for n in anchors if n in by_name
     }
     terms = _question_terms(query, understanding)
     pool: list[tuple[int, int, str]] = []
@@ -764,9 +779,17 @@ def _same_document_small_tables(
         rows = table.get("row_count")
         if not isinstance(rows, int) or rows > _SIBLING_MAX_ROWS:
             continue
-        pool.append((-len(terms & _table_vocabulary(table)), rows, name))
+        cells = max(rows, 1) * max(len(table.get("columns") or []), 1)
+        score = len(terms & _table_vocabulary(table)) + (1 if _value_hints(table) else 0)
+        pool.append((-score, cells, name))
     pool.sort()
-    extras = {name for _, _, name in pool[:MAX_SIBLING_EXTRAS]}
+    extras: set[str] = set()
+    used = 0
+    for _, cells, name in pool:
+        if len(extras) >= MAX_SIBLING_EXTRAS or used + cells > MAX_EXTRA_CELLS:
+            continue
+        extras.add(name)
+        used += cells
     if extras:
         logger.info("table selection: same-document small tables added=%s", sorted(extras))
     return extras
@@ -916,6 +939,7 @@ def _select_tables_core(
         )
 
     chosen = set(roles)
+    anchors = set(roles) | forced  # tables the model / entity resolution picked
     rescued = _rescue_unmet(unmet, candidates, chosen) if unmet else set()
     chosen |= rescued
     chosen |= forced
@@ -923,7 +947,9 @@ def _select_tables_core(
         # Recall passes: terms nothing selected grounds, then small siblings.
         # Both only add tables, so they cannot narrow or break the selection.
         chosen |= _rescue_ungrounded(query, understanding, candidates, chosen)
-        chosen |= _same_document_small_tables(query, understanding, candidates, chosen)
+        chosen |= _same_document_small_tables(
+            query, understanding, candidates, chosen, anchors
+        )
 
     all_computed = list(dict.fromkeys(deterministic_computed + computed))
     must_compute = bool(all_computed)

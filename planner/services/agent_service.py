@@ -26,6 +26,7 @@ import re
 import time
 from typing import Any
 from langgraph.graph import END, START, StateGraph
+from llm.exceptions import RequestTooLargeError
 from planner.services.answer import _narrow_spreadsheet_tables_v3, _parse_answer_response, generate_answer_stream
 from planner.services.cross_document_join import build_joined_view
 from planner.services.coverage import document_coverage_note, prior_conclusions_note, requirement_coverage_note
@@ -1715,6 +1716,78 @@ def dispatch_node(state: AgentState) -> dict[str, Any]:
         }
 
 
+_TOO_LARGE_LIMITS = re.compile(r"Limit\s+(\d+),\s*Requested\s+(\d+)", re.IGNORECASE)
+_MAX_FIT_ATTEMPTS = 3
+_FIT_CHARS_PER_TOKEN = 3
+_FIT_TARGET = 0.85
+_FIT_FALLBACK_SHRINK = 0.25
+
+
+def _json_len(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _is_trimmable_evidence(item: Any) -> bool:
+    """Only raw table reads and text passages may be dropped to fit a prompt.
+
+    Notes, aggregates, joined views, protected items and anything that is not
+    a plain evidence item are the answer's ground rules and always stay.
+    """
+    if not isinstance(item, dict) or item.get("protect_from_trim"):
+        return False
+    content = item.get("content")
+    if item.get("source_type") == "table_query":
+        return isinstance(content, dict) and content.get("evidence_role") == "document_table"
+    return item.get("source_type") == "text_chunk"
+
+
+def _trim_evidence_to_fit(
+    evidence: list[Any],
+    *,
+    query: str,
+    planner_requirements: list[dict[str, Any]] | None,
+    chars_to_remove: int,
+) -> tuple[list[Any], int]:
+    """Drop the least relevant plain evidence until ``chars_to_remove`` is freed.
+
+    Relevance is the number of distinct question/requirement words an item
+    mentions; ties drop the larger item first, so small items survive. Returns
+    the trimmed list (original order kept) and how many items were dropped.
+    """
+    words: set[str] = set(re.findall(r"[a-z0-9]{4,}", str(query).lower()))
+    for requirement in planner_requirements or []:
+        if isinstance(requirement, dict):
+            words |= set(re.findall(r"[a-z0-9]{4,}", json.dumps(requirement, default=str).lower()))
+    ranked: list[tuple[int, int, int]] = []
+    for position, item in enumerate(evidence):
+        if not _is_trimmable_evidence(item):
+            continue
+        size = _json_len(item)
+        text = set(re.findall(r"[a-z0-9]{4,}", json.dumps(item, default=str).lower()))
+        ranked.append((len(words & text), -size, position))
+    ranked.sort()
+    drop: set[int] = set()
+    freed = 0
+    for _, neg_size, position in ranked:
+        if freed >= chars_to_remove:
+            break
+        drop.add(position)
+        freed += -neg_size
+    kept = [item for position, item in enumerate(evidence) if position not in drop]
+    if drop:
+        kept.append({
+            "source_type": "evidence_note",
+            "note_kind": "size_trim",
+            "result_status": "PARTIAL",
+            "content": (
+                f"{len(drop)} lower-relevance evidence item(s) were omitted to fit "
+                "the model's size limit. Do not claim anything about them; if the "
+                "answer needs data that is not shown, say it was not available."
+            ),
+        })
+    return kept, len(drop)
+
+
 def _stream_answer_with_fit(
     *,
     query: str,
@@ -1722,13 +1795,50 @@ def _stream_answer_with_fit(
     conversation_history: list[dict[str, Any]] | None,
     planner_requirements: list[dict[str, Any]] | None = None,
 ):
-    """Stream an answer from the complete evidence set without trimming."""
-    yield from generate_answer_stream(
-        query=query,
-        evidence=evidence,
-        conversation_history=conversation_history,
-        planner_requirements=planner_requirements,
-    )
+    """Stream an answer; if the provider rejects the prompt as too large
+    (HTTP 413, a hard per-request token cap), retry with the least relevant
+    plain evidence removed instead of failing the whole answer.
+
+    The complete evidence set is always tried first, so nothing is trimmed
+    unless the provider refuses it. A rejection happens before any token is
+    streamed, so a retry never repeats text.
+    """
+    items = list(evidence)
+    for attempt in range(1, _MAX_FIT_ATTEMPTS + 1):
+        started = False
+        try:
+            for delta in generate_answer_stream(
+                query=query,
+                evidence=items,
+                conversation_history=conversation_history,
+                planner_requirements=planner_requirements,
+            ):
+                started = True
+                yield delta
+            return
+        except RequestTooLargeError as exc:
+            if started or attempt == _MAX_FIT_ATTEMPTS:
+                raise
+            match = _TOO_LARGE_LIMITS.search(str(exc))
+            if match:
+                limit, requested = int(match.group(1)), int(match.group(2))
+                excess_tokens = max(requested - int(limit * _FIT_TARGET), 1)
+                chars_to_remove = excess_tokens * _FIT_CHARS_PER_TOKEN
+            else:
+                chars_to_remove = int(_json_len(items) * _FIT_FALLBACK_SHRINK)
+            items, dropped = _trim_evidence_to_fit(
+                items,
+                query=query,
+                planner_requirements=planner_requirements,
+                chars_to_remove=chars_to_remove,
+            )
+            if not dropped:
+                raise
+            logger.warning(
+                "answer prompt too large; retrying without %d low-relevance evidence item(s) "
+                "(attempt %d/%d, evidence now %d chars)",
+                dropped, attempt, _MAX_FIT_ATTEMPTS, _json_len(items),
+            )
 
 
 def finish_node(state: AgentState) -> dict[str, Any]:
